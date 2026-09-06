@@ -14,7 +14,7 @@ JAR=$(mktemp)
 # Extract a fresh CSRF token from the rendered login form for the given
 # authorization request parameters.
 csrf_for() {
-  curl -s "$BASE/authorize?$1" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p'
+  curl -s -c "$JAR" "$BASE/authorize?$1" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p'
 }
 
 AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
@@ -47,7 +47,7 @@ grep -q 'name="nonce" value="'$NONCE'"' /tmp/login.html && echo "nonce echoed in
 
 echo "== 4. POST /authorize with WRONG password =="
 CSRF=$(csrf_for "$AUTH_QUERY")
-LOC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
+LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
   --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
@@ -63,7 +63,7 @@ LOC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
 
 echo "== 5. POST /authorize with correct credentials =="
 CSRF=$(csrf_for "$AUTH_QUERY")
-LOC=$(curl -s -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
   --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
@@ -85,7 +85,7 @@ CODE=$(printf '%s' "$LOC" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 echo "== 6. redeem code WITHOUT verifier (must fail) =="
 # use a fresh code to avoid burning $CODE
 CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s2&nonce=n2&code_challenge=$CHALLENGE&code_challenge_method=S256")
-LOC2=$(curl -s -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+LOC2=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
   --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
@@ -202,7 +202,7 @@ curl -s -o /dev/null -D - "$BASE/" | grep -i "x-frame-options: DENY" >/dev/null 
   && echo "security headers OK"
 
 echo "== 17. CSRF-protected login =="
-curl -s -o /dev/null -w 'POST /authorize without CSRF token -> %{http_code}\n' -X POST "$BASE/authorize" \
+curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_code}\n' -X POST "$BASE/authorize" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "username=rego" --data-urlencode "password=adventure" \
   | grep -q "400" && echo "login without CSRF token rejected OK"
 

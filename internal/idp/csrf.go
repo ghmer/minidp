@@ -16,8 +16,15 @@ import (
 // round-trips the OAuth2 request parameters through the browser, so without
 // protection an attacker could submit a crafted cross-site form and have the
 // victim silently obtain an authorization code for an attacker-controlled
-// redirect_uri. The token is an HMAC over the form action plus a fingerprint
-// of the request parameters, with a short expiry.
+// redirect_uri.
+//
+// A token is an HMAC over the form action, a fingerprint of the request
+// parameters and a per-browser nonce — a random value delivered in an
+// HttpOnly, SameSite=Lax cookie alongside the form. Binding the token to the
+// nonce means a token fetched by one browser is worthless to another: an
+// attacker can pre-fetch a token for malicious parameters, but the victim's
+// browser will neither send the attacker's cookie (SameSite) nor possess a
+// nonce the attacker knows.
 type csrfManager struct {
 	key []byte
 	ttl time.Duration
@@ -27,17 +34,23 @@ func newCSRFManager(secret []byte, ttl time.Duration) *csrfManager {
 	return &csrfManager{key: secret, ttl: ttl}
 }
 
-// issue returns a fresh signed token for the given form action and parameters.
-func (m *csrfManager) issue(action string, params url.Values) string {
-	payload := m.payload(action, params, time.Now().Add(m.ttl))
+// issue returns a fresh signed token for the given form action, parameters and
+// browser nonce.
+func (m *csrfManager) issue(action string, params url.Values, nonce []byte) string {
+	exp := time.Now().Add(m.ttl)
+	payload := strconv.FormatInt(exp.Unix(), 10) + "|" + action + "|" +
+		fingerprint(params) + "|" + nonceFingerprint(nonce)
 	mac := hmac.New(sha256.New, m.key)
 	mac.Write([]byte(payload))
 	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// verify checks a submitted token: signature, expiry, action and parameter
-// fingerprint must all match.
-func (m *csrfManager) verify(action string, params url.Values, token string) bool {
+// verify checks a submitted token: signature, expiry, action, parameter
+// fingerprint and browser nonce must all match.
+func (m *csrfManager) verify(action string, params url.Values, nonce []byte, token string) bool {
+	if len(nonce) == 0 {
+		return false
+	}
 	payload, sig, ok := strings.Cut(token, ".")
 	if !ok {
 		return false
@@ -51,45 +64,34 @@ func (m *csrfManager) verify(action string, params url.Values, token string) boo
 	if subtle.ConstantTimeCompare(mac.Sum(nil), expected) != 1 {
 		return false
 	}
-	want := m.payload(action, params, time.Time{})
-	gotAction, gotFingerprint, ok := splitPayload(payload)
-	if !ok {
+	parts := strings.SplitN(payload, "|", 4)
+	if len(parts) != 4 {
 		return false
 	}
-	if subtle.ConstantTimeCompare([]byte(gotAction), []byte(action)) != 1 {
-		return false
-	}
-	if subtle.ConstantTimeCompare([]byte(gotFingerprint), []byte(want)) != 1 {
-		return false
-	}
-	expUnix, err := strconv.ParseInt(splitExp(payload), 10, 64)
+	expUnix, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || time.Now().Unix() > expUnix {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(action)) != 1 {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(fingerprint(params))) != 1 {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(parts[3]), []byte(nonceFingerprint(nonce))) != 1 {
 		return false
 	}
 	return true
 }
 
-// payload builds "exp|action|paramFingerprint". When exp is the zero time the
-// fingerprint part alone is produced (used as the comparison value).
-func (m *csrfManager) payload(action string, params url.Values, exp time.Time) string {
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(params.Encode())))
-	if exp.IsZero() {
-		return fingerprint
-	}
-	return strconv.FormatInt(exp.Unix(), 10) + "|" + action + "|" + fingerprint
+// fingerprint is a stable digest of the canonical parameter encoding
+// (url.Values.Encode sorts keys).
+func fingerprint(params url.Values) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(params.Encode())))
 }
 
-func splitPayload(payload string) (action, fingerprint string, ok bool) {
-	parts := strings.SplitN(payload, "|", 3)
-	if len(parts) != 3 {
-		return "", "", false
-	}
-	return parts[1], parts[2], true
-}
-
-func splitExp(payload string) string {
-	if exp, _, ok := strings.Cut(payload, "|"); ok {
-		return exp
-	}
-	return ""
+// nonceFingerprint hashes the browser nonce so the raw value never appears in
+// the form token (it is already in the cookie).
+func nonceFingerprint(nonce []byte) string {
+	return fmt.Sprintf("%x", sha256.Sum256(nonce))
 }

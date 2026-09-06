@@ -1,7 +1,9 @@
 package idp
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +17,11 @@ import (
 // authCodeTTL is how long an authorization code stays redeemable (RFC 6749
 // recommends a maximum of 10 minutes).
 const authCodeTTL = 10 * time.Minute
+
+// csrfCookie carries the per-browser nonce that login-form CSRF tokens are
+// bound to. SameSite=Lax keeps it off cross-site POSTs entirely; HttpOnly
+// keeps it away from JavaScript.
+const csrfCookie = "minidp-login"
 
 // oauthParamKeys are the authorization-request parameters echoed through the
 // login form as hidden inputs so the POST /authorize round-trip keeps the full
@@ -34,6 +41,21 @@ func oauthHiddenFields(q url.Values) []loginField {
 		}
 	}
 	return fields
+}
+
+// csrfNonce extracts and decodes the browser nonce from the CSRF cookie. It
+// returns nil when the cookie is absent or malformed, which makes verification
+// fail closed.
+func csrfNonce(r *http.Request) []byte {
+	cookie, err := r.Cookie(csrfCookie)
+	if err != nil || cookie.Value == "" {
+		return nil
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(cookie.Value)
+	if err != nil {
+		return nil
+	}
+	return nonce
 }
 
 // oauthParamsOf extracts the OAuth2 parameters relevant for CSRF binding from
@@ -75,12 +97,30 @@ func (s *Server) validateAuthorizeRequest(q url.Values) string {
 	return ""
 }
 
-// renderLoginPage renders the login form (or an error message page). The form
-// carries a fresh CSRF token bound to the form action and the OAuth2 request
-// parameters.
+// renderLoginPage renders the login form (or an error message page). A fresh
+// per-browser nonce is generated and delivered in an HttpOnly SameSite cookie;
+// the form's CSRF token is signed over that nonce, so a token obtained by one
+// browser cannot be replayed from another.
 func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status int, data loginData) {
 	if data.Action != "" {
-		data.CSRFToken = s.csrf.issue(data.Action, oauthParamsOf(r))
+		nonce := make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		// #nosec G124 -- Secure is deliberately conditional on the issuer scheme
+		// (https => true) so the plain-HTTP demo deployment keeps working; all
+		// other attributes are strictly set.
+		http.SetCookie(w, &http.Cookie{
+			Name:     csrfCookie,
+			Value:    base64.RawURLEncoding.EncodeToString(nonce),
+			Path:     "/",
+			MaxAge:   int(s.csrf.ttl.Seconds()),
+			HttpOnly: true,
+			Secure:   strings.HasPrefix(s.cfg.Issuer, "https://"),
+			SameSite: http.SameSiteLaxMode,
+		})
+		data.CSRFToken = s.csrf.issue(data.Action, oauthParamsOf(r), nonce)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
@@ -122,8 +162,10 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 
 	// The CSRF token must be valid before anything else is processed, so a
 	// crafted cross-site form cannot smuggle attacker-chosen OAuth2 parameters
-	// through an authenticated user's browser.
-	if !s.csrf.verify("/authorize", oauthParamsOf(r), form.Get("csrf_token")) {
+	// through an authenticated user's browser. The token is bound to the nonce
+	// cookie of the browser that rendered the form; a token pre-fetched by an
+	// attacker does not match the victim's cookie.
+	if !s.csrf.verify("/authorize", oauthParamsOf(r), csrfNonce(r), form.Get("csrf_token")) {
 		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
 			Action: "/authorize",
@@ -204,7 +246,7 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	form := r.PostForm
-	if !s.csrf.verify("/login", oauthParamsOf(r), form.Get("csrf_token")) {
+	if !s.csrf.verify("/login", oauthParamsOf(r), csrfNonce(r), form.Get("csrf_token")) {
 		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
 			Action: "/login",

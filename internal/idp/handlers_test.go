@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
@@ -115,8 +116,9 @@ func login(t *testing.T, base, user, pass, verifier string) string {
 	form := authorizeForm(verifier)
 	form.Set("username", user)
 	form.Set("password", pass)
-	form.Set("csrf_token", fetchCSRF(t, base+"/authorize", authorizeForm(verifier)))
-	resp := postForm(t, noFollow(), base+"/authorize", form)
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, base+"/authorize", authorizeForm(verifier)))
+	resp := postForm(t, browser, base+"/authorize", form)
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("POST /authorize: status = %d, want 302", resp.StatusCode)
 	}
@@ -125,11 +127,26 @@ func login(t *testing.T, base, user, pass, verifier string) string {
 
 var csrfFieldRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
 
+// newBrowser returns a client that behaves like a browser for the login flow:
+// it stores cookies (the CSRF nonce) and surfaces redirects instead of
+// following them.
+func newBrowser() *http.Client {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		panic(err)
+	}
+	return &http.Client{
+		Jar:           jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
 // fetchCSRF renders the login page at target (query built from form) and
-// extracts the signed CSRF token from the form.
-func fetchCSRF(t *testing.T, target string, form url.Values) string {
+// extracts the signed CSRF token from the form. The client must be reused for
+// the subsequent POST so the nonce cookie round-trips.
+func fetchCSRF(t *testing.T, client *http.Client, target string, form url.Values) string {
 	t.Helper()
-	resp, err := http.Get(target + "?" + form.Encode())
+	resp, err := client.Get(target + "?" + form.Encode())
 	if err != nil {
 		t.Fatalf("GET %s: %v", target, err)
 	}
@@ -258,8 +275,9 @@ func TestAuthorizeWrongPassword(t *testing.T) {
 	form := authorizeForm(verifier)
 	form.Set("username", "rego")
 	form.Set("password", "wrong")
-	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/authorize", authorizeForm(verifier)))
-	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
+	resp := postForm(t, browser, ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -649,8 +667,9 @@ func TestLandingAndBareLogin(t *testing.T) {
 	}
 
 	form := url.Values{"username": {"rego"}, "password": {"adventure"}}
-	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/", url.Values{}))
-	ok := postForm(t, noFollow(), ts.URL+"/login", form)
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/", url.Values{}))
+	ok := postForm(t, browser, ts.URL+"/login", form)
 	if ok.StatusCode != http.StatusOK {
 		t.Fatalf("POST /login: status = %d", ok.StatusCode)
 	}
@@ -660,8 +679,8 @@ func TestLandingAndBareLogin(t *testing.T) {
 	}
 
 	form.Set("password", "nope")
-	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/", url.Values{}))
-	bad := postForm(t, noFollow(), ts.URL+"/login", form)
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/", url.Values{}))
+	bad := postForm(t, browser, ts.URL+"/login", form)
 	if bad.StatusCode != http.StatusUnauthorized {
 		t.Errorf("POST /login with wrong password: status = %d, want 401", bad.StatusCode)
 	}
@@ -723,15 +742,82 @@ func TestAuthorizeRejectsParamTampering(t *testing.T) {
 	verifier, _ := pkcePair()
 	// Get a CSRF token bound to the legit parameters...
 	form := authorizeForm(verifier)
-	token := fetchCSRF(t, ts.URL+"/authorize", form)
+	browser := newBrowser()
+	token := fetchCSRF(t, browser, ts.URL+"/authorize", form)
 	// ...then swap the redirect_uri behind the server's back.
 	form.Set("redirect_uri", "http://evil.example.com/callback")
 	form.Set("username", "rego")
 	form.Set("password", "adventure")
 	form.Set("csrf_token", token)
-	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+	resp := postForm(t, browser, ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("tampered redirect_uri: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestCSRFTokenRequiresBrowserNonce reproduces the cross-site attack from
+// FINDINGS: an attacker pre-fetches a login form (and its CSRF token) for
+// attacker-chosen OAuth parameters, then replays both against a victim's
+// browser. The token must be rejected because the victim's browser does not
+// carry the attacker's nonce cookie.
+func TestCSRFTokenRequiresBrowserNonce(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+
+	// The attacker fetches a valid form for their own parameters.
+	attacker := newBrowser()
+	attackerForm := authorizeForm(verifier)
+	attackerForm.Set("redirect_uri", "http://evil.example.com/callback")
+	token := fetchCSRF(t, attacker, ts.URL+"/authorize", attackerForm)
+
+	submit := func(victim *http.Client) *http.Response {
+		form := attackerForm
+		form.Set("username", "rego")
+		form.Set("password", "adventure")
+		form.Set("csrf_token", token)
+		return postForm(t, victim, ts.URL+"/authorize", form)
+	}
+
+	// Case 1: victim's browser has never visited the IdP (no cookie at all).
+	if resp := submit(newBrowser()); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("replayed token without nonce cookie: status = %d, want 400", resp.StatusCode)
+	}
+
+	// Case 2: victim's browser has its own legitimate nonce (mismatch).
+	victim := newBrowser()
+	fetchCSRF(t, victim, ts.URL+"/authorize", authorizeForm(verifier))
+	if resp := submit(victim); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("replayed token with mismatched nonce: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestAuthorizeFormSetsNonceCookie(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.Issuer = strings.Replace(c.Issuer, "http://", "https://", 1) })
+	verifier, _ := pkcePair()
+	resp, err := newBrowser().Get(ts.URL + "/authorize?" + authorizeForm(verifier).Encode())
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	found := false
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name != "minidp-login" {
+			continue
+		}
+		found = true
+		if !cookie.HttpOnly {
+			t.Error("nonce cookie must be HttpOnly")
+		}
+		if cookie.SameSite != http.SameSiteLaxMode {
+			t.Errorf("nonce cookie SameSite = %v, want Lax", cookie.SameSite)
+		}
+		if !cookie.Secure {
+			t.Error("nonce cookie must be Secure for an https issuer")
+		}
+	}
+	if !found {
+		t.Fatal("GET /authorize did not set the nonce cookie")
 	}
 }
 
@@ -739,12 +825,13 @@ func TestLoginRateLimiting(t *testing.T) {
 	ts, _ := testIDP(t, func(c *Config) { c.LoginRateLimit = 2 })
 	verifier, _ := pkcePair()
 
+	browser := newBrowser()
 	attempt := func() int {
 		form := authorizeForm(verifier)
 		form.Set("username", "rego")
 		form.Set("password", "adventure")
-		form.Set("csrf_token", fetchCSRF(t, ts.URL+"/authorize", authorizeForm(verifier)))
-		resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+		form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
+		resp := postForm(t, browser, ts.URL+"/authorize", form)
 		return resp.StatusCode
 	}
 	if s := attempt(); s != http.StatusFound {

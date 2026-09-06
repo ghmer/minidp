@@ -30,8 +30,10 @@ designed to work out of the box as the IdP for
 ## Hardening
 
 - **CSRF-protected login form**: the form carries an HMAC-signed token bound
-  to the form action and the full OAuth2 parameter set, so a cross-site form
-  post cannot inject an attacker-chosen `redirect_uri` into a victim's login.
+  to the form action, the full OAuth2 parameter set **and a per-browser nonce
+  delivered in an `HttpOnly`/`SameSite=Lax` cookie** — a token pre-fetched by
+  an attacker is worthless in a victim's browser, and `SameSite=Lax` keeps the
+  cookie off cross-site POSTs entirely.
 - **Rate limiting**: per-client-IP token bucket on the login endpoints
   (`IDP_LOGIN_RATE_LIMIT`, default 20/min). Behind a reverse proxy, set
   `TRUSTED_PROXIES` so the real client IP is used (spoofing
