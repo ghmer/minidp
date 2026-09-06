@@ -147,17 +147,43 @@ print('refresh grant OK, rotated refresh token issued, nonce preserved')
 "
 NEWREFRESH=$(printf '%s' "$TOK2" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
 
-echo "== 10. old refresh token is single-use (must fail) =="
+echo "== 10. refresh token reuse detection (family revocation) =="
 RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=$REFRESH&client_id=$CLIENT")
 echo "$RESP" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['error']=='invalid_grant', d
-print('refresh token rotation enforced OK')
+print('replayed refresh token rejected OK')
+"
+# RFC 9700 §4.14.2: replaying a consumed refresh token is treated as theft —
+# the whole family (including the legitimately rotated NEWREFRESH) is revoked.
+RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=$NEWREFRESH&client_id=$CLIENT")
+echo "$RESP" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['error']=='invalid_grant', d
+print('reuse detected: whole token family revoked OK')
 "
 
-echo "== 11. userinfo with new access token =="
-AT=$(printf '%s' "$TOK2" | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
+echo "== 11. userinfo with a fresh token set =="
+# A fresh login: the replay above killed the previous family on purpose.
+V3=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+C3=$(printf '%s' "$V3" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s3&nonce=n3&code_challenge=$C3&code_challenge_method=S256")
+LOC3=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
+  --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
+  --data-urlencode "state=s3" --data-urlencode "nonce=n3" \
+  --data-urlencode "code_challenge=$C3" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+CODE3=$(printf '%s' "$LOC3" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+TOK3=$(curl -s -X POST "$BASE/token" \
+  -d "grant_type=authorization_code&code=$CODE3&client_id=$CLIENT&redirect_uri=$REDIRECT" \
+  --data-urlencode "code_verifier=$V3")
+AT=$(printf '%s' "$TOK3" | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
+REFRESH3=$(printf '%s' "$TOK3" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
+IDTOK3=$(printf '%s' "$TOK3" | python3 -c "import json,sys;print(json.load(sys.stdin)['id_token'])")
 curl -s -H "Authorization: Bearer $AT" "$BASE/userinfo" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -168,21 +194,41 @@ print('userinfo OK:', d['sub'])
 echo "== 12. userinfo with garbage token (must 401) =="
 curl -s -o /dev/null -w 'userinfo bad token -> %{http_code}\n' -H "Authorization: Bearer garbage" "$BASE/userinfo"
 
-echo "== 13. introspect + revoke =="
+echo "== 13. introspect + revocation + logout =="
 curl -s -X POST "$BASE/introspect" -d "token=$AT" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['active'] is True and d['sub']=='rego', d
 print('introspect OK (active)')
 "
-curl -s -X POST "$BASE/revoke" -d "token=$NEWREFRESH" -o /dev/null -w 'revoke -> %{http_code}\n'
-RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=$NEWREFRESH&client_id=$CLIENT")
+# Logout with the id_token_hint revokes the whole authorization: the access
+# token is denied by jti and the refresh token is deleted.
+curl -s -o /dev/null -w 'end_session with id_token_hint -> %{http_code}\n' \
+  "$BASE/end_session?id_token_hint=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$IDTOK3")"
+curl -s -H "Authorization: Bearer $AT" "$BASE/userinfo" -o /dev/null -w 'userinfo after logout -> %{http_code}\n' | grep -q 401 \
+  && echo "access token denied after logout OK"
+RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=$REFRESH3&client_id=$CLIENT")
 echo "$RESP" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['error']=='invalid_grant', d
-print('revoked refresh token rejected OK')
+print('refresh token revoked by logout OK')
 "
+# /revoke with an access token denies it immediately.
+LOC4=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s4&nonce=n4&code_challenge=$C3&code_challenge_method=S256")" \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
+  --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
+  --data-urlencode "state=s4" --data-urlencode "nonce=n4" \
+  --data-urlencode "code_challenge=$C3" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+CODE4=$(printf '%s' "$LOC4" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+AT4=$(curl -s -X POST "$BASE/token" \
+  -d "grant_type=authorization_code&code=$CODE4&client_id=$CLIENT&redirect_uri=$REDIRECT" \
+  --data-urlencode "code_verifier=$V3" | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
+curl -s -X POST "$BASE/revoke" -d "token=$AT4" -o /dev/null -w 'revoke access token -> %{http_code}\n'
+curl -s -H "Authorization: Bearer $AT4" "$BASE/userinfo" -o /dev/null -w 'userinfo after revoke -> %{http_code}\n' | grep -q 401 \
+  && echo "revoked access token rejected OK"
 
 echo "== 14. CORS preflight on /token =="
 curl -s -o /dev/null -X OPTIONS "$BASE/token" \
