@@ -69,6 +69,12 @@ type Config struct {
 	// limiting and audit logs. Empty means: trust no proxy, use the socket
 	// address.
 	TrustedProxies []string
+	// ClientSecret (IDP_CLIENT_SECRET), when set, makes /introspect and
+	// /revoke require client authentication: HTTP Basic auth with any
+	// username and this secret as the password, or a client_secret form
+	// field. Unset leaves both endpoints open (bounded risk: tokens are
+	// 256-bit random, but an open /revoke is a free probe endpoint).
+	ClientSecret string
 	// LoginRateLimit is the number of login attempts (POST /authorize and
 	// POST /login) allowed per minute and client IP.
 	LoginRateLimit int
@@ -103,6 +109,7 @@ func LoadConfig() (Config, error) {
 		RSAPeM:          os.Getenv("IDP_RSA_PEM"),
 		KeyDir:          os.Getenv("IDP_KEY_DIR"),
 		LoginRateLimit:  loginRateLimit,
+		ClientSecret:    os.Getenv("IDP_CLIENT_SECRET"),
 	}
 	if raw := os.Getenv("ALLOWED_REDIRECTS"); raw != "" {
 		for _, r := range strings.Split(raw, ",") {

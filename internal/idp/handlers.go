@@ -476,6 +476,28 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
+// requireClientAuth enforces client authentication on the introspection and
+// revocation endpoints when IDP_CLIENT_SECRET is configured (RFC 7662
+// strongly recommends authenticating introspection; an open /revoke is a free
+// probe endpoint). Accepted: HTTP Basic auth (any username, the configured
+// secret as password) or a client_secret form field. Unconfigured -> open.
+func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool {
+	if s.cfg.ClientSecret == "" {
+		return true
+	}
+	secret := []byte(s.cfg.ClientSecret)
+	if _, pw, ok := r.BasicAuth(); ok && subtle.ConstantTimeCompare([]byte(pw), secret) == 1 {
+		return true
+	}
+	_ = r.ParseForm()
+	if pw := r.PostForm.Get("client_secret"); pw != "" && subtle.ConstantTimeCompare([]byte(pw), secret) == 1 {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="minidp"`)
+	writeError(w, http.StatusUnauthorized, "invalid_client", "Client authentication required.")
+	return false
+}
+
 // handleUserinfo returns the claims of the authenticated user for a valid
 // access token.
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
@@ -499,6 +521,9 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 
 // handleIntrospect reports whether a token is currently valid (RFC 7662).
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientAuth(w, r) {
+		return
+	}
 	_ = r.ParseForm()
 	claims, err := s.verifyAccessToken(r.PostForm.Get("token"))
 	if err != nil {
@@ -527,6 +552,9 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 // (Without this, a revoked session's access token would stay valid for its
 // full TTL.)
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if !s.requireClientAuth(w, r) {
+		return
+	}
 	_ = r.ParseForm()
 	token := r.PostForm.Get("token")
 	if token != "" {

@@ -792,6 +792,66 @@ func TestEndSessionRevokesTokenFamily(t *testing.T) {
 	}
 }
 
+// TestIntrospectRevokeClientAuth pins the review fix: with IDP_CLIENT_SECRET
+// configured, /introspect and /revoke require client authentication.
+func TestIntrospectRevokeClientAuth(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.ClientSecret = "s3cret" })
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+	access := tokens["access_token"].(string)
+
+	// Without credentials both endpoints must reject with 401 invalid_client.
+	for _, ep := range []string{"/introspect", "/revoke"} {
+		resp := postForm(t, http.DefaultClient, ts.URL+ep, url.Values{"token": {access}})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s without auth: status = %d, want 401", ep, resp.StatusCode)
+		}
+		if got := decodeJSON(t, resp)["error"]; got != "invalid_client" {
+			t.Errorf("%s without auth: error = %v, want invalid_client", ep, got)
+		}
+	}
+
+	// HTTP Basic auth with the correct secret is accepted.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/introspect",
+		strings.NewReader(url.Values{"token": {access}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(testClientID, "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("introspect with basic auth: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("introspect with basic auth: status = %d, want 200", resp.StatusCode)
+	}
+
+	// A client_secret form field is accepted as well.
+	resp2 := postForm(t, http.DefaultClient, ts.URL+"/revoke", url.Values{
+		"token":         {access},
+		"client_secret": {"s3cret"},
+	})
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("revoke with form secret: status = %d, want 200", resp2.StatusCode)
+	}
+
+	// A wrong secret is rejected.
+	resp3 := postForm(t, http.DefaultClient, ts.URL+"/introspect", url.Values{
+		"token":         {access},
+		"client_secret": {"wrong"},
+	})
+	if resp3.StatusCode != http.StatusUnauthorized {
+		t.Errorf("introspect with wrong secret: status = %d, want 401", resp3.StatusCode)
+	}
+	_ = resp3.Body.Close()
+}
+
 func TestEndSessionRequiresAllowlist(t *testing.T) {
 	// Without an allowlist, no redirect may happen (open-redirect hardening).
 	ts, _ := testIDP(t, nil)

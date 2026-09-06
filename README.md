@@ -103,6 +103,7 @@ All settings are provided through environment variables.
 | `IDP_RSA_PEM`           | *(unset)*               | Path to a PKCS#1/PKCS#8 RSA private key; takes precedence over `IDP_KEY_DIR` |
 | `IDP_KEY_DIR`           | *(unset)*               | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`) |
 | `TRUSTED_PROXIES`       | *(empty)*               | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted |
+| `IDP_CLIENT_SECRET`     | *(unset = open)*        | When set, `/introspect` and `/revoke` require client auth (Basic or `client_secret` form field) |
 | `IDP_LOGIN_RATE_LIMIT`  | `20`                    | Login attempts per minute and client IP                            |
 | `IDP_USERS_FILE`        | *(unset)*               | JSON file with user accounts — enables multi-user mode (see below) |
 | `IDP_TITLE`             | `Rego Adventure`        | Title shown on the login page                                      |
