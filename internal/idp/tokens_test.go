@@ -121,8 +121,8 @@ func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issueTokens: %v", err)
 	}
-	entry := srv.store.takeRefresh(resp.RefreshToken)
-	if entry == nil {
+	entry, reused := srv.store.takeRefresh(resp.RefreshToken)
+	if entry == nil || reused {
 		t.Fatal("issued refresh token is not redeemable")
 	}
 	if entry.Sub != "rego" || entry.ClientID != "c1" {

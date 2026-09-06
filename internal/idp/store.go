@@ -23,12 +23,15 @@ type authCode struct {
 
 // refreshEntry is a stored refresh token bound to its subject, client, scopes
 // and the nonce captured at authorization time so a refreshed id_token keeps the
-// same nonce as the original.
+// same nonce as the original. Family groups all tokens derived from one
+// authorization so that a detected reuse (RFC 9700 §4.14.2) can revoke the
+// whole chain at once.
 type refreshEntry struct {
 	Sub       string
 	ClientID  string
 	Scopes    []string
 	Nonce     string
+	Family    string
 	ExpiresAt time.Time
 }
 
@@ -40,12 +43,17 @@ type store struct {
 	mu      sync.Mutex
 	codes   map[string]*authCode
 	refresh map[string]*refreshEntry
+	// usedRefresh remembers consumed refresh tokens until their original
+	// expiry so a replayed (stolen) token can be recognised and its entire
+	// family revoked instead of merely failing (RFC 9700 §4.14.2).
+	usedRefresh map[string]*refreshEntry
 }
 
 func newStore() *store {
 	return &store{
-		codes:   make(map[string]*authCode),
-		refresh: make(map[string]*refreshEntry),
+		codes:       make(map[string]*authCode),
+		refresh:     make(map[string]*refreshEntry),
+		usedRefresh: make(map[string]*refreshEntry),
 	}
 }
 
@@ -85,25 +93,71 @@ func (s *store) addRefresh(f *refreshEntry, ttl time.Duration) string {
 	return id
 }
 
-func (s *store) takeRefresh(id string) *refreshEntry {
+// takeRefresh consumes a refresh token (single-use). reused is true when the
+// token had already been consumed before — a replay of a stolen token — in
+// which case the whole family has been revoked and the entry is nil.
+func (s *store) takeRefresh(id string) (entry *refreshEntry, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if f, ok := s.usedRefresh[id]; ok {
+		s.revokeFamilyLocked(f.Family)
+		delete(s.usedRefresh, id)
+		return nil, true
+	}
 	f, ok := s.refresh[id]
 	if !ok {
-		return nil
+		return nil, false
 	}
 	delete(s.refresh, id)
 	if time.Now().After(f.ExpiresAt) {
-		return nil
+		return nil, false
 	}
-	return f
+	s.usedRefresh[id] = f
+	return f, false
 }
 
+// revokeFamily drops every live and consumed refresh token derived from the
+// same authorization. An empty family is a no-op (untracked entries).
+func (s *store) revokeFamily(family string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revokeFamilyLocked(family)
+}
+
+// revokeFamilyLocked is revokeFamily without locking. The caller must hold
+// the lock.
+func (s *store) revokeFamilyLocked(family string) {
+	if family == "" {
+		return
+	}
+	for id, f := range s.refresh {
+		if f.Family == family {
+			delete(s.refresh, id)
+		}
+	}
+	for id, f := range s.usedRefresh {
+		if f.Family == family {
+			delete(s.usedRefresh, id)
+		}
+	}
+}
+
+// revokeToken revokes the given token per RFC 7009; because a refresh token
+// stands for a whole authorization, revoking it (or presenting an already-used
+// one to the endpoint) drops the entire family derived from that
+// authorization.
 func (s *store) revokeToken(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.codes, id)
-	delete(s.refresh, id)
+	if f, ok := s.refresh[id]; ok {
+		delete(s.refresh, id)
+		s.revokeFamilyLocked(f.Family)
+		return
+	}
+	if f, ok := s.usedRefresh[id]; ok {
+		s.revokeFamilyLocked(f.Family)
+	}
 }
 
 // dropExpired removes expired entries. The caller must hold the lock.
@@ -117,6 +171,11 @@ func (s *store) dropExpired() {
 	for id, f := range s.refresh {
 		if now.After(f.ExpiresAt) {
 			delete(s.refresh, id)
+		}
+	}
+	for id, f := range s.usedRefresh {
+		if now.After(f.ExpiresAt) {
+			delete(s.usedRefresh, id)
 		}
 	}
 }

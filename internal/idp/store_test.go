@@ -58,27 +58,29 @@ func TestDropExpiredSweepsBothMaps(t *testing.T) {
 
 func TestRefreshTokenRotation(t *testing.T) {
 	s := newStore()
-	first := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1"}, time.Minute)
+	first := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
-	entry := s.takeRefresh(first)
-	if entry == nil {
-		t.Fatal("expected refresh token to be redeemable")
+	entry, reused := s.takeRefresh(first)
+	if entry == nil || reused {
+		t.Fatal("expected refresh token to be redeemable and not marked as reused")
 	}
-	if entry.Sub != "rego" || entry.ClientID != "c1" {
+	if entry.Sub != "rego" || entry.ClientID != "c1" || entry.Family != "fam-1" {
 		t.Fatalf("unexpected refresh entry: %+v", entry)
 	}
 
 	// Rotation: the consumed token must not be redeemable again.
-	if again := s.takeRefresh(first); again != nil {
+	if again, reused := s.takeRefresh(first); again != nil {
 		t.Fatal("expected consumed refresh token to be rejected")
+	} else if !reused {
+		t.Error("re-presenting a consumed token must be flagged as reuse")
 	}
 
 	// A newly issued refresh token is independent of the old one.
-	second := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1"}, time.Minute)
+	second := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 	if second == first {
 		t.Fatal("expected new refresh token id to differ from the old one")
 	}
-	if s.takeRefresh(second) == nil {
+	if e, _ := s.takeRefresh(second); e == nil {
 		t.Fatal("expected new refresh token to be redeemable")
 	}
 }
@@ -86,18 +88,69 @@ func TestRefreshTokenRotation(t *testing.T) {
 func TestTakeRefreshExpired(t *testing.T) {
 	s := newStore()
 	id := s.addRefresh(&refreshEntry{Sub: "rego"}, -time.Minute)
-	if got := s.takeRefresh(id); got != nil {
-		t.Fatalf("expected expired refresh token to be rejected, got %+v", got)
+	if got, reused := s.takeRefresh(id); got != nil || reused {
+		t.Fatalf("expected expired refresh token to be rejected, got %+v (reused=%v)", got, reused)
+	}
+}
+
+// TestRefreshFamilyReuseRevokesFamily pins RFC 9700 §4.14.2: replaying a
+// consumed refresh token must revoke not only the presented token but the
+// entire family derived from the same authorization.
+func TestRefreshFamilyReuseRevokesFamily(t *testing.T) {
+	s := newStore()
+	other := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-other"}, time.Minute)
+
+	stolen := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	rotated := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+
+	// Legitimate rotation consumes the stolen token...
+	if entry, reused := s.takeRefresh(stolen); entry == nil || reused {
+		t.Fatalf("expected first use to succeed (entry=%v reused=%v)", entry, reused)
+	}
+	// ...then the attacker replays it: reuse detection must kill the family.
+	if entry, reused := s.takeRefresh(stolen); entry != nil || !reused {
+		t.Fatalf("expected reuse to be detected (entry=%v reused=%v)", entry, reused)
+	}
+	// The rotated descendant of the same authorization is gone too.
+	if entry, reused := s.takeRefresh(rotated); entry != nil || reused {
+		t.Error("family revocation must also drop live descendants of the same authorization")
+	}
+	// Unrelated families are untouched.
+	if entry, _ := s.takeRefresh(other); entry == nil {
+		t.Error("family revocation must not touch other authorizations")
+	}
+}
+
+// TestRevokeTokenRevokesFamily covers /revoke on both a live token and an
+// already-consumed one: either way the whole family goes.
+func TestRevokeTokenRevokesFamily(t *testing.T) {
+	s := newStore()
+	sibling := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+
+	live := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	s.revokeToken(live)
+	if entry, _ := s.takeRefresh(sibling); entry != nil {
+		t.Error("revoking a live token must drop its whole family")
+	}
+
+	sibling2 := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	consumed := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	if _, reused := s.takeRefresh(consumed); reused {
+		t.Fatal("expected first use of the token to succeed")
+	}
+	s.revokeToken(consumed) // /revoke with an already-rotated token
+	if entry, _ := s.takeRefresh(sibling2); entry != nil {
+		t.Error("revoking a consumed token must drop its whole family")
 	}
 }
 
 func TestRevokeToken(t *testing.T) {
 	s := newStore()
 	codeID := s.addCode(&authCode{Sub: "rego"}, time.Minute)
-	refreshID := s.addRefresh(&refreshEntry{Sub: "rego"}, time.Minute)
+	refreshID := s.addRefresh(&refreshEntry{Sub: "rego", Family: "fam-1"}, time.Minute)
 
 	s.revokeToken(refreshID)
-	if got := s.takeRefresh(refreshID); got != nil {
+	if got, _ := s.takeRefresh(refreshID); got != nil {
 		t.Fatal("expected revoked refresh token to be rejected")
 	}
 	if got := s.takeCode(codeID); got == nil {

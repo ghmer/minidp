@@ -323,12 +323,24 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
 		return
 	}
-	// The token request must repeat the same client_id and redirect_uri.
-	if clientID := form.Get("client_id"); clientID != "" && clientID != ac.ClientID {
+	// RFC 6749 §4.1.3: the token request must repeat client_id (public
+	// clients cannot authenticate) and the same redirect_uri that was used in
+	// the authorization request (which this IdP always requires).
+	clientID := form.Get("client_id")
+	if clientID == "" {
+		writeAuthError(w, "invalid_request", "Missing client_id.")
+		return
+	}
+	if clientID != ac.ClientID {
 		writeAuthError(w, "invalid_grant", "client_id does not match the authorization request.")
 		return
 	}
-	if redirectURI := form.Get("redirect_uri"); redirectURI != "" && redirectURI != ac.RedirectURI {
+	redirectURI := form.Get("redirect_uri")
+	if redirectURI == "" {
+		writeAuthError(w, "invalid_request", "Missing redirect_uri.")
+		return
+	}
+	if redirectURI != ac.RedirectURI {
 		writeAuthError(w, "invalid_grant", "redirect_uri does not match the authorization request.")
 		return
 	}
@@ -343,9 +355,11 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		ClientID: ac.ClientID,
 		Scopes:   ac.Scopes,
 		Nonce:    ac.Nonce,
+		Family:   randomToken(), // a fresh authorization starts a new refresh chain
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		slog.Error("token issuance failed", "grant", "authorization_code", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
 		return
 	}
 	slog.Info("tokens issued", "grant", "authorization_code", "client", ac.ClientID, "sub", ac.Sub)
@@ -360,10 +374,32 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_request", "Missing refresh_token.")
 		return
 	}
-	entry := s.store.takeRefresh(token)
+	// RFC 6749 §6: a public client must identify itself with client_id.
+	clientID := r.PostForm.Get("client_id")
+	if clientID == "" {
+		writeAuthError(w, "invalid_request", "Missing client_id.")
+		return
+	}
+	// Consume the token first (single lookup, no validity oracle), then check
+	// that it belongs to the presenting client. On a mismatch the whole token
+	// family is dropped — a mismatched client_id on a valid token is a theft
+	// signal.
+	entry, reused := s.store.takeRefresh(token)
 	if entry == nil {
-		slog.Warn("refresh token rejected: unknown, expired or already used", "ip", s.clientIP(r))
+		if reused {
+			// RFC 9700 §4.14.2: a replayed refresh token is treated as theft;
+			// takeRefresh has already revoked the whole family.
+			slog.Warn("refresh token REUSE detected: token family revoked", "ip", s.clientIP(r))
+		} else {
+			slog.Warn("refresh token rejected: unknown, expired or already used", "ip", s.clientIP(r))
+		}
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already used refresh token.")
+		return
+	}
+	if clientID != entry.ClientID {
+		slog.Warn("refresh rejected: client_id mismatch", "ip", s.clientIP(r), "client", clientID)
+		s.store.revokeFamily(entry.Family)
+		writeAuthError(w, "invalid_grant", "client_id does not match the refresh token.")
 		return
 	}
 
@@ -372,9 +408,11 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		ClientID: entry.ClientID,
 		Scopes:   entry.Scopes,
 		Nonce:    entry.Nonce,
+		Family:   entry.Family,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		slog.Error("token issuance failed", "grant", "refresh_token", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
 		return
 	}
 	slog.Info("tokens issued", "grant", "refresh_token", "client", entry.ClientID, "sub", entry.Sub)

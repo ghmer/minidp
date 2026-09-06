@@ -507,6 +507,107 @@ func TestRefreshGrantRotatesTokens(t *testing.T) {
 	}
 }
 
+// TestTokenGrantRequiresClientIDAndRedirect pins RFC 6749 §4.1.3: the token
+// request must repeat client_id and redirect_uri, not merely repeat them
+// correctly when present.
+func TestTokenGrantRequiresClientIDAndRedirect(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+
+	// A fresh code per case: the code is consumed before parameter validation
+	// fails, so reusing it would turn the second case into invalid_grant.
+	freshCode := func() string {
+		return codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	}
+
+	// Missing client_id / redirect_uri -> invalid_request.
+	for _, drop := range []string{"client_id", "redirect_uri"} {
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {freshCode()},
+			"client_id":     {testClientID},
+			"redirect_uri":  {testRedirect},
+			"code_verifier": {verifier},
+		}
+		form.Del(drop)
+		resp := postForm(t, http.DefaultClient, ts.URL+"/token", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("without %s: status = %d, want 400", drop, resp.StatusCode)
+		}
+		if got := decodeJSON(t, resp)["error"]; got != "invalid_request" {
+			t.Errorf("without %s: error = %v, want invalid_request", drop, got)
+		}
+	}
+
+	// Missing client_id on the refresh grant -> invalid_request (RFC 6749 §6).
+	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type": {"refresh_token"},
+	})
+	if got := decodeJSON(t, resp)["error"]; got != "invalid_request" {
+		t.Errorf("refresh without client_id: error = %v, want invalid_request", got)
+	}
+}
+
+// TestRefreshReuseRevokesWholeFamily drives the RFC 9700 §4.14.2 behaviour
+// end-to-end: replaying a rotated refresh token must invalidate every token
+// derived from the same authorization, not just fail.
+func TestRefreshReuseRevokesWholeFamily(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+
+	redeemRefresh := func(token string) map[string]any {
+		return decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {token},
+			"client_id":     {testClientID},
+		}))
+	}
+
+	first := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+	v1 := first["refresh_token"].(string)
+
+	second := redeemRefresh(v1)
+	v2 := second["refresh_token"].(string)
+	if v2 == "" || v2 == v1 {
+		t.Fatal("expected a rotated refresh token")
+	}
+
+	// The attacker replays the already-consumed v1.
+	if got := redeemRefresh(v1)["error"]; got != "invalid_grant" {
+		t.Fatalf("replay: error = %v, want invalid_grant", got)
+	}
+	// Reuse detection must have revoked the family: the legitimately rotated
+	// v2 is dead too.
+	if got := redeemRefresh(v2)["error"]; got != "invalid_grant" {
+		t.Fatalf("descendant of a replayed chain: error = %v, want invalid_grant", got)
+	}
+
+	// client_id must match the refresh token's client (RFC 6749 §6).
+	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	})
+	fresh := decodeJSON(t, resp)["refresh_token"].(string)
+	mismatch := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {fresh},
+		"client_id":     {"other-client"},
+	}))
+	if mismatch["error"] != "invalid_grant" {
+		t.Errorf("client_id mismatch: error = %v, want invalid_grant", mismatch["error"])
+	}
+}
+
 func TestUnsupportedGrantType(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{"grant_type": {"password"}})

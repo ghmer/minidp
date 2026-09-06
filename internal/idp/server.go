@@ -16,13 +16,15 @@ import (
 )
 
 // authContext captures the per-request context that is carried from the
-// authorization endpoint through to token issuance.
+// authorization endpoint through to token issuance. Family identifies the
+// refresh-token chain started by one authorization (empty for a new chain).
 type authContext struct {
 	Sub         string
 	ClientID    string
 	RedirectURI string
 	Scopes      []string
 	Nonce       string
+	Family      string
 }
 
 // subject identifies the authenticated user carried through to token

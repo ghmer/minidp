@@ -107,12 +107,15 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	}
 
 	// Mint a single-use refresh token that itself carries forward the subject,
-	// client, scopes and nonce so it can mint the next token set.
+	// client, scopes and nonce so it can mint the next token set. Every token
+	// of a chain shares the Family id of the originating authorization so reuse
+	// detection can revoke the whole chain.
 	resp.RefreshToken = s.store.addRefresh(&refreshEntry{
 		Sub:      ctx.Sub,
 		ClientID: ctx.ClientID,
 		Scopes:   ctx.Scopes,
 		Nonce:    ctx.Nonce,
+		Family:   ctx.Family,
 	}, s.cfg.RefreshTokenTTL)
 
 	return resp, nil
