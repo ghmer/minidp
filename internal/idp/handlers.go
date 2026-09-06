@@ -296,6 +296,12 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 
 // handleToken implements the RFC 6749 token endpoint for the
 // authorization_code and refresh_token grants.
+//
+// Deliberately NOT rate limited: the tokens redeemed here (codes, refresh
+// tokens) are 256-bit random and single-use, so guessing cannot succeed and
+// a limit would only enable a denial-of-service against legitimate clients.
+// The attacker-guessable entry point — the login form's credential check — is
+// rate limited via clientIP (see handleAuthorizePost/handleBareLogin).
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		writeAuthError(w, "invalid_request", "Malformed form body.")
