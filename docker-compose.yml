@@ -5,6 +5,21 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    # Same hardening as the app service below; minidp holds the signing key
+    # and the credential material, so it has no business being the weak link.
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
     environment:
       # The issuer is what BROWSERS reach (the SPA exchanges the PKCE code
       # against it), hence localhost — not the service-internal DNS name.
