@@ -184,21 +184,25 @@ func SaveUsers(path string, users []User) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	tmp, err := root.OpenFile(name+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Unique temp name inside the same directory (instead of a fixed
+	// <name>.tmp), so concurrent tool invocations cannot clobber each other's
+	// temp file. O_EXCL makes the create exclusive.
+	tmpName := name + ".tmp-" + randomToken()
+	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temp file in %q: %w", dir, err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		_ = root.Remove(name + ".tmp")
+		_ = root.Remove(tmpName)
 		return fmt.Errorf("write users file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(name + ".tmp")
+		_ = root.Remove(tmpName)
 		return fmt.Errorf("close users file: %w", err)
 	}
-	if err := os.Rename(filepath.Join(dir, name+".tmp"), path); err != nil {
-		_ = root.Remove(name + ".tmp")
+	if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
+		_ = root.Remove(tmpName)
 		return fmt.Errorf("persist users file to %q: %w", path, err)
 	}
 	return nil
