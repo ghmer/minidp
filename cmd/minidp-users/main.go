@@ -221,9 +221,26 @@ func update(args []string) error {
 		return fmt.Errorf("user %q does not exist", *u.username)
 	}
 
+	// fs.Visit reports which flags were actually set, so "no -password flag"
+	// (keep the existing hash) is distinguishable from "-password -" (read one
+	// line from stdin) and "-password ''" (prompt interactively).
+	passwordProvided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "password" {
+			passwordProvided = true
+		}
+	})
+
 	changed := false
-	if *u.password != "" {
-		hash, err := idp.HashPassword(*u.password, *u.cost)
+	if passwordProvided {
+		password, err := resolvePassword(*u.password, false)
+		if err != nil {
+			return err
+		}
+		if password == "" {
+			return fmt.Errorf("password must not be empty")
+		}
+		hash, err := idp.HashPassword(password, *u.cost)
 		if err != nil {
 			return err
 		}
