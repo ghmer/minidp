@@ -427,7 +427,9 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 }
 
 // verifyAccessToken parses and validates a signed JWT issued by this IdP. It
-// enforces RS256, the configured issuer and the expiry.
+// enforces RS256, the configured issuer, the expiry and a non-empty audience
+// (minidp always sets aud to the client the token was minted for; a token
+// without an audience is never acceptable).
 func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
 		return &s.key.key.PublicKey, nil
@@ -442,6 +444,10 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		return nil, fmt.Errorf("invalid claims")
+	}
+	aud, _ := claims.GetAudience()
+	if len(aud) == 0 {
+		return nil, fmt.Errorf("invalid token: missing audience")
 	}
 	return claims, nil
 }

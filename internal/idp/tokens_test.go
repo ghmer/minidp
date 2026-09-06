@@ -133,6 +133,27 @@ func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	}
 }
 
+// TestVerifyAccessTokenRequiresAudience pins the review fix: a correctly
+// signed, unexpired token without an aud claim must be rejected by
+// userinfo/introspect instead of being accepted for any client.
+func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
+	srv := newTestServer(t)
+	claims := jwt.MapClaims{
+		"iss": srv.cfg.Issuer,
+		"sub": "rego",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+		// deliberately no aud
+	}
+	signed, err := srv.key.sign(claims)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := srv.verifyAccessToken(signed); err == nil {
+		t.Error("a token without an aud claim must be rejected")
+	}
+}
+
 func TestJoinScopesDeduplicatesAndKeepsOrder(t *testing.T) {
 	got := joinScopes([]string{"openid", "profile", "openid", "", "email", "profile"})
 	if got != "openid profile email" {
