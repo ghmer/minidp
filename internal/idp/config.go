@@ -146,14 +146,15 @@ func LoadConfig() (Config, error) {
 	passwordFile := os.Getenv("IDP_PASSWORD_FILE")
 	plainPassword := os.Getenv("IDP_PASSWORD")
 	if usersFile != "" {
-		for key, val := range map[string]string{
-			"IDP_USERNAME":        os.Getenv("IDP_USERNAME"),
-			"IDP_PASSWORD":        plainPassword,
-			"IDP_PASSWORD_BCRYPT": bcryptHash,
-			"IDP_PASSWORD_FILE":   passwordFile,
+		// A fixed order keeps the reported conflicting variable deterministic.
+		for _, c := range []struct{ key, val string }{
+			{"IDP_USERNAME", os.Getenv("IDP_USERNAME")},
+			{"IDP_PASSWORD", plainPassword},
+			{"IDP_PASSWORD_BCRYPT", bcryptHash},
+			{"IDP_PASSWORD_FILE", passwordFile},
 		} {
-			if val != "" {
-				return cfg, fmt.Errorf("%s is set together with IDP_USERS_FILE; configure either multi-user mode or a single user, not both", key)
+			if c.val != "" {
+				return cfg, fmt.Errorf("%s is set together with IDP_USERS_FILE; configure either multi-user mode or a single user, not both", c.key)
 			}
 		}
 		cfg.UsersFile = usersFile
