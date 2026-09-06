@@ -121,16 +121,18 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
-			// #nosec G124 -- Secure is deliberately conditional on the issuer scheme
-			// (https => true) so the plain-HTTP demo deployment keeps working; all
-			// other attributes are strictly set.
+			// Secure is set unconditionally: minidp is deployed either on
+			// https (TLS-terminating proxy) or on plain-HTTP localhost, where
+			// Chrome and Firefox honour the "potentially trustworthy origin"
+			// exception (W3C Secure Contexts). Safari implements no localhost
+			// exception — use Chrome/Firefox or TLS there.
 			http.SetCookie(w, &http.Cookie{
 				Name:     csrfCookie,
 				Value:    base64.RawURLEncoding.EncodeToString(nonce),
 				Path:     "/",
 				MaxAge:   int(s.csrf.ttl.Seconds()),
 				HttpOnly: true,
-				Secure:   strings.HasPrefix(s.cfg.Issuer, "https://"),
+				Secure:   true,
 				SameSite: http.SameSiteLaxMode,
 			})
 		}

@@ -37,9 +37,12 @@ designed to work out of the box as the IdP for
 
 - **CSRF-protected login form**: the form carries an HMAC-signed token bound
   to the form action, the full OAuth2 parameter set **and a per-browser nonce
-  delivered in an `HttpOnly`/`SameSite=Lax` cookie** — a token pre-fetched by
-  an attacker is worthless in a victim's browser, and `SameSite=Lax` keeps the
-  cookie off cross-site POSTs entirely.
+  delivered in an `HttpOnly`/`SameSite=Lax`/`Secure` cookie** — a token
+  pre-fetched by an attacker is worthless in a victim's browser, and
+  `SameSite=Lax` keeps the cookie off cross-site POSTs entirely. `Secure` is
+  always set: on plain-HTTP localhost this relies on the browsers'
+  secure-context exception (Chrome, Firefox — Safari does not implement it,
+  use Chrome/Firefox or TLS there).
 - **Rate limiting**: per-client-IP token bucket on the login endpoints
   (`IDP_LOGIN_RATE_LIMIT`, default 20/min). Behind a reverse proxy, set
   `TRUSTED_PROXIES` so the real client IP is used (spoofing
@@ -63,10 +66,7 @@ designed to work out of the box as the IdP for
 - **Audit logging**: login success/failure (with client IP and attempted
   username), code issuance, token grants and rejections via slog.
 - **Graceful shutdown** on SIGTERM/SIGINT for k8s/compose rolling updates.
-- Golang-ci-lint and gosec clean (enforced in CI). Exactly one `#nosec`
-  directive exists (the CSRF nonce cookie's `Secure` flag, which is
-  deliberately conditional on the issuer scheme so the plain-HTTP demo keeps
-  working) and it carries the justifying comment inline.
+- Golang-ci-lint and gosec clean (enforced in CI); no `#nosec` directives.
 
 ## Quick start
 

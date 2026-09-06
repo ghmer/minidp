@@ -11,10 +11,19 @@ STATE="st-123"
 NONCE="n-abc"
 JAR=$(mktemp)
 
+# Browsers (Chrome/Firefox) treat localhost as a "potentially trustworthy
+# origin" and send Secure cookies over plain-HTTP localhost; curl implements
+# RFC 6265 literally and would keep them for https only. Flip the secure flag
+# in the Netscape jar to emulate the browser exception for the demo.
+mark_jar_insecure() {
+  awk -F'\t' 'BEGIN{OFS="\t"} /^#/ || NF==0 {print; next} {$4="FALSE"; print}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
 # Extract a fresh CSRF token from the rendered login form for the given
 # authorization request parameters.
 csrf_for() {
   curl -s -c "$JAR" "$BASE/authorize?$1" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p'
+  mark_jar_insecure "$JAR"
 }
 
 AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
@@ -276,6 +285,7 @@ C2=$(printf '%s' "$V2" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | 
 Q2="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s9&nonce=n9&code_challenge=$C2&code_challenge_method=S256"
 JAR2=$(mktemp)
 CSRF2=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+mark_jar_insecure "$JAR2"
 LOC9=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
   --data-urlencode "csrf_token=$CSRF2" --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
@@ -300,6 +310,7 @@ print('multi-user: alice logged in, sub/email claims correct')
 
 # The former single-user demo credentials must not work in multi-user mode.
 CSRF3=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+mark_jar_insecure "$JAR2"
 ST9=$(curl -s -b "$JAR2" -o /dev/null -w '%{http_code}' -X POST "$BASE2/authorize" \
   --data-urlencode "csrf_token=$CSRF3" --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \

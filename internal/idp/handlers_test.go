@@ -128,6 +128,24 @@ func login(t *testing.T, base, user, pass, verifier string) string {
 
 var csrfFieldRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
 
+// trustLocalhostTransport emulates the browsers' "localhost is a potentially
+// trustworthy origin" exception (W3C Secure Contexts; implemented by Chrome
+// and Firefox, not by Safari): it strips the Secure attribute from Set-Cookie
+// headers before Go's RFC 6265-literal cookiejar sees them, so the nonce
+// cookie issued over plain-HTTP httptest connections round-trips exactly as
+// it would in Chrome/Firefox on http://localhost.
+type trustLocalhostTransport struct{ base http.RoundTripper }
+
+func (t trustLocalhostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil {
+		for i, c := range resp.Header["Set-Cookie"] {
+			resp.Header["Set-Cookie"][i] = strings.Replace(c, "; Secure", "", 1)
+		}
+	}
+	return resp, err
+}
+
 // newBrowser returns a client that behaves like a browser for the login flow:
 // it stores cookies (the CSRF nonce) and surfaces redirects instead of
 // following them.
@@ -138,6 +156,7 @@ func newBrowser() *http.Client {
 	}
 	return &http.Client{
 		Jar:           jar,
+		Transport:     trustLocalhostTransport{base: http.DefaultTransport},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }
@@ -1137,10 +1156,14 @@ func TestCSRFTokenRequiresBrowserNonce(t *testing.T) {
 	}
 }
 
+// TestAuthorizeFormSetsNonceCookie pins the unconditional Secure attribute:
+// the nonce cookie always carries HttpOnly, SameSite=Lax and Secure. The
+// plain (non-jar) client is used so the raw header is inspected without the
+// trustLocalhostTransport stripping the attribute.
 func TestAuthorizeFormSetsNonceCookie(t *testing.T) {
-	ts, _ := testIDP(t, func(c *Config) { c.Issuer = strings.Replace(c.Issuer, "http://", "https://", 1) })
+	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	resp, err := newBrowser().Get(ts.URL + "/authorize?" + authorizeForm(verifier).Encode())
+	resp, err := http.Get(ts.URL + "/authorize?" + authorizeForm(verifier).Encode())
 	if err != nil {
 		t.Fatalf("GET /authorize: %v", err)
 	}
@@ -1159,7 +1182,7 @@ func TestAuthorizeFormSetsNonceCookie(t *testing.T) {
 			t.Errorf("nonce cookie SameSite = %v, want Lax", cookie.SameSite)
 		}
 		if !cookie.Secure {
-			t.Error("nonce cookie must be Secure for an https issuer")
+			t.Error("nonce cookie must always be Secure (localhost demo relies on the browser secure-context exception)")
 		}
 	}
 	if !found {
