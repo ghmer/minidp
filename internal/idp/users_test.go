@@ -29,7 +29,7 @@ func writeFile(t *testing.T, path, content string) {
 func TestLoadUsersAndLookup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "users.json")
 	users := []User{
-		{Username: "alice", PasswordHash: testHash(t, "wonderland"), Email: "alice@example.com", Name: "Alice"},
+		{Username: "alice", PasswordHash: testHash(t, "wonderland"), Email: "alice@example.com", Name: "Alice", Roles: []string{"admin", "auditor"}},
 		{Username: "bob", PasswordHash: testHash(t, "builder")},
 	}
 	if err := SaveUsers(path, users); err != nil {
@@ -47,6 +47,9 @@ func TestLoadUsersAndLookup(t *testing.T) {
 	alice, ok := store.Lookup("alice")
 	if !ok || alice.Email != "alice@example.com" || alice.Name != "Alice" {
 		t.Fatalf("Lookup(alice) = %+v, ok = %v", alice, ok)
+	}
+	if len(alice.Roles) != 2 || alice.Roles[0] != "admin" || alice.Roles[1] != "auditor" {
+		t.Errorf("Lookup(alice).Roles = %v, want [admin auditor]", alice.Roles)
 	}
 	if !verifyHash(alice.PasswordHash, "wonderland") {
 		t.Error("alice's hash does not verify her password")
@@ -68,6 +71,10 @@ func TestLoadUsersErrors(t *testing.T) {
 		"truncated hash":      `[{"username": "alice", "password_hash": "$2a$10$short"}]`,
 		"duplicate users": `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"},` +
 			`{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]`,
+		"empty role":        `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234", "roles": ["admin", "  "]}]`,
+		"whitespace role":   `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234", "roles": [" admin"]}]`,
+		"duplicate role":    `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234", "roles": ["admin", "admin"]}]`,
+		"role not a string": `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234", "roles": [7]}]`,
 	}
 	for name, content := range cases {
 		path := filepath.Join(dir, name+"-users.json")
@@ -131,6 +138,9 @@ func TestSaveUsersRejectsInvalidEntries(t *testing.T) {
 	}
 	if err := SaveUsers(filepath.Join(dir, "u.json"), dup); err == nil {
 		t.Error("expected an error for duplicate usernames")
+	}
+	if err := SaveUsers(filepath.Join(dir, "u.json"), []User{{Username: "a", PasswordHash: testHash(t, "x"), Roles: []string{"admin", " "}}}); err == nil {
+		t.Error("expected an error for an empty role entry")
 	}
 	// Nothing may have been written by the failed attempts.
 	entries, err := os.ReadDir(dir)

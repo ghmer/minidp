@@ -24,14 +24,20 @@ services:
       # The issuer is what BROWSERS reach (the SPA exchanges the PKCE code
       # against it), hence localhost — not the service-internal DNS name.
       IDP_ISSUER: ${IDP_ISSUER:-http://localhost:8080}
-      IDP_USERNAME: ${IDP_USERNAME:-rego}
-      # Demo default; for anything beyond a demo use a bcrypt hash instead:
-      #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
-      #   IDP_PASSWORD_BCRYPT=$$2y$$10$$...
-      IDP_PASSWORD: ${IDP_PASSWORD:-adventure}
-      # Redirect URI of the rego-adventure service below.
+      # Single registered client; tokens carry aud=rego-adventure and both
+      # /authorize and /token reject every other client_id.
+      IDP_CLIENT_ID: rego-adventure
+      IDP_AUDIENCE: rego-adventure
+      # Accounts come from the mounted users file (bcrypt hashes, managed
+      # with minidp-users). The bundled demo file contains rego/adventure —
+      # replace it for anything beyond a demo:
+      #   minidp-users update -file users.json -username rego -password '...'
+      IDP_USERS_FILE: /config/users.json
+      # Redirect URI of the rego-adventure service below; the policy is
+      # mandatory, minidp refuses to start without it.
       ALLOWED_REDIRECTS: ${APP_DOMAIN:-http://localhost:3000}/callback
     volumes:
+      - ./users.json:/config/users.json:ro
       - github.com/ghmer/minidp-data:/data
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]

@@ -103,3 +103,72 @@ func TestUpdateEmptyPasswordFlagNonInteractiveFails(t *testing.T) {
 		t.Error("a failed password resolution must keep the existing hash")
 	}
 }
+
+func rolesOf(t *testing.T, file, username string) []string {
+	t.Helper()
+	users, _, err := readUsersForUpdate(file)
+	if err != nil {
+		t.Fatalf("read users: %v", err)
+	}
+	idx := findUserIndex(users, username)
+	if idx < 0 {
+		t.Fatalf("user %q not found", username)
+	}
+	return users[idx].Roles
+}
+
+func TestAddAndUpdateRoles(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "users.json")
+	if err := add([]string{"-file", file, "-username", "alice", "-password", "secret", "-roles", " admin , auditor,"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got := rolesOf(t, file, "alice"); len(got) != 2 || got[0] != "admin" || got[1] != "auditor" {
+		t.Errorf("roles after add = %v, want [admin auditor] (trimmed, empties dropped)", got)
+	}
+
+	// An update without -roles keeps the existing set.
+	if err := update([]string{"-file", file, "-username", "alice", "-email", "a@example.com"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := rolesOf(t, file, "alice"); len(got) != 2 {
+		t.Errorf("roles after unrelated update = %v, want [admin auditor]", got)
+	}
+
+	// A provided -roles replaces the set; "-roles ''" clears it.
+	if err := update([]string{"-file", file, "-username", "alice", "-roles", "admin"}); err != nil {
+		t.Fatalf("update roles: %v", err)
+	}
+	if got := rolesOf(t, file, "alice"); len(got) != 1 || got[0] != "admin" {
+		t.Errorf("roles after replace = %v, want [admin]", got)
+	}
+	if err := update([]string{"-file", file, "-username", "alice", "-roles", ""}); err != nil {
+		t.Fatalf("clear roles: %v", err)
+	}
+	if got := rolesOf(t, file, "alice"); len(got) != 0 {
+		t.Errorf("roles after clear = %v, want none", got)
+	}
+}
+
+func TestParseRoles(t *testing.T) {
+	cases := map[string][]string{
+		"":                  nil,
+		" ":                 nil,
+		",":                 nil,
+		"admin":             {"admin"},
+		"admin,auditor":     {"admin", "auditor"},
+		" admin , auditor ": {"admin", "auditor"},
+		"admin,,auditor,":   {"admin", "auditor"},
+	}
+	for in, want := range cases {
+		got := parseRoles(in)
+		if len(got) != len(want) {
+			t.Errorf("parseRoles(%q) = %v, want %v", in, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("parseRoles(%q) = %v, want %v", in, got, want)
+			}
+		}
+	}
+}

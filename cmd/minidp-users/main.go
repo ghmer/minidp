@@ -5,8 +5,8 @@
 //
 // Usage:
 //
-//	minidp-users add    -file users.json -username alice [-email ...] [-name ...] [-password ...|-] [-cost 10]
-//	minidp-users update -file users.json -username alice [-email ...] [-name ...] [-password ...|-] [-cost 10]
+//	minidp-users add    -file users.json -username alice [-email ...] [-name ...] [-roles a,b] [-password ...|-] [-cost 10]
+//	minidp-users update -file users.json -username alice [-email ...] [-name ...] [-roles a,b] [-password ...|-] [-cost 10]
 //	minidp-users remove -file users.json -username alice
 //	minidp-users list   -file users.json
 //	minidp-users hash   [-password ...|-] [-cost 10]
@@ -64,15 +64,16 @@ func usage() {
 	fmt.Fprint(os.Stderr, `minidp-users — manage the minidp users file
 
 Usage:
-  minidp-users add    -file users.json -username alice [-email ...] [-name ...] [-password ...|-] [-cost 10]
-  minidp-users update -file users.json -username alice [-email ...] [-name ...] [-password ...|-] [-cost 10]
+  minidp-users add    -file users.json -username alice [-email ...] [-name ...] [-roles a,b] [-password ...|-] [-cost 10]
+  minidp-users update -file users.json -username alice [-email ...] [-name ...] [-roles a,b] [-password ...|-] [-cost 10]
   minidp-users remove -file users.json -username alice
   minidp-users list   -file users.json
   minidp-users hash   [-password ...|-] [-cost 10]
 
 Passwords are stored as salted bcrypt hashes; list never prints them.
 "-password -" reads one line from stdin; without -password an interactive
-prompt (with confirmation) is used where applicable.
+prompt (with confirmation) is used where applicable. -roles takes a
+comma-separated list; updating with "-roles ''" clears all roles.
 `)
 }
 
@@ -83,6 +84,7 @@ type userFlags struct {
 	password *string
 	email    *string
 	name     *string
+	roles    *string
 	cost     *int
 }
 
@@ -93,8 +95,22 @@ func registerUserFlags(fs *flag.FlagSet) *userFlags {
 	u.password = fs.String("password", "", "password; '-' reads one line from stdin, empty prompts interactively")
 	u.email = fs.String("email", "", "optional email claim")
 	u.name = fs.String("name", "", "optional name claim")
+	u.roles = fs.String("roles", "", "optional comma-separated roles, released as the roles claim on the user's tokens")
 	u.cost = fs.Int("cost", bcrypt.DefaultCost, "bcrypt cost factor")
 	return u
+}
+
+// parseRoles splits a comma-separated -roles value into clean entries:
+// whitespace around entries is trimmed and empty entries are dropped, so the
+// result always satisfies the users-file validation.
+func parseRoles(value string) []string {
+	var roles []string
+	for _, r := range strings.Split(value, ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			roles = append(roles, r)
+		}
+	}
+	return roles
 }
 
 // resolvePassword returns the password from the flag, from stdin ("-" or a
@@ -192,6 +208,7 @@ func add(args []string) error {
 		PasswordHash: hash,
 		Email:        *u.email,
 		Name:         *u.name,
+		Roles:        parseRoles(*u.roles),
 	})
 	if err := idp.SaveUsers(*u.file, users); err != nil {
 		return err
@@ -223,11 +240,17 @@ func update(args []string) error {
 
 	// fs.Visit reports which flags were actually set, so "no -password flag"
 	// (keep the existing hash) is distinguishable from "-password -" (read one
-	// line from stdin) and "-password ''" (prompt interactively).
+	// line from stdin) and "-password ''" (prompt interactively). The same
+	// applies to -roles: absent keeps the existing roles, "-roles ''" clears
+	// them.
 	passwordProvided := false
+	rolesProvided := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "password" {
+		switch f.Name {
+		case "password":
 			passwordProvided = true
+		case "roles":
+			rolesProvided = true
 		}
 	})
 
@@ -257,8 +280,12 @@ func update(args []string) error {
 		users[idx].Name = *u.name
 		changed = true
 	}
+	if rolesProvided {
+		users[idx].Roles = parseRoles(*u.roles)
+		changed = true
+	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -password, -email or -name")
+		return fmt.Errorf("nothing to update: provide -password, -email, -name or -roles")
 	}
 	if err := idp.SaveUsers(*u.file, users); err != nil {
 		return err
@@ -316,6 +343,9 @@ func list(args []string) error {
 		}
 		if u.Name != "" {
 			line += "\t" + u.Name
+		}
+		if len(u.Roles) > 0 {
+			line += "\troles: " + strings.Join(u.Roles, ",")
 		}
 		fmt.Println(line)
 	}

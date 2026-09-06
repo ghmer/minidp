@@ -24,9 +24,10 @@ type tokenResponse struct {
 // accessClaims are the claims embedded in the issued access token.
 type accessClaims struct {
 	jwt.RegisteredClaims
-	Scope    string `json:"scope,omitempty"`
-	Username string `json:"preferred_username,omitempty"`
-	Email    string `json:"email,omitempty"`
+	Scope    string   `json:"scope,omitempty"`
+	Username string   `json:"preferred_username,omitempty"`
+	Email    string   `json:"email,omitempty"`
+	Roles    []string `json:"roles,omitempty"`
 }
 
 // idClaims are the OIDC claims embedded in the issued id_token. sid carries
@@ -34,51 +35,63 @@ type accessClaims struct {
 // that authorization's tokens from an id_token_hint.
 type idClaims struct {
 	jwt.RegisteredClaims
-	Nonce             string `json:"nonce,omitempty"`
-	Email             string `json:"email,omitempty"`
-	Name              string `json:"name,omitempty"`
-	PreferredUsername string `json:"preferred_username,omitempty"`
-	SessionID         string `json:"sid,omitempty"`
+	Nonce             string   `json:"nonce,omitempty"`
+	Email             string   `json:"email,omitempty"`
+	Name              string   `json:"name,omitempty"`
+	PreferredUsername string   `json:"preferred_username,omitempty"`
+	Roles             []string `json:"roles,omitempty"`
+	SessionID         string   `json:"sid,omitempty"`
 }
 
 // issueTokens mints a fresh access token, an id_token (when the openid scope is
 // present, as it is for rego-adventure) and a brand-new refresh token. Refresh
 // tokens are rotated: every issuance retires the previous one, so a refresh
 // token can only ever be used a single time.
+//
+// Every token carries the configured audience (s.cfg.Audience) — never a
+// caller-chosen one — and profile claims are released strictly according to
+// the granted scopes from the authoritative users-file record.
 func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
 
-	// Profile claims come from the user store when the subject exists there;
-	// single-user mode falls back to a placeholder email. Deliberate
-	// simplification for a minimal IdP: email and name are embedded whenever
-	// they are known, regardless of the granted scopes (the discovery document
-	// lists exactly the claims that are issued).
-	email := ctx.Sub + "@example.com"
-	name := ""
-	if s.users != nil {
-		if u, ok := s.users.Lookup(ctx.Sub); ok {
-			if u.Email != "" {
-				email = u.Email
-			}
+	// Scope-based claim release (OIDC Core §5.4): profile unlocks
+	// preferred_username and name, email unlocks the email claim. The values
+	// come from the users-file record; nothing is fabricated (no
+	// placeholder@example.com), so an absent claim is simply omitted. Roles
+	// are authorization data, not profile claims: they are released on both
+	// tokens whenever the record defines them, regardless of the scopes.
+	wantProfile := hasScope(ctx.Scopes, "profile")
+	wantEmail := hasScope(ctx.Scopes, "email")
+	var email, name string
+	var roles []string
+	if u, ok := s.users.Lookup(ctx.Sub); ok {
+		if wantEmail {
+			email = u.Email
+		}
+		if wantProfile {
 			name = u.Name
 		}
+		roles = u.Roles
 	}
 
 	access := &accessClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    s.cfg.Issuer,
 			Subject:   ctx.Sub,
-			Audience:  jwt.ClaimStrings{ctx.ClientID},
+			Audience:  jwt.ClaimStrings{s.cfg.Audience},
 			ExpiresAt: jwt.NewNumericDate(accessExpires),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        randomJTI(),
 		},
-		Scope:    joinScopes(ctx.Scopes),
-		Username: ctx.Sub,
-		Email:    email,
+		Scope: joinScopes(ctx.Scopes),
 	}
-	accessTokenString, err := s.key.sign(access)
+	if wantProfile {
+		access.Username = ctx.Sub
+	}
+	access.Email = email
+	access.Roles = roles
+	accessTokenString, err := s.key.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -98,17 +111,20 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 			RegisteredClaims: jwt.RegisteredClaims{
 				Issuer:    s.cfg.Issuer,
 				Subject:   ctx.Sub,
-				Audience:  jwt.ClaimStrings{ctx.ClientID},
+				Audience:  jwt.ClaimStrings{s.cfg.Audience},
 				ExpiresAt: jwt.NewNumericDate(accessExpires),
 				IssuedAt:  jwt.NewNumericDate(now),
 				ID:        randomJTI(),
 			},
-			Nonce:             ctx.Nonce,
-			Email:             email,
-			Name:              name,
-			PreferredUsername: ctx.Sub,
-			SessionID:         ctx.Family,
+			Nonce:     ctx.Nonce,
+			SessionID: ctx.Family,
 		}
+		if wantProfile {
+			id.PreferredUsername = ctx.Sub
+			id.Name = name
+		}
+		id.Email = email
+		id.Roles = roles
 		idTokenString, err := s.key.sign(id)
 		if err != nil {
 			return nil, fmt.Errorf("sign id token: %w", err)

@@ -17,8 +17,8 @@ import (
 )
 
 // Config holds all tunable IdP settings. Every field is overridable through an
-// environment variable so the user identity ("rego"/"adventure" by default) and
-// every URL can be configured without recompiling.
+// environment variable so the registered client, the user accounts and every
+// URL can be configured without recompiling.
 type Config struct {
 	// Host is the interface the HTTP server binds to.
 	Host string
@@ -28,24 +28,28 @@ type Config struct {
 	// published in the discovery document. rego-adventure compares this against
 	// its AUTH_ISSUER, so it must line up with whatever the relying party expects.
 	Issuer string
-	// Username / Password are the single user accepted by the IdP (used in
-	// single-user mode; empty in multi-user mode when UsersFile is set).
-	Username string
-	Password string
-	// PasswordBcrypt, when set, is a bcrypt hash of the password; the plaintext
-	// then never needs to appear in configuration or manifests.
-	PasswordBcrypt string
-	// UsersFile, when set, switches the IdP to multi-user mode: the file is a
-	// JSON array of User entries with bcrypt password hashes, managed with the
-	// minidp-users tool. It takes precedence over the single-user credentials,
-	// which must then not be configured at all. Changes take effect on restart.
+	// ClientID is the one registered OAuth client (IDP_CLIENT_ID). minidp is a
+	// single-client provider for public PKCE clients: only this client_id is
+	// accepted at /authorize and /token, and the redirect policy below is its
+	// registration. Requests for any other client are rejected.
+	ClientID string
+	// Audience is the "aud" value written into every access and id token
+	// (IDP_AUDIENCE). It defaults to ClientID. Resource servers (userinfo,
+	// introspection) reject tokens whose audience does not match, so a token
+	// can never be minted for — or accepted at — an arbitrary audience.
+	Audience string
+	// UsersFile is the JSON array of User entries with bcrypt password hashes,
+	// managed with the minidp-users tool. It is the only credential source:
+	// single-user env credentials were removed. Changes take effect on restart.
 	UsersFile string
 	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
 	AccessTokenTTL time.Duration
 	// RefreshTokenTTL is how long a refresh_token stays valid.
 	RefreshTokenTTL time.Duration
-	// AllowedRedirects restricts the redirect_uri values honoured on /authorize.
-	// When empty, any well-formed http(s) redirect_uri is accepted.
+	// AllowedRedirects is the registered redirect_uri set of the single
+	// configured client (ALLOWED_REDIRECTS). Requests are honoured only for
+	// these exact values; the policy is mandatory and minidp fails to start
+	// without it, so no open default exists.
 	AllowedRedirects []string
 	// AllowedOrigins is the explicit CORS origin allowlist (IDP_ALLOWED_ORIGINS).
 	// Origins are additionally derived from the ALLOWED_REDIRECTS entries.
@@ -82,8 +86,8 @@ type Config struct {
 
 // LoadConfig builds a Config from environment variables, applying the documented
 // rego-adventure-compatible defaults. It fails fast on misconfiguration that
-// would silently weaken security (unreadable secret files, invalid proxy CIDRs,
-// conflicting password sources).
+// would silently weaken security (no redirect policy, no users file, removed
+// legacy variables, unreadable secret files, invalid proxy CIDRs).
 func LoadConfig() (Config, error) {
 	accessTokenTTL, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
 	if err != nil {
@@ -97,11 +101,20 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// The single-user credential variables were removed when the users file
+	// became the only account source. Reject them loudly instead of ignoring
+	// them: a silently ignored credential would let an operator believe their
+	// configuration still governs who can sign in.
+	for _, removed := range []string{"IDP_USERNAME", "IDP_PASSWORD", "IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE"} {
+		if os.Getenv(removed) != "" {
+			return Config{}, fmt.Errorf("%s is no longer supported: manage accounts in the IDP_USERS_FILE users file (see minidp-users)", removed)
+		}
+	}
 	cfg := Config{
 		Host:            envOr("IDP_HOST", "0.0.0.0"),
 		Port:            envOr("IDP_PORT", "8080"),
 		Issuer:          envOr("IDP_ISSUER", "http://localhost:8080"),
-		Username:        envOr("IDP_USERNAME", "rego"),
+		ClientID:        envOr("IDP_CLIENT_ID", "rego-adventure"),
 		AccessTokenTTL:  accessTokenTTL,
 		RefreshTokenTTL: refreshTokenTTL,
 		Title:           envOr("IDP_TITLE", "Rego Adventure"),
@@ -111,6 +124,10 @@ func LoadConfig() (Config, error) {
 		LoginRateLimit:  loginRateLimit,
 		ClientSecret:    os.Getenv("IDP_CLIENT_SECRET"),
 	}
+	// The token audience defaults to the registered client id, matching what
+	// rego-adventure expects (AUTH_AUDIENCE = AUTH_CLIENT_ID). A distinct
+	// resource audience can be configured with IDP_AUDIENCE.
+	cfg.Audience = envOr("IDP_AUDIENCE", cfg.ClientID)
 	if raw := os.Getenv("ALLOWED_REDIRECTS"); raw != "" {
 		for _, r := range strings.Split(raw, ",") {
 			if r = strings.TrimSpace(r); r == "" {
@@ -130,6 +147,12 @@ func LoadConfig() (Config, error) {
 			cfg.AllowedRedirects = append(cfg.AllowedRedirects, r)
 		}
 	}
+	// The redirect policy IS the client registration of the single configured
+	// client; an empty allowlist must not fall back to "any host" (that would
+	// send authorization codes to arbitrary URLs).
+	if len(cfg.AllowedRedirects) == 0 {
+		return cfg, fmt.Errorf("ALLOWED_REDIRECTS is empty: declare the registered redirect_uri values of client %q", cfg.ClientID)
+	}
 	if raw := os.Getenv("IDP_ALLOWED_ORIGINS"); raw != "" {
 		for _, o := range strings.Split(raw, ",") {
 			if o = strings.TrimSpace(o); o != "" {
@@ -138,32 +161,10 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Credential source resolution. IDP_USERS_FILE enables multi-user mode and
-	// excludes the single-user sources; otherwise exactly one single-user
-	// source should be configured.
-	usersFile := os.Getenv("IDP_USERS_FILE")
-	bcryptHash := os.Getenv("IDP_PASSWORD_BCRYPT")
-	passwordFile := os.Getenv("IDP_PASSWORD_FILE")
-	plainPassword := os.Getenv("IDP_PASSWORD")
-	if usersFile != "" {
-		// A fixed order keeps the reported conflicting variable deterministic.
-		for _, c := range []struct{ key, val string }{
-			{"IDP_USERNAME", os.Getenv("IDP_USERNAME")},
-			{"IDP_PASSWORD", plainPassword},
-			{"IDP_PASSWORD_BCRYPT", bcryptHash},
-			{"IDP_PASSWORD_FILE", passwordFile},
-		} {
-			if c.val != "" {
-				return cfg, fmt.Errorf("%s is set together with IDP_USERS_FILE; configure either multi-user mode or a single user, not both", c.key)
-			}
-		}
-		cfg.UsersFile = usersFile
-		cfg.Username = "" // multi-user mode has no single configured identity
-	} else {
-		// Username is already resolved in the struct literal above.
-		if err := loadSingleUserCredentials(&cfg, bcryptHash, passwordFile, plainPassword); err != nil {
-			return cfg, err
-		}
+	// Accounts come from the users file; there is no fallback credential.
+	cfg.UsersFile = os.Getenv("IDP_USERS_FILE")
+	if cfg.UsersFile == "" {
+		return cfg, fmt.Errorf("IDP_USERS_FILE is not set: minidp has no built-in accounts, create a users file (see minidp-users) and point IDP_USERS_FILE at it")
 	}
 
 	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
@@ -172,35 +173,6 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.TrustedProxies = proxies
 	return cfg, nil
-}
-
-// loadSingleUserCredentials resolves the password for single-user mode:
-// bcrypt hash wins over a password file, both win over the plaintext default.
-func loadSingleUserCredentials(cfg *Config, bcryptHash, passwordFile, plainPassword string) error {
-	switch {
-	case bcryptHash != "":
-		if plainPassword != "" {
-			return fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_BCRYPT are both set; configure exactly one password source")
-		}
-		cfg.PasswordBcrypt = bcryptHash
-	case passwordFile != "":
-		if plainPassword != "" {
-			return fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_FILE are both set; configure exactly one password source")
-		}
-		// The read is scoped via os.Root so a crafted path cannot traverse
-		// outside the file's directory (gosec G304/G703).
-		raw, err := readScopedFile(passwordFile)
-		if err != nil {
-			return fmt.Errorf("read IDP_PASSWORD_FILE: %w", err)
-		}
-		cfg.Password = strings.TrimSpace(string(raw))
-		if cfg.Password == "" {
-			return fmt.Errorf("IDP_PASSWORD_FILE %q is empty", passwordFile)
-		}
-	default:
-		cfg.Password = envOr("IDP_PASSWORD", "adventure")
-	}
-	return nil
 }
 
 // parseTrustedProxies validates a comma-separated list of CIDR ranges.

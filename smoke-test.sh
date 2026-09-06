@@ -1,5 +1,7 @@
 #!/bin/bash
 # End-to-end smoke test for minidp: full public-client PKCE flow.
+# Self-contained: builds the binaries, creates a users file and starts its own
+# IdP instance on port 8099.
 set -euo pipefail
 
 BASE="http://localhost:8099"
@@ -11,9 +13,12 @@ STATE="st-123"
 NONCE="n-abc"
 JAR=$(mktemp)
 
-# Remove the scratch files when the script exits (success or failure).
+# Scratch files and the test instance are removed when the script exits
+# (success or failure).
 cleanup() {
-  rm -rf "${JAR:-}" "${JAR2:-}" "$(dirname "${UFILE:-/nonexistent}")" /tmp/login.html
+  [ -n "${MINIDP_PID:-}" ] && kill "$MINIDP_PID" 2>/dev/null || true
+  rm -rf "${JAR:-}" "${JAR2:-}" "${WORKDIR:-}"
+  rm -f /tmp/login.html
 }
 trap cleanup EXIT
 
@@ -32,7 +37,25 @@ csrf_for() {
   mark_jar_insecure "$JAR"
 }
 
-AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
+AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile%20email&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
+
+echo "== 0. build + boot a self-contained IdP instance =="
+WORKDIR=$(mktemp -d)
+go build -o "$WORKDIR/minidp" .
+go build -o "$WORKDIR/minidp-users" ./cmd/minidp-users
+"$WORKDIR/minidp-users" add -file "$WORKDIR/users.json" -username rego \
+  -password adventure -email rego@adventure.example -roles admin >/dev/null
+mkdir -p "$WORKDIR/keys"
+IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_USERS_FILE="$WORKDIR/users.json" \
+  ALLOWED_REDIRECTS="$REDIRECT" IDP_KEY_DIR="$WORKDIR/keys" \
+  "$WORKDIR/minidp" >"$WORKDIR/minidp.log" 2>&1 &
+MINIDP_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/healthz" >/dev/null && break
+  sleep 0.2
+done
+curl -sf "$BASE/healthz" >/dev/null || { echo "IdP did not come up"; exit 1; }
+echo "IdP running on $BASE"
 
 echo "== 1. discovery =="
 curl -s "$BASE/.well-known/openid-configuration" | python3 -c "
@@ -56,9 +79,27 @@ print('jwks ok, kid =', k['kid'])
 "
 
 echo "== 3. GET /authorize renders login form =="
-curl -s -c "$JAR" "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256" -o /tmp/login.html
+curl -s -c "$JAR" "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile%20email&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256" -o /tmp/login.html
 grep -q 'name="code_challenge" value="'"$CHALLENGE"'"' /tmp/login.html && echo "PKCE challenge echoed into form"
 grep -q 'name="nonce" value="'"$NONCE"'"' /tmp/login.html && echo "nonce echoed into form"
+
+echo "== 3b. unknown client_id and unregistered redirect are rejected =="
+CSRF=$(csrf_for "$AUTH_QUERY")
+ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=other-app&redirect_uri=$REDIRECT&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
+[ "$ST" = "400" ] && echo "unknown client_id rejected (400) OK"
+ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=https://attacker.example/cb&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
+[ "$ST" = "400" ] && echo "unregistered redirect_uri rejected (400) OK"
+# Unsupported scopes/params are answered with a redirect carrying the error.
+LOC=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=admin&code_challenge=$CHALLENGE&code_challenge_method=S256&state=$STATE")
+case "$LOC" in
+  "$REDIRECT?error=invalid_scope"*) echo "invalid_scope redirect OK" ;;
+  *) echo "UNEXPECTED: $LOC"; exit 1 ;;
+esac
+LOC=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&code_challenge=$CHALLENGE&code_challenge_method=S256&state=$STATE&max_age=900")
+case "$LOC" in
+  "$REDIRECT?error=invalid_request"*) echo "unsupported max_age rejected OK" ;;
+  *) echo "UNEXPECTED: $LOC"; exit 1 ;;
+esac
 
 echo "== 4. POST /authorize with WRONG password =="
 CSRF=$(csrf_for "$AUTH_QUERY")
@@ -67,7 +108,7 @@ LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize"
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid profile" \
+  --data-urlencode "scope=openid profile email" \
   --data-urlencode "state=$STATE" \
   --data-urlencode "nonce=$NONCE" \
   --data-urlencode "code_challenge=$CHALLENGE" \
@@ -83,7 +124,7 @@ LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authori
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid profile" \
+  --data-urlencode "scope=openid profile email" \
   --data-urlencode "state=$STATE" \
   --data-urlencode "nonce=$NONCE" \
   --data-urlencode "code_challenge=$CHALLENGE" \
@@ -130,14 +171,22 @@ def claims(t):
     p=t.split('.')[1]
     p+='='*(-len(p)%4)
     return json.loads(base64.urlsafe_b64decode(p))
+def typ(t):
+    h=t.split('.')[0]
+    h+='='*(-len(h)%4)
+    return json.loads(base64.urlsafe_b64decode(h))['typ']
 ac=claims(d['access_token']); ic=claims(d['id_token'])
 assert ac['iss']=='$BASE' and ic['iss']=='$BASE'
 assert ac['aud']==['$CLIENT'] and ic['aud']==['$CLIENT']
 assert ac['sub']=='rego' and ic['sub']=='rego'
 assert ic['nonce']=='$NONCE', ic['nonce']
-print('access+id token claims OK (iss/aud/sub/nonce)')
+assert typ(d['access_token'])=='at+jwt', 'access token must carry the RFC 9068 typ header'
+assert typ(d['id_token'])=='JWT', 'id token must carry typ JWT'
+assert ac['email']=='rego@adventure.example', ac.get('email')
+assert ac['roles']==['admin'] and ic['roles']==['admin'], 'roles must be released on both tokens when set'
+print('access+id token claims OK (iss/aud/sub/nonce/typ/scope/roles claims)')
 print('refresh token present, scope =', d['scope'])
-" 
+"
 REFRESH=$(printf '%s' "$TOK" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
 
 echo "== 8. reuse the SAME code again (must fail, single-use) =="
@@ -180,15 +229,24 @@ assert d['error']=='invalid_grant', d
 print('reuse detected: whole token family revoked OK')
 "
 
+echo "== 10b. unknown client_id cannot redeem or refresh =="
+RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=anything&client_id=other-app")
+echo "$RESP" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['error']=='invalid_grant', d
+print('unknown client at /token rejected OK')
+"
+
 echo "== 11. userinfo with a fresh token set =="
 # A fresh login: the replay above killed the previous family on purpose.
 V3=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
 C3=$(printf '%s' "$V3" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
-CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s3&nonce=n3&code_challenge=$C3&code_challenge_method=S256")
+CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=s3&nonce=n3&code_challenge=$C3&code_challenge_method=S256")
 LOC3=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
   --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
-  --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
+  --data-urlencode "response_type=code" --data-urlencode "scope=openid profile" \
   --data-urlencode "state=s3" --data-urlencode "nonce=n3" \
   --data-urlencode "code_challenge=$C3" --data-urlencode "code_challenge_method=S256" \
   --data-urlencode "username=rego" --data-urlencode "password=adventure")
@@ -203,8 +261,12 @@ curl -s -H "Authorization: Bearer $AT" "$BASE/userinfo" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['sub']=='rego' and d['preferred_username']=='rego', d
-print('userinfo OK:', d['sub'])
+assert 'email' not in d, 'email must not be released without the email scope'
+print('userinfo OK (profile scope):', d['sub'])
 "
+# The id_token must NOT work as a bearer access token (typ profile separation).
+ST=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $IDTOK3" "$BASE/userinfo")
+[ "$ST" = "401" ] && echo "id_token rejected as access token OK"
 
 echo "== 12. userinfo with garbage token (must 401) =="
 curl -s -o /dev/null -w 'userinfo bad token -> %{http_code}\n' -H "Authorization: Bearer garbage" "$BASE/userinfo"
@@ -214,6 +276,7 @@ curl -s -X POST "$BASE/introspect" -d "token=$AT" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['active'] is True and d['sub']=='rego', d
+assert d['aud']==['$CLIENT'], d
 print('introspect OK (active)')
 "
 # Logout with the id_token_hint revokes the whole authorization: the access
@@ -262,40 +325,45 @@ curl -s -o /dev/null -D - "$BASE/" | grep -i "x-frame-options: DENY" >/dev/null 
   && curl -s -o /dev/null -D - "$BASE/" | grep -i "content-security-policy:.*frame-ancestors 'none'" >/dev/null \
   && echo "security headers OK"
 
-echo "== 17. CSRF-protected login =="
+echo "== 17. CSRF-protected login + token responses not cacheable =="
 curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_code}\n' -X POST "$BASE/authorize" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "username=rego" --data-urlencode "password=adventure" \
   | grep -q "400" && echo "login without CSRF token rejected OK"
+curl -s -D - -o /dev/null -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=x&client_id=$CLIENT" \
+  | grep -qi "cache-control: no-store" && echo "token response Cache-Control: no-store OK"
 
-echo "== 18. multi-user mode (users file + minidp-users tool) =="
-TOOL=/tmp/minidp-users
-go build -o "$TOOL" ./cmd/minidp-users
-# The multi-user section starts its own IdP instance; build the server next to
-# the tool so the section works on a fresh checkout that only followed the
-# README (which builds into the repo directory, not /tmp).
-go build -o /tmp/minidp .
-UFILE="$(mktemp -d)/users.json"
-"$TOOL" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example >/dev/null
-"$TOOL" add -file "$UFILE" -username bob -password builder >/dev/null
-"$TOOL" list -file "$UFILE" | grep -q "^alice" && echo "tool: users added and listed"
-"$TOOL" update -file "$UFILE" -username bob -password builder2 >/dev/null && echo "tool: password updated"
-"$TOOL" remove -file "$UFILE" -username bob >/dev/null && echo "tool: user removed"
+echo "== 18. minidp-users tool + a second users-file instance =="
+UFILE="$WORKDIR/users2.json"
+"$WORKDIR/minidp-users" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example -name Alice -roles admin,auditor >/dev/null
+"$WORKDIR/minidp-users" add -file "$UFILE" -username bob -password builder >/dev/null
+"$WORKDIR/minidp-users" list -file "$UFILE" | grep -q "^alice.*roles: admin,auditor" && echo "tool: users added and listed"
+"$WORKDIR/minidp-users" update -file "$UFILE" -username alice -roles admin >/dev/null && echo "tool: roles updated"
+"$WORKDIR/minidp-users" update -file "$UFILE" -username bob -password builder2 >/dev/null && echo "tool: password updated"
+"$WORKDIR/minidp-users" remove -file "$UFILE" -username bob >/dev/null && echo "tool: user removed"
 
-IDP_PORT=8098 IDP_ISSUER=http://localhost:8098 IDP_USERS_FILE="$UFILE" /tmp/minidp &
+IDP_PORT=8098 IDP_ISSUER=http://localhost:8098 IDP_USERS_FILE="$UFILE" \
+  ALLOWED_REDIRECTS="$REDIRECT" "$WORKDIR/minidp" >"$WORKDIR/minidp2.log" 2>&1 &
 MINIDP2_PID=$!
-sleep 1
+cleanup() {
+  [ -n "${MINIDP2_PID:-}" ] && kill "$MINIDP2_PID" 2>/dev/null || true
+}
+trap 'cleanup; exit' EXIT
+for _ in $(seq 1 50); do
+  curl -sf http://localhost:8098/healthz >/dev/null && break
+  sleep 0.2
+done
 
 BASE2="http://localhost:8098"
 V2=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
 C2=$(printf '%s' "$V2" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
-Q2="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s9&nonce=n9&code_challenge=$C2&code_challenge_method=S256"
+Q2="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile%20email&state=s9&nonce=n9&code_challenge=$C2&code_challenge_method=S256"
 JAR2=$(mktemp)
 CSRF2=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
 mark_jar_insecure "$JAR2"
 LOC9=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
   --data-urlencode "csrf_token=$CSRF2" --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
+  --data-urlencode "scope=openid profile email" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
   --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
   --data-urlencode "username=alice" --data-urlencode "password=wonderland")
 CODE9=$(printf '%s' "$LOC9" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
@@ -311,23 +379,25 @@ def claims(t):
 ac=claims(d['access_token']); ic=claims(d['id_token'])
 assert ac['sub']=='alice' and ic['sub']=='alice', (ac['sub'], ic['sub'])
 assert ic['email']=='alice@wonderland.example', ic['email']
-print('multi-user: alice logged in, sub/email claims correct')
+assert ic['name']=='Alice', ic.get('name')
+assert ac['roles']==['admin'] and ic['roles']==['admin'], ac.get('roles')
+print('multi-user: alice logged in, sub/email/name/roles claims correct')
 "
 
-# The former single-user demo credentials must not work in multi-user mode.
+# Credentials that are not in the users file must not authenticate.
 CSRF3=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
 mark_jar_insecure "$JAR2"
 ST9=$(curl -s -b "$JAR2" -o /dev/null -w '%{http_code}' -X POST "$BASE2/authorize" \
   --data-urlencode "csrf_token=$CSRF3" --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
+  --data-urlencode "scope=openid profile email" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
   --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
   --data-urlencode "username=rego" --data-urlencode "password=adventure")
 if [ "$ST9" != "401" ]; then
-  echo "UNEXPECTED: rego/adventure in multi-user mode -> $ST9 (want 401)"; exit 1
+  echo "UNEXPECTED: unknown user in users-file mode -> $ST9 (want 401)"; exit 1
 fi
-echo "multi-user: rego/adventure rejected OK"
-kill "$MINIDP2_PID" 2>/dev/null
+echo "multi-user: unknown user rejected OK"
+kill "$MINIDP2_PID" 2>/dev/null || true
 
 echo
 echo "ALL CHECKS PASSED"

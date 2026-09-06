@@ -15,12 +15,14 @@ import (
 
 // User is one account in the users file (IDP_USERS_FILE). Passwords are
 // stored as bcrypt hashes — the per-user salt is part of the bcrypt format
-// ($2a$10$<salt><hash>), so no separate salt field is needed.
+// ($2a$10$<salt><hash>), so no separate salt field is needed. Roles, when
+// set, are released as the roles claim on every token of the user.
 type User struct {
-	Username     string `json:"username"`
-	PasswordHash string `json:"password_hash"`
-	Email        string `json:"email,omitempty"`
-	Name         string `json:"name,omitempty"`
+	Username     string   `json:"username"`
+	PasswordHash string   `json:"password_hash"`
+	Email        string   `json:"email,omitempty"`
+	Name         string   `json:"name,omitempty"`
+	Roles        []string `json:"roles,omitempty"`
 }
 
 // UserStore is the account backend of the IdP. It is an interface so the
@@ -48,6 +50,19 @@ func (u User) validate() error {
 	if !isBcryptHash(u.PasswordHash) {
 		return fmt.Errorf("user %q: password_hash must be a 60-character bcrypt hash "+
 			"like $2a$10$... (generate one with: minidp-users hash)", u.Username)
+	}
+	seenRoles := make(map[string]bool, len(u.Roles))
+	for _, role := range u.Roles {
+		if strings.TrimSpace(role) == "" {
+			return fmt.Errorf("user %q: roles must not contain empty entries", u.Username)
+		}
+		if role != strings.TrimSpace(role) {
+			return fmt.Errorf("user %q: role %q must not have leading or trailing whitespace", u.Username, role)
+		}
+		if seenRoles[role] {
+			return fmt.Errorf("user %q: duplicate role %q", u.Username, role)
+		}
+		seenRoles[role] = true
 	}
 	return nil
 }

@@ -14,11 +14,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // testIDP spins up a real HTTP test server. The listener is created first so
 // the issuer URL is known before the Server (which signs tokens with it) is
-// constructed.
+// constructed. The default client registration matches the authorize helpers
+// below; mutate the Config for other cases.
 func testIDP(t *testing.T, mutate func(*Config)) (*httptest.Server, *Server) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -26,12 +29,14 @@ func testIDP(t *testing.T, mutate func(*Config)) (*httptest.Server, *Server) {
 		t.Fatalf("listen: %v", err)
 	}
 	cfg := Config{
-		Host:            "127.0.0.1",
-		Username:        "rego",
-		Password:        "adventure",
-		Issuer:          "http://" + ln.Addr().String(),
-		AccessTokenTTL:  time.Hour,
-		RefreshTokenTTL: 2 * time.Hour,
+		Host:             "127.0.0.1",
+		ClientID:         testClientID,
+		Audience:         testClientID,
+		UsersFile:        writeUsersFile(t),
+		AllowedRedirects: []string{testRedirect},
+		Issuer:           "http://" + ln.Addr().String(),
+		AccessTokenTTL:   time.Hour,
+		RefreshTokenTTL:  2 * time.Hour,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -91,7 +96,7 @@ func pkcePair() (verifier, challenge string) {
 const (
 	testClientID   = "rego-adventure"
 	testRedirect   = "http://localhost:3000/callback"
-	testScopes     = "openid profile"
+	testScopes     = "openid profile email"
 	testNonceValue = "n-abc"
 	testStateValue = "st-123"
 )
@@ -280,9 +285,31 @@ func TestAuthorizeFormRendersHiddenParams(t *testing.T) {
 	}
 }
 
-func TestAuthorizeRejectsMissingPKCE(t *testing.T) {
+// authorizeError extracts the OAuth error code from a 302 the authorize
+// endpoint sent to the registered redirect_uri.
+func authorizeError(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302 to the redirect_uri", resp.StatusCode)
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil || loc.String() != resp.Header.Get("Location") {
+		t.Fatalf("bad redirect location %q", resp.Header.Get("Location"))
+	}
+	if got := loc.String(); !strings.HasPrefix(got, testRedirect+"?") {
+		t.Fatalf("error went to %q, want the registered redirect_uri", got)
+	}
+	if loc.Query().Get("state") != testStateValue {
+		t.Errorf("error redirect must echo state, got %q", loc.Query().Get("state"))
+	}
+	return loc.Query().Get("error")
+}
+
+// TestAuthorizeRejectsUnknownClientID pins the H1 fix: minidp is a
+// single-client provider, so only the registered client_id may start a flow.
+func TestAuthorizeRejectsUnknownClientID(t *testing.T) {
 	ts, _ := testIDP(t, nil)
-	resp, err := http.Get(ts.URL + "/authorize?client_id=c1&redirect_uri=" + url.QueryEscape(testRedirect) + "&response_type=code")
+	resp, err := http.Get(ts.URL + "/authorize?client_id=any-other-app&redirect_uri=" + url.QueryEscape(testRedirect) + "&response_type=code&code_challenge=" + strings.Repeat("a", 43) + "&code_challenge_method=S256")
 	if err != nil {
 		t.Fatalf("GET /authorize: %v", err)
 	}
@@ -291,8 +318,39 @@ func TestAuthorizeRejectsMissingPKCE(t *testing.T) {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "code_challenge") {
-		t.Error("expected an explanation that PKCE is required")
+	if !strings.Contains(string(body), "Unknown client_id") {
+		t.Error("expected an explanatory error page, not a redirect to an attacker-controlled URI")
+	}
+}
+
+// TestAuthorizeRejectsUnregisteredRedirect pins the H1/H2 fix: redirect URIs
+// outside the client registration are rejected with an error page — never a
+// redirect.
+func TestAuthorizeRejectsUnregisteredRedirect(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	target := ts.URL + "/authorize?client_id=" + testClientID + "&redirect_uri=" + url.QueryEscape("https://attacker.example/cb") + "&response_type=code&code_challenge=" + strings.Repeat("a", 43) + "&code_challenge_method=S256"
+	resp, err := noFollow().Get(target)
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestAuthorizeRejectsMissingPKCE(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	// After the client binding is validated, errors are redirected to the
+	// registered redirect_uri (RFC 6749 §4.1.2.1) — never shown on a page.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/authorize?client_id="+testClientID+"&redirect_uri="+url.QueryEscape(testRedirect)+"&response_type=code&state="+testStateValue, nil)
+	resp, err := noFollow().Do(req)
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := authorizeError(t, resp); got != "invalid_request" {
+		t.Errorf("error = %q, want invalid_request", got)
 	}
 }
 
@@ -301,19 +359,15 @@ func TestAuthorizeRejectsMissingPKCE(t *testing.T) {
 func TestAuthorizeRejectsPlainPKCE(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	for _, method := range []string{"plain", "", "s256"} {
-		target := ts.URL + "/authorize?client_id=c1&redirect_uri=" + url.QueryEscape(testRedirect) +
-			"&response_type=code&code_challenge=abc&code_challenge_method=" + url.QueryEscape(method)
-		resp, err := http.Get(target)
+		target := ts.URL + "/authorize?client_id=" + testClientID + "&redirect_uri=" + url.QueryEscape(testRedirect) +
+			"&response_type=code&state=" + testStateValue + "&code_challenge=abc&code_challenge_method=" + url.QueryEscape(method)
+		resp, err := noFollow().Get(target)
 		if err != nil {
 			t.Fatalf("GET /authorize (method=%q): %v", method, err)
 		}
-		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("method=%q: status = %d, want 400", method, resp.StatusCode)
-		}
-		if !strings.Contains(string(body), "S256") {
-			t.Errorf("method=%q: expected an explanation mentioning S256", method)
+		if got := authorizeError(t, resp); got != "invalid_request" {
+			t.Errorf("method=%q: error = %q, want invalid_request", method, got)
 		}
 	}
 
@@ -321,6 +375,109 @@ func TestAuthorizeRejectsPlainPKCE(t *testing.T) {
 	if verifyPKCE("some-verifier", "plain", "some-verifier") {
 		t.Error("verifyPKCE must reject the plain method")
 	}
+}
+
+// TestAuthorizeRejectsUnsupportedScope pins the M1 fix: scopes outside the
+// advertised set are rejected with invalid_scope instead of being copied into
+// tokens.
+func TestAuthorizeRejectsUnsupportedScope(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	for _, scope := range []string{"admin", "offline_access openid", "openid profile bogus"} {
+		q := authorizeForm(verifier)
+		q.Set("scope", scope)
+		resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
+		if err != nil {
+			t.Fatalf("GET /authorize (scope=%q): %v", scope, err)
+		}
+		_ = resp.Body.Close()
+		if got := authorizeError(t, resp); got != "invalid_scope" {
+			t.Errorf("scope=%q: error = %q, want invalid_scope", scope, got)
+		}
+	}
+}
+
+// TestAuthorizeRejectsUnsupportedOIDCParams pins the M3 fix: prompt (other
+// than login/none), max_age, response_mode, display, ui_locales and
+// acr_values are rejected explicitly instead of being accepted and ignored.
+func TestAuthorizeRejectsUnsupportedOIDCParams(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	cases := map[string]url.Values{
+		"max_age":        {"max_age": {"900"}},
+		"acr_values":     {"acr_values": {"mfa"}},
+		"display":        {"display": {"popup"}},
+		"ui_locales":     {"ui_locales": {"de"}},
+		"response_mode":  {"response_mode": {"form_post"}},
+		"prompt=consent": {"prompt": {"consent"}},
+	}
+	for name, extra := range cases {
+		q := authorizeForm(verifier)
+		for k, v := range extra {
+			q.Set(k, v[0])
+		}
+		resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
+		if err != nil {
+			t.Fatalf("GET /authorize (%s): %v", name, err)
+		}
+		_ = resp.Body.Close()
+		if got := authorizeError(t, resp); got != "invalid_request" {
+			t.Errorf("%s: error = %q, want invalid_request", name, got)
+		}
+	}
+}
+
+// TestAuthorizePromptNoneReturnsLoginRequired pins the OIDC behaviour for
+// prompt=none: minidp keeps no browser session, so the correct answer is the
+// login_required error redirect, not a login page.
+func TestAuthorizePromptNoneReturnsLoginRequired(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	q := authorizeForm(verifier)
+	q.Set("prompt", "none")
+	resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
+	if err != nil {
+		t.Fatalf("GET /authorize: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := authorizeError(t, resp); got != "login_required" {
+		t.Errorf("error = %q, want login_required", got)
+	}
+}
+
+// TestTokenResponseNoStore pins the M4 fix: /token responses (including
+// errors) must not be cached (RFC 6749 §5.1).
+func TestTokenResponseNoStore(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{"grant_type": {"password"}})
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("error response Cache-Control = %q, want no-store", got)
+	}
+	if got := resp.Header.Get("Pragma"); got != "no-cache" {
+		t.Errorf("error response Pragma = %q, want no-cache", got)
+	}
+	_ = resp.Body.Close()
+
+	// A successful response must carry the headers as well.
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	ok := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	})
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("token grant: status = %d", ok.StatusCode)
+	}
+	if got := ok.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("success response Cache-Control = %q, want no-store", got)
+	}
+	if got := ok.Header.Get("Pragma"); got != "no-cache" {
+		t.Errorf("success response Pragma = %q, want no-cache", got)
+	}
+	_ = ok.Body.Close()
 }
 
 func TestAuthorizeWrongPassword(t *testing.T) {
@@ -347,13 +504,20 @@ func TestAuthorizeWrongPassword(t *testing.T) {
 
 func TestAuthorizeRedirectsUnknownResponseType(t *testing.T) {
 	ts, _ := testIDP(t, nil)
-	resp, err := http.Get(ts.URL + "/authorize?client_id=c1&redirect_uri=" + url.QueryEscape(testRedirect) + "&response_type=token&code_challenge=x")
+	q := url.Values{
+		"client_id":      {testClientID},
+		"redirect_uri":   {testRedirect},
+		"response_type":  {"token"},
+		"state":          {testStateValue},
+		"code_challenge": {strings.Repeat("a", 43)},
+	}
+	resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
 	if err != nil {
 		t.Fatalf("GET /authorize: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("response_type=token: status = %d, want 400", resp.StatusCode)
+	if got := authorizeError(t, resp); got != "unsupported_response_type" {
+		t.Errorf("error = %q, want unsupported_response_type", got)
 	}
 }
 
@@ -669,6 +833,9 @@ func TestUserinfo(t *testing.T) {
 	if info["sub"] != "rego" || info["preferred_username"] != "rego" {
 		t.Errorf("userinfo = %v", info)
 	}
+	if info["email"] != "rego@example.com" {
+		t.Errorf("userinfo email = %v, want the users-file value", info["email"])
+	}
 
 	// A garbage token must be rejected with 401.
 	bad, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
@@ -680,6 +847,83 @@ func TestUserinfo(t *testing.T) {
 	defer func() { _ = badResp.Body.Close() }()
 	if badResp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("garbage token: status = %d, want 401", badResp.StatusCode)
+	}
+}
+
+// TestUserinfoEnforcesScopesAndTokenProfile pins the H3/M2 fixes end-to-end:
+// an id_token is not a bearer access token, and profile claims follow the
+// granted scopes.
+func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
+	ts, srv := testIDP(t, nil)
+	verifier, _ := pkcePair()
+
+	// A flow WITHOUT profile/email scopes: userinfo must return sub only.
+	form := authorizeForm(verifier)
+	form.Set("scope", "openid")
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", form))
+	form.Set("username", "rego")
+	form.Set("password", "adventure")
+	loginResp := postForm(t, browser, ts.URL+"/authorize", form)
+	if loginResp.StatusCode != http.StatusFound {
+		t.Fatalf("POST /authorize: status = %d", loginResp.StatusCode)
+	}
+	code := codeFrom(t, loginResp.Header.Get("Location"))
+	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+
+	call := func(token string) (int, map[string]any) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /userinfo: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode, decodeJSON(t, resp)
+	}
+
+	status, info := call(tokens["access_token"].(string))
+	if status != http.StatusOK {
+		t.Fatalf("userinfo (openid only): status = %d", status)
+	}
+	if info["sub"] != "rego" {
+		t.Errorf("userinfo sub = %v", info["sub"])
+	}
+	if _, has := info["preferred_username"]; has {
+		t.Error("preferred_username must not be released without the profile scope")
+	}
+	if _, has := info["email"]; has {
+		t.Error("email must not be released without the email scope")
+	}
+
+	// The id_token (typ JWT) must be rejected as a bearer access token (H3).
+	status, _ = call(tokens["id_token"].(string))
+	if status != http.StatusUnauthorized {
+		t.Errorf("id_token at /userinfo: status = %d, want 401", status)
+	}
+
+	// A signed access token for a foreign audience must be rejected (H4).
+	foreign := jwt.MapClaims{
+		"iss": srv.cfg.Issuer,
+		"sub": "rego",
+		"aud": "some-other-client",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+		"jti": "foreign-aud-jti",
+	}
+	signed, err := srv.key.signAccess(foreign)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	status, _ = call(signed)
+	if status != http.StatusUnauthorized {
+		t.Errorf("foreign-audience token at /userinfo: status = %d, want 401", status)
 	}
 }
 
@@ -908,27 +1152,31 @@ func base64Decode(s string) ([]byte, error) {
 }
 
 func TestRedirectURIAllowed(t *testing.T) {
-	// Default policy: any well-formed http(s) URI is allowed.
-	_, srv := testIDP(t, nil)
-	if !srv.redirectURIAllowed(testRedirect) {
-		t.Error("expected default policy to allow well-formed http(s) redirect URIs")
-	}
-	if srv.redirectURIAllowed("javascript:alert(1)") {
-		t.Error("non-http schemes must be rejected")
-	}
-	if srv.redirectURIAllowed("not a url") {
-		t.Error("garbage redirect URIs must be rejected")
-	}
-
-	// With an allowlist, only exactly listed URIs pass.
+	// With a registered policy, only exactly listed URIs pass.
 	_, srv2 := testIDP(t, func(c *Config) {
 		c.AllowedRedirects = []string{testRedirect}
 	})
 	if !srv2.redirectURIAllowed(testRedirect) {
-		t.Error("allowlisted URI must be allowed")
+		t.Error("registered URI must be allowed")
 	}
 	if srv2.redirectURIAllowed("https://other.example.com/cb") {
-		t.Error("non-allowlisted URI must be rejected")
+		t.Error("non-registered URI must be rejected")
+	}
+	if srv2.redirectURIAllowed(testRedirect + "#frag") {
+		t.Error("a URI with a fragment must be rejected")
+	}
+	if srv2.redirectURIAllowed("javascript:alert(1)") {
+		t.Error("non-http schemes must be rejected")
+	}
+	if srv2.redirectURIAllowed("not a url") {
+		t.Error("garbage redirect URIs must be rejected")
+	}
+
+	// There is no open fallback: without a policy nothing is allowed (the
+	// server refuses to start this way; this only pins the check).
+	_, srv3 := testIDP(t, func(c *Config) { c.AllowedRedirects = nil })
+	if srv3.redirectURIAllowed(testRedirect) {
+		t.Error("an empty policy must allow nothing")
 	}
 }
 
@@ -989,7 +1237,8 @@ func TestCORSRejectsArbitraryOrigins(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	// Without any allowlist, nothing is credited cross-origin.
+	// An origin that is neither derived from a registered redirect nor
+	// listed in IDP_ALLOWED_ORIGINS is never credited.
 	ts2, _ := testIDP(t, nil)
 	req, _ := http.NewRequest(http.MethodGet, ts2.URL+"/healthz", nil)
 	req.Header.Set("Origin", "https://adventure.example.com")
@@ -999,7 +1248,7 @@ func TestCORSRejectsArbitraryOrigins(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
-		t.Errorf("no allowlist configured: Access-Control-Allow-Origin = %q, want unset", got)
+		t.Errorf("unrelated origin: Access-Control-Allow-Origin = %q, want unset", got)
 	}
 }
 
@@ -1129,10 +1378,12 @@ func TestCSRFTokenRequiresBrowserNonce(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
 
-	// The attacker fetches a valid form for their own parameters.
+	// The attacker fetches a valid form for their own (registered redirect,
+	// attacker-chosen state) parameters.
 	attacker := newBrowser()
 	attackerForm := authorizeForm(verifier)
-	attackerForm.Set("redirect_uri", "http://evil.example.com/callback")
+	attackerForm.Set("state", "attacker-state")
+	attackerForm.Set("nonce", "attacker-nonce")
 	token := fetchCSRF(t, attacker, ts.URL+"/authorize", attackerForm)
 
 	submit := func(victim *http.Client) *http.Response {
@@ -1365,7 +1616,6 @@ func TestMultiUserFlow(t *testing.T) {
 	}
 	ts, _ := testIDP(t, func(c *Config) {
 		c.UsersFile = usersFile
-		c.Username = "" // multi-user mode
 	})
 
 	redeem := func(user, pass, verifier string) map[string]any {
@@ -1394,21 +1644,22 @@ func TestMultiUserFlow(t *testing.T) {
 		t.Errorf("alice id claims = %v/%v", idA["email"], idA["name"])
 	}
 
-	// Bob: no email in the file -> placeholder fallback, no name claim.
+	// Bob: no email or name in the file -> the claims are absent, nothing is
+	// fabricated.
 	verifierB, _ := pkcePair()
 	tokensB := redeem("bob", "builder", verifierB)
 	idB := verifyTokenString(t, tokensB["id_token"].(string), ts.URL)
 	if idB["sub"] != "bob" {
 		t.Errorf("bob id sub = %v", idB["sub"])
 	}
-	if idB["email"] != "bob@example.com" {
-		t.Errorf("bob id email = %v, want the placeholder", idB["email"])
+	if _, has := idB["email"]; has {
+		t.Error("bob has no email in the users file; the claim must be absent")
 	}
 	if _, has := idB["name"]; has {
 		t.Error("bob has no name in the users file; the claim must be absent")
 	}
 
-	// The single-user demo credentials must no longer authenticate.
+	// Credentials that are not in the users file do not authenticate.
 	verifierC, _ := pkcePair()
 	form := authorizeForm(verifierC)
 	form.Set("username", "rego")

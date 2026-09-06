@@ -187,11 +187,31 @@ func loadSigningKey(pemPath string) (*signingKey, error) {
 	return &signingKey{key: key, kid: "minidp-1", version: "1.0"}, nil
 }
 
-// sign produces an RS256-signed JWT for the supplied claims.
+// typIDToken / typAccessToken are the JWT "typ" header values. Access tokens
+// use the RFC 9068 profile header "at+jwt" so resource endpoints can tell an
+// access token from an id token even before looking at the claims; accepting
+// an id token as a bearer access token was a review finding (H3).
+const (
+	typIDToken     = "JWT"
+	typAccessToken = "at+jwt"
+)
+
+// sign produces an RS256-signed id token for the supplied claims.
 func (k *signingKey) sign(claims jwt.Claims) (string, error) {
+	return k.signTyped(claims, typIDToken)
+}
+
+// signAccess produces an RS256-signed access token with the RFC 9068 "at+jwt"
+// typ header.
+func (k *signingKey) signAccess(claims jwt.Claims) (string, error) {
+	return k.signTyped(claims, typAccessToken)
+}
+
+// signTyped signs the claims with the given typ header value.
+func (k *signingKey) signTyped(claims jwt.Claims, typ string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = k.kid
-	token.Header["typ"] = "JWT"
+	token.Header["typ"] = typ
 	return token.SignedString(k.key)
 }
 

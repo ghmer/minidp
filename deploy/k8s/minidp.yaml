@@ -55,17 +55,22 @@ spec:
           env:
             - name: IDP_ISSUER
               value: https://idp.example.com # must be the URL browsers reach
-            - name: IDP_USERNAME
-              valueFrom:
-                secretKeyRef: { name: minidp, key: username }
-            - name: IDP_PASSWORD
-              valueFrom:
-                secretKeyRef: { name: minidp, key: password }
+            # Single registered client; tokens carry aud=rego-adventure and
+            # both /authorize and /token reject every other client_id.
+            - name: IDP_CLIENT_ID
+              value: rego-adventure
+            - name: IDP_AUDIENCE
+              value: rego-adventure
+            # Registered redirect URIs of the client (mandatory — minidp
+            # refuses to start without a redirect policy).
+            - name: ALLOWED_REDIRECTS
+              value: https://adventure.example.com/callback
+            # Accounts come from a users-file Secret (bcrypt hashes, managed
+            # with minidp-users); there are no built-in credentials.
+            - name: IDP_USERS_FILE
+              value: /config/users.json
             - name: IDP_KEY_DIR
               value: /data
-            # Restrict redirects once the client is known:
-            # - name: ALLOWED_REDIRECTS
-            #   value: https://adventure.example.com/callback
             # Behind an ingress, trust its network so rate limiting sees real IPs:
             # - name: TRUSTED_PROXIES
             #   value: 10.0.0.0/8
@@ -76,6 +81,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: users
+              mountPath: /config
+              readOnly: true
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2
@@ -90,6 +98,12 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        - name: users
+          secret:
+            secretName: minidp-users
+            items:
+              - key: users.json
+                path: users.json
           # For key stability across pod reschedules, mount a Secret instead:
           # - name: keys
           #   secret: { secretName: minidp-key }
@@ -98,13 +112,8 @@ spec:
           #   value: /keys/minidp-rsa.pem
           # plus mount "keys" at /keys (readOnly).
 ---
-# Example secret — create it properly with kubectl create secret, do not
-# commit real credentials:
+# Example secret — create it properly with kubectl, do not commit real
+# credentials. Build the file with the bundled tool (never prints hashes):
 #
-#   kubectl create secret generic minidp \
-#     --from-literal=username=rego \
-#     --from-literal=password=adventure
-#
-# For a hash-only manifest use IDP_PASSWORD_BCRYPT with a bcrypt hash:
-#
-#   htpasswd -bnBC 10 "" 'adventure' | tr -d ':\n'
+#   minidp-users add -file users.json -username rego -email rego@example.com
+#   kubectl create secret generic minidp-users --from-file=users.json=users.json
