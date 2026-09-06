@@ -99,29 +99,41 @@ func (s *Server) validateAuthorizeRequest(q url.Values) string {
 	return ""
 }
 
+// nonceBytes is the length of the per-browser CSRF nonce.
+const nonceBytes = 32
+
 // renderLoginPage renders the login form (or an error message page). A fresh
 // per-browser nonce is generated and delivered in an HttpOnly SameSite cookie;
 // the form's CSRF token is signed over that nonce, so a token obtained by one
 // browser cannot be replayed from another.
+//
+// The nonce is only minted when the browser does not already carry a valid
+// one: re-rendering (a failed login, a second tab) reuses the existing nonce
+// and keeps forms rendered earlier valid, instead of silently invalidating
+// every previously issued form. The token itself is freshly signed per render
+// and expires with the manager TTL either way.
 func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status int, data loginData) {
 	if data.Action != "" {
-		nonce := make([]byte, 32)
-		if _, err := rand.Read(nonce); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+		nonce := csrfNonce(r)
+		if len(nonce) != nonceBytes {
+			nonce = make([]byte, nonceBytes)
+			if _, err := rand.Read(nonce); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			// #nosec G124 -- Secure is deliberately conditional on the issuer scheme
+			// (https => true) so the plain-HTTP demo deployment keeps working; all
+			// other attributes are strictly set.
+			http.SetCookie(w, &http.Cookie{
+				Name:     csrfCookie,
+				Value:    base64.RawURLEncoding.EncodeToString(nonce),
+				Path:     "/",
+				MaxAge:   int(s.csrf.ttl.Seconds()),
+				HttpOnly: true,
+				Secure:   strings.HasPrefix(s.cfg.Issuer, "https://"),
+				SameSite: http.SameSiteLaxMode,
+			})
 		}
-		// #nosec G124 -- Secure is deliberately conditional on the issuer scheme
-		// (https => true) so the plain-HTTP demo deployment keeps working; all
-		// other attributes are strictly set.
-		http.SetCookie(w, &http.Cookie{
-			Name:     csrfCookie,
-			Value:    base64.RawURLEncoding.EncodeToString(nonce),
-			Path:     "/",
-			MaxAge:   int(s.csrf.ttl.Seconds()),
-			HttpOnly: true,
-			Secure:   strings.HasPrefix(s.cfg.Issuer, "https://"),
-			SameSite: http.SameSiteLaxMode,
-		})
 		data.CSRFToken = s.csrf.issue(data.Action, oauthParamsOf(r), nonce)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

@@ -1012,6 +1012,58 @@ func TestAuthorizeFormSetsNonceCookie(t *testing.T) {
 	}
 }
 
+// TestLoginFormsSurviveRerender pins the review fix: rendering a new login
+// form (second tab, failed-login re-render) must not rotate the nonce cookie,
+// which used to invalidate every previously rendered form.
+func TestLoginFormsSurviveRerender(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifierA, _ := pkcePair()
+	verifierB, _ := pkcePair()
+
+	browser := newBrowser()
+
+	// Tab A fetches its form.
+	formA := authorizeForm(verifierA)
+	respA, err := browser.Get(ts.URL + "/authorize?" + formA.Encode())
+	if err != nil {
+		t.Fatalf("GET /authorize (tab A): %v", err)
+	}
+	bodyA, _ := io.ReadAll(respA.Body)
+	_ = respA.Body.Close()
+	tokenA := csrfFieldRe.FindStringSubmatch(string(bodyA))
+	if tokenA == nil {
+		t.Fatal("tab A: no csrf_token")
+	}
+
+	// Tab B fetches its own form. It must not mint a new nonce cookie.
+	formB := authorizeForm(verifierB)
+	respB, err := browser.Get(ts.URL + "/authorize?" + formB.Encode())
+	if err != nil {
+		t.Fatalf("GET /authorize (tab B): %v", err)
+	}
+	for _, c := range respB.Cookies() {
+		if c.Name == csrfCookie {
+			t.Error("re-render must not rotate the nonce cookie")
+		}
+	}
+	_ = respB.Body.Close()
+
+	// Tab A's form, submitted after tab B's render, must still be accepted.
+	formA.Set("username", "rego")
+	formA.Set("password", "adventure")
+	formA.Set("csrf_token", tokenA[1])
+	resp := postForm(t, browser, ts.URL+"/authorize", formA)
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("stale form rejected: status = %d, body = %s", resp.StatusCode, body)
+	}
+	_ = resp.Body.Close()
+	if !strings.HasPrefix(resp.Header.Get("Location"), testRedirect+"?code=") {
+		t.Errorf("location = %q, want a code redirect", resp.Header.Get("Location"))
+	}
+}
+
 func TestLoginRateLimiting(t *testing.T) {
 	ts, _ := testIDP(t, func(c *Config) { c.LoginRateLimit = 2 })
 	verifier, _ := pkcePair()
