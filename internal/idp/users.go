@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -30,6 +31,10 @@ type UserStore interface {
 	Lookup(username string) (User, bool)
 	// Count returns the number of accounts (for startup logging).
 	Count() int
+	// DummyHash is a verifiable bcrypt hash burned on unknown-user lookups
+	// so response timing does not reveal which usernames exist. Its cost
+	// should match the cost of the stored user hashes.
+	DummyHash() string
 }
 
 // validate checks one user entry when the file is loaded or saved.
@@ -53,15 +58,37 @@ func isBcryptHash(s string) bool {
 		(strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$"))
 }
 
-// dummyHash equalises the bcrypt cost of failed lookups so an attacker cannot
-// probe for valid usernames via response timing: comparing against a real hash
-// takes ~100ms, a missing user would otherwise return instantly.
-var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("minidp-timing-equalizer-dummy"), bcrypt.DefaultCost)
+// newDummyHash creates the hash burned on failed lookups so an attacker
+// cannot probe for valid usernames via response timing: comparing against a
+// real hash takes as long as the configured bcrypt cost, a missing user would
+// otherwise return instantly.
+func newDummyHash(cost int) string {
+	h, err := bcrypt.GenerateFromPassword([]byte("minidp-timing-equalizer-dummy"), cost)
+	if err != nil {
+		// Cannot happen for a fixed plaintext and valid cost; fail loudly.
+		panic(fmt.Sprintf("generate timing-equalisation dummy hash: %v", err))
+	}
+	return string(h)
+}
+
+// bcryptCostOf extracts the cost factor from a modular bcrypt hash
+// ("$2a$10$..."). It falls back to bcrypt.DefaultCost for malformed input.
+func bcryptCostOf(hash string) int {
+	if len(hash) < 7 || hash[0] != '$' {
+		return bcrypt.DefaultCost
+	}
+	cost, err := strconv.Atoi(hash[4:6])
+	if err != nil || cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		return bcrypt.DefaultCost
+	}
+	return cost
+}
 
 // fileUserStore is the file-backed UserStore: a JSON array of users read once
 // at startup; changes take effect on restart.
 type fileUserStore struct {
-	byName map[string]User
+	byName    map[string]User
+	dummyHash string
 }
 
 // LoadUsers reads and validates a users file and returns it as the account
@@ -72,11 +99,21 @@ func LoadUsers(path string) (UserStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &fileUserStore{byName: make(map[string]User, len(users))}
+	// Burn the same bcrypt work for unknown users as for real ones: derive
+	// the dummy hash cost from the users' own hash cost instead of assuming
+	// bcrypt.DefaultCost.
+	cost := bcrypt.DefaultCost
+	if len(users) > 0 {
+		cost = bcryptCostOf(users[0].PasswordHash)
+	}
+	store := &fileUserStore{
+		byName:    make(map[string]User, len(users)),
+		dummyHash: newDummyHash(cost),
+	}
 	for _, u := range users {
 		store.byName[u.Username] = u
 	}
-	slog.Info("users file loaded", "path", path, "users", len(users))
+	slog.Info("users file loaded", "path", path, "users", len(users), "bcryptCost", cost)
 	return store, nil
 }
 
@@ -114,6 +151,9 @@ func (s *fileUserStore) Lookup(username string) (User, bool) {
 
 // Count returns the number of accounts.
 func (s *fileUserStore) Count() int { return len(s.byName) }
+
+// DummyHash returns the timing-equalisation hash (cost derived at load time).
+func (s *fileUserStore) DummyHash() string { return s.dummyHash }
 
 // SaveUsers validates and writes the users file atomically (temp file + rename,
 // mode 0600). Used by the minidp-users tool.

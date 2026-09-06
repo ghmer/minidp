@@ -180,7 +180,7 @@ func (s *Server) authenticate(username, password string) (subject, bool) {
 func (s *Server) authenticateUserFile(username, password string) (subject, bool) {
 	u, ok := s.users.Lookup(username)
 	if !ok {
-		_ = verifyHash(string(dummyHash), password)
+		_ = verifyHash(s.users.DummyHash(), password)
 		return subject{}, false
 	}
 	if !verifyHash(u.PasswordHash, password) {

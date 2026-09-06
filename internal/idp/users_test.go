@@ -152,12 +152,32 @@ func TestHashPasswordRejectsInvalidCost(t *testing.T) {
 }
 
 // The dummy hash used to equalise failed lookups must be a real, verifiable
-// bcrypt hash so the timing equalisation actually burns the same work.
+// bcrypt hash so the timing equalisation actually burns the same work — at
+// the cost of the stored user hashes, not an assumed default.
 func TestDummyHashIsUsableBcryptHash(t *testing.T) {
-	if !isBcryptHash(string(dummyHash)) {
-		t.Fatalf("dummy hash has unexpected format: %q", dummyHash)
+	h := newDummyHash(bcrypt.DefaultCost)
+	if !isBcryptHash(h) {
+		t.Fatalf("dummy hash has unexpected format: %q", h)
 	}
-	if err := bcrypt.CompareHashAndPassword(dummyHash, []byte("minidp-timing-equalizer-dummy")); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(h), []byte("minidp-timing-equalizer-dummy")); err != nil {
 		t.Fatalf("dummy hash does not verify: %v", err)
+	}
+}
+
+func TestBcryptCostOf(t *testing.T) {
+	for _, tc := range []struct {
+		hash string
+		want int
+	}{
+		{"", bcrypt.DefaultCost},
+		{"garbage", bcrypt.DefaultCost},
+		{"$2a$10$0123456789012345678901234567890123456789012345678901234", 10},
+		{"$2y$14$0123456789012345678901234567890123456789012345678901234", 14},
+		{"$2a$ab$0123456789012345678901234567890123456789012345678901234", bcrypt.DefaultCost},
+		{"$2a$99$0123456789012345678901234567890123456789012345678901234", bcrypt.DefaultCost},
+	} {
+		if got := bcryptCostOf(tc.hash); got != tc.want {
+			t.Errorf("bcryptCostOf(%q...) = %d, want %d", tc.hash[:min(12, len(tc.hash))], got, tc.want)
+		}
 	}
 }
