@@ -201,9 +201,13 @@ func (s *Server) checkPassword(password string) bool {
 }
 
 // clientIP resolves the client IP for rate limiting and audit logs. When the
-// socket peer is a trusted proxy (TRUSTED_PROXIES), the first
-// X-Forwarded-For entry — or X-Real-IP — is used; otherwise the socket
-// address itself, so spoofed forwarding headers cannot bypass rate limiting.
+// socket peer is a trusted proxy (TRUSTED_PROXIES), the X-Forwarded-For chain
+// is walked from right to left and the rightmost entry NOT belonging to a
+// trusted proxy is used: standard proxies append the real client address, so
+// an attacker-supplied leftmost entry ("X-Forwarded-For: <random>, <real>")
+// can neither select nor rotate the rate-limit key. X-Real-IP is honoured only
+// when X-Forwarded-For is absent (proxies that set it overwrite the header).
+// Without a trusted proxy, the socket address itself is used.
 func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -214,12 +218,25 @@ func (s *Server) clientIP(r *http.Request) string {
 		return host
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
-			return first
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(parts[i])
+			cIP := net.ParseIP(candidate)
+			if cIP == nil {
+				continue // malformed entry: cannot be the real client, keep walking
+			}
+			if !s.ipTrusted(cIP) {
+				return candidate
+			}
 		}
+		// The whole chain consists of trusted proxies; the most specific
+		// address we can vouch for is the socket peer itself.
+		return host
 	}
 	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
-		return real
+		if realIP := net.ParseIP(real); realIP != nil && !s.ipTrusted(realIP) {
+			return real
+		}
 	}
 	return host
 }

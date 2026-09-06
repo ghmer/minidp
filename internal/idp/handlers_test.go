@@ -872,7 +872,7 @@ func TestClientIPHonoursTrustedProxies(t *testing.T) {
 	r.RemoteAddr = "10.1.2.3:5555" // trusted proxy
 	r.Header.Set("X-Forwarded-For", "203.0.113.7, 10.1.2.3")
 	if got := srv.clientIP(r); got != "203.0.113.7" {
-		t.Errorf("trusted proxy: clientIP = %q, want the forwarded address", got)
+		t.Errorf("trusted proxy: clientIP = %q, want the rightmost non-trusted forwarded address", got)
 	}
 
 	r = httptest.NewRequest(http.MethodPost, "/authorize", nil)
@@ -880,6 +880,46 @@ func TestClientIPHonoursTrustedProxies(t *testing.T) {
 	r.Header.Set("X-Forwarded-For", "203.0.113.7")
 	if got := srv.clientIP(r); got != "192.0.2.9" {
 		t.Errorf("untrusted peer: clientIP = %q, want the socket address (no header spoofing)", got)
+	}
+}
+
+// TestClientIPResistsSpoofedXFF pins the right-to-left walk: a proxy that
+// APPENDS the real client address must defeat an attacker-supplied leftmost
+// entry, otherwise rotating the spoofed value rotates the rate-limit key.
+func TestClientIPResistsSpoofedXFF(t *testing.T) {
+	_, srv := testIDP(t, func(c *Config) { c.TrustedProxies = []string{"10.0.0.0/8"} })
+
+	// Attacker sends "6.6.6.6"; the trusted proxy appends the real client.
+	r := httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r.RemoteAddr = "10.1.2.3:5555"
+	r.Header.Set("X-Forwarded-For", "6.6.6.6, 198.51.100.23")
+	if got := srv.clientIP(r); got != "198.51.100.23" {
+		t.Errorf("spoofed XFF chain: clientIP = %q, want the proxy-appended 198.51.100.23", got)
+	}
+
+	// A chain consisting solely of trusted proxies yields the socket peer.
+	r2 := httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r2.RemoteAddr = "10.1.2.3:5555"
+	r2.Header.Set("X-Forwarded-For", "10.9.9.9, 10.8.8.8")
+	if got := srv.clientIP(r2); got != "10.1.2.3" {
+		t.Errorf("all-trusted chain: clientIP = %q, want the socket host 10.1.2.3", got)
+	}
+
+	// X-Real-IP spoofed by the client is ignored when XFF is present.
+	r3 := httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r3.RemoteAddr = "10.1.2.3:5555"
+	r3.Header.Set("X-Forwarded-For", "6.6.6.6, 198.51.100.23")
+	r3.Header.Set("X-Real-IP", "7.7.7.7")
+	if got := srv.clientIP(r3); got != "198.51.100.23" {
+		t.Errorf("XFF present: clientIP = %q, want 198.51.100.23 (X-Real-IP must be ignored)", got)
+	}
+
+	// X-Real-IP is honoured only when XFF is absent.
+	r4 := httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r4.RemoteAddr = "10.1.2.3:5555"
+	r4.Header.Set("X-Real-IP", "198.51.100.23")
+	if got := srv.clientIP(r4); got != "198.51.100.23" {
+		t.Errorf("X-Real-IP without XFF: clientIP = %q, want 198.51.100.23", got)
 	}
 }
 
