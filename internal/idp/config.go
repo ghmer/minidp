@@ -78,18 +78,30 @@ type Config struct {
 // would silently weaken security (unreadable secret files, invalid proxy CIDRs,
 // conflicting password sources).
 func LoadConfig() (Config, error) {
+	accessTokenTTL, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
+	if err != nil {
+		return Config{}, err
+	}
+	refreshTokenTTL, err := envDurationSeconds("IDP_REFRESH_TOKEN_TTL", 7200)
+	if err != nil {
+		return Config{}, err
+	}
+	loginRateLimit, err := envInt("IDP_LOGIN_RATE_LIMIT", 20)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Host:            envOr("IDP_HOST", "0.0.0.0"),
 		Port:            envOr("IDP_PORT", "8080"),
 		Issuer:          envOr("IDP_ISSUER", "http://localhost:8080"),
 		Username:        envOr("IDP_USERNAME", "rego"),
-		AccessTokenTTL:  envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600),
-		RefreshTokenTTL: envDurationSeconds("IDP_REFRESH_TOKEN_TTL", 7200),
+		AccessTokenTTL:  accessTokenTTL,
+		RefreshTokenTTL: refreshTokenTTL,
 		Title:           envOr("IDP_TITLE", "Rego Adventure"),
 		Subtitle:        envOr("IDP_SUBTITLE", "Sign in to begin the adventure"),
 		RSAPeM:          os.Getenv("IDP_RSA_PEM"),
 		KeyDir:          os.Getenv("IDP_KEY_DIR"),
-		LoginRateLimit:  envInt("IDP_LOGIN_RATE_LIMIT", 20),
+		LoginRateLimit:  loginRateLimit,
 	}
 	if raw := os.Getenv("ALLOWED_REDIRECTS"); raw != "" {
 		for _, r := range strings.Split(raw, ",") {
@@ -199,15 +211,29 @@ func envOr(key, def string) string {
 	return def
 }
 
-func envDurationSeconds(key string, def int) time.Duration {
-	return time.Duration(envInt(key, def)) * time.Second
+func envDurationSeconds(key string, def int) (time.Duration, error) {
+	n, err := envInt(key, def)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
+// envInt parses a positive integer environment variable, falling back to def
+// only when the variable is unset or empty. A set but unparseable or
+// non-positive value is an error: the package contract is to fail fast on
+// misconfiguration instead of silently weakening a security control.
+func envInt(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: must be a whole number", key, v)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be positive", key, v)
+	}
+	return n, nil
 }

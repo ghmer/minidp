@@ -107,14 +107,22 @@ func TestLoadConfigOverrides(t *testing.T) {
 	}
 }
 
-func TestLoadConfigInvalidTTLFallsBackToDefault(t *testing.T) {
-	t.Setenv("IDP_ACCESS_TOKEN_TTL", "not-a-number")
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.AccessTokenTTL != time.Hour {
-		t.Errorf("AccessTokenTTL = %v, want the 1h default", cfg.AccessTokenTTL)
+func TestLoadConfigInvalidNumericEnvFailsFast(t *testing.T) {
+	for _, tc := range []struct{ key, val string }{
+		{"IDP_ACCESS_TOKEN_TTL", "not-a-number"},
+		{"IDP_ACCESS_TOKEN_TTL", "0"},
+		{"IDP_ACCESS_TOKEN_TTL", "-5"},
+		{"IDP_REFRESH_TOKEN_TTL", "abc"},
+		{"IDP_LOGIN_RATE_LIMIT", "abc"},
+		{"IDP_LOGIN_RATE_LIMIT", "0"},
+	} {
+		t.Setenv(tc.key, tc.val)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("%s=%q: expected a fail-fast error, got nil", tc.key, tc.val)
+		} else {
+			t.Logf("%s=%q rejected: %v", tc.key, tc.val, err)
+		}
+		t.Setenv(tc.key, "")
 	}
 }
 
