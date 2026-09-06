@@ -1,0 +1,11 @@
+# Compiled binary
+/minidp
+/dist/
+
+# Test and coverage artefacts
+*.test
+*.out
+coverage.txt
+
+# OS noise
+.DS_Store
