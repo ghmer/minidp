@@ -1,4 +1,4 @@
-module minidp
+module github.com/ghmer/minidp
 
 go 1.27.1
 

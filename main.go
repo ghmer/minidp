@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"minidp/internal/idp"
+	"github.com/ghmer/minidp/internal/idp"
 )
 
 const shutdownGrace = 10 * time.Second

@@ -27,7 +27,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/term"
 
-	"minidp/internal/idp"
+	"github.com/ghmer/minidp/internal/idp"
 )
 
 func main() {
