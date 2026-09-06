@@ -209,6 +209,10 @@ curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_
 echo "== 18. multi-user mode (users file + minidp-users tool) =="
 TOOL=/tmp/minidp-users
 go build -o "$TOOL" ./cmd/minidp-users
+# The multi-user section starts its own IdP instance; build the server next to
+# the tool so the section works on a fresh checkout that only followed the
+# README (which builds into the repo directory, not /tmp).
+go build -o /tmp/minidp .
 UFILE="$(mktemp -d)/users.json"
 "$TOOL" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example >/dev/null
 "$TOOL" add -file "$UFILE" -username bob -password builder >/dev/null
