@@ -85,9 +85,11 @@ func (s *store) addCode(c *authCode, ttl time.Duration) string {
 
 // takeCode removes and returns a code by id, or nil if it is unknown, expired,
 // or has already been redeemed (codes are single-use to defeat replay).
+// Read-only traffic also sweeps expired entries so they cannot linger.
 func (s *store) takeCode(id string) *authCode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dropExpired()
 	c, ok := s.codes[id]
 	if !ok {
 		return nil
@@ -115,6 +117,7 @@ func (s *store) addRefresh(f *refreshEntry, ttl time.Duration) string {
 func (s *store) takeRefresh(id string) (entry *refreshEntry, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dropExpired()
 	if f, ok := s.usedRefresh[id]; ok {
 		s.revokeFamilyLocked(f.Family)
 		delete(s.usedRefresh, id)
