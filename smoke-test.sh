@@ -11,6 +11,14 @@ STATE="st-123"
 NONCE="n-abc"
 JAR=$(mktemp)
 
+# Extract a fresh CSRF token from the rendered login form for the given
+# authorization request parameters.
+csrf_for() {
+  curl -s "$BASE/authorize?$1" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p'
+}
+
+AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
+
 echo "== 1. discovery =="
 curl -s "$BASE/.well-known/openid-configuration" | python3 -c "
 import json,sys
@@ -38,7 +46,9 @@ grep -q 'name="code_challenge" value="'$CHALLENGE'"' /tmp/login.html && echo "PK
 grep -q 'name="nonce" value="'$NONCE'"' /tmp/login.html && echo "nonce echoed into form"
 
 echo "== 4. POST /authorize with WRONG password =="
+CSRF=$(csrf_for "$AUTH_QUERY")
 LOC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" \
@@ -52,7 +62,9 @@ LOC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
 [ "$LOC" = "401" ] && echo "wrong password rejected (401) OK"
 
 echo "== 5. POST /authorize with correct credentials =="
+CSRF=$(csrf_for "$AUTH_QUERY")
 LOC=$(curl -s -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" \
   --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" \
@@ -72,7 +84,9 @@ CODE=$(printf '%s' "$LOC" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 
 echo "== 6. redeem code WITHOUT verifier (must fail) =="
 # use a fresh code to avoid burning $CODE
+CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s2&nonce=n2&code_challenge=$CHALLENGE&code_challenge_method=S256")
 LOC2=$(curl -s -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
   --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
   --data-urlencode "state=s2" --data-urlencode "nonce=n2" \
@@ -181,6 +195,16 @@ echo "== 15. landing page + login page styling =="
 curl -s "$BASE/" | grep -q 'href="/login.css"' && echo "landing links themed css"
 curl -s "$BASE/login.css" | grep -q -- '--accent-color: #c77d00' && echo "rego-adventure theme css served"
 curl -s "$BASE/logo.svg" | grep -qi '<svg' && echo "logo served"
+
+echo "== 16. security headers =="
+curl -s -o /dev/null -D - "$BASE/" | grep -i "x-frame-options: DENY" >/dev/null \
+  && curl -s -o /dev/null -D - "$BASE/" | grep -i "content-security-policy:.*frame-ancestors 'none'" >/dev/null \
+  && echo "security headers OK"
+
+echo "== 17. CSRF-protected login =="
+curl -s -o /dev/null -w 'POST /authorize without CSRF token -> %{http_code}\n' -X POST "$BASE/authorize" \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode "username=rego" --data-urlencode "password=adventure" \
+  | grep -q "400" && echo "login without CSRF token rejected OK"
 
 echo
 echo "ALL CHECKS PASSED"

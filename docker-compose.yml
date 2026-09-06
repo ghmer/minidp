@@ -1,0 +1,64 @@
+services:
+  minidp:
+    build: .
+    image: minidp:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # The issuer is what BROWSERS reach (the SPA exchanges the PKCE code
+      # against it), hence localhost — not the service-internal DNS name.
+      IDP_ISSUER: ${IDP_ISSUER:-http://localhost:8080}
+      IDP_USERNAME: ${IDP_USERNAME:-rego}
+      # Demo default; for anything beyond a demo use a bcrypt hash instead:
+      #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
+      #   IDP_PASSWORD_BCRYPT=$$2y$$10$$...
+      IDP_PASSWORD: ${IDP_PASSWORD:-adventure}
+      # Redirect URI of the rego-adventure service below.
+      ALLOWED_REDIRECTS: ${APP_DOMAIN:-http://localhost:3000}/callback
+    volumes:
+      - minidp-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+
+  rego-adventure:
+    image: ghcr.io/ghmer/rego-adventure:v2.2.0
+    container_name: rego-adventure
+    restart: unless-stopped
+    depends_on:
+      - minidp
+    ports:
+      - "3000:3000"
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    environment:
+      PORT: 3000
+      GIN_MODE: release
+      DOMAIN: ${APP_DOMAIN:-http://localhost:3000}
+      SHOW_IMPRESSUM: "false"
+      # Authentication against the minidp service above.
+      # AUTH_ISSUER must equal minidp's IDP_ISSUER (the backend only string-
+      # matches it against the token's iss claim); the SPA resolves the issuer
+      # in the browser, so localhost works for both.
+      AUTH_ENABLED: "true"
+      AUTH_ISSUER: ${IDP_ISSUER:-http://localhost:8080}
+      # The backend fetches discovery container-to-container via service DNS.
+      AUTH_DISCOVERY_URL: http://minidp:8080/.well-known/openid-configuration
+      AUTH_CLIENT_ID: rego-adventure
+      AUTH_AUDIENCE: rego-adventure
+
+volumes:
+  minidp-data:

@@ -1,0 +1,110 @@
+# Minimal production deployment of minidp for a single-user demo of
+# rego-adventure.
+#
+# Key management: by default the signing key is generated on first start into
+# an emptyDir and is LOST when the pod is rescheduled (users simply log in
+# again — acceptable for a demo). For stability across reschedules, generate
+# the key once, put the PEM into a Secret and mount it, then set
+# IDP_RSA_PEM=/keys/minidp-rsa.pem instead of IDP_KEY_DIR (see commented
+# block below).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minidp
+  labels:
+    app: minidp
+spec:
+  selector:
+    app: minidp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minidp
+  labels:
+    app: minidp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single-writer: key dir is per-pod state
+  selector:
+    matchLabels:
+      app: minidp
+  template:
+    metadata:
+      labels:
+        app: minidp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: minidp
+          image: minidp:latest # replace with your registry path
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: IDP_ISSUER
+              value: https://idp.example.com # must be the URL browsers reach
+            - name: IDP_USERNAME
+              valueFrom:
+                secretKeyRef: { name: minidp, key: username }
+            - name: IDP_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: minidp, key: password }
+            - name: IDP_KEY_DIR
+              value: /data
+            # Restrict redirects once the client is known:
+            # - name: ALLOWED_REDIRECTS
+            #   value: https://adventure.example.com/callback
+            # Behind an ingress, trust its network so rate limiting sees real IPs:
+            # - name: TRUSTED_PROXIES
+            #   value: 10.0.0.0/8
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+      volumes:
+        - name: data
+          emptyDir: {}
+          # For key stability across pod reschedules, mount a Secret instead:
+          # - name: keys
+          #   secret: { secretName: minidp-key }
+          # and replace the IDP_KEY_DIR env with:
+          # - name: IDP_RSA_PEM
+          #   value: /keys/minidp-rsa.pem
+          # plus mount "keys" at /keys (readOnly).
+---
+# Example secret — create it properly with kubectl create secret, do not
+# commit real credentials:
+#
+#   kubectl create secret generic minidp \
+#     --from-literal=username=rego \
+#     --from-literal=password=adventure
+#
+# For a hash-only manifest use IDP_PASSWORD_BCRYPT with a bcrypt hash:
+#
+#   htpasswd -bnBC 10 "" 'adventure' | tr -d ':\n'

@@ -10,12 +10,17 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// keyFileName is the file name used for the persisted signing key inside
+// IDP_KEY_DIR.
+const keyFileName = "minidp-rsa.pem"
 
 // signingKey wraps an RSA private key together with the stable key id (kid) that
 // is written into the JWT header and published in the JWKS document so that the
@@ -26,16 +31,77 @@ type signingKey struct {
 	version string
 }
 
-// NewSigningKey loads a PKCS#1 RSA key from a PEM file when pemPath is
-// non-empty, otherwise it generates a fresh RSA-2048 key in memory.
-func NewSigningKey(pemPath string) (*signingKey, error) {
-	if pemPath != "" {
+// NewSigningKey resolves the signing key in this order:
+//
+//  1. pemPath is set: load the key from that PEM file.
+//  2. keyDir is set: load <keyDir>/minidp-rsa.pem; if it does not exist yet,
+//     generate a fresh RSA-2048 key and persist it there (mode 0600, written
+//     via a temp file + rename so an interrupted start cannot corrupt it).
+//  3. Otherwise: generate an ephemeral key held in memory only (development
+//     mode; all tokens become invalid on restart).
+func NewSigningKey(pemPath, keyDir string) (*signingKey, error) {
+	switch {
+	case pemPath != "":
 		return loadSigningKey(pemPath)
+	case keyDir != "":
+		return persistentSigningKey(keyDir)
+	default:
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil, fmt.Errorf("generate rsa key: %w", err)
+		}
+		return &signingKey{key: key, kid: "minidp-1", version: "1.0"}, nil
 	}
+}
+
+// persistentSigningKey loads the key from keyDir, generating and persisting a
+// new one on first use.
+func persistentSigningKey(keyDir string) (*signingKey, error) {
+	dir := filepath.Clean(keyDir)
+	path := filepath.Join(dir, keyFileName)
+
+	if _, err := os.Stat(path); err == nil {
+		return loadSigningKey(path)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat signing key %q: %w", path, err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open key dir %q: %w", dir, err)
+	}
+	defer func() { _ = root.Close() }()
+
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, fmt.Errorf("generate rsa key: %w", err)
 	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+
+	// Write to a temp file inside the same directory, then rename, so a crash
+	// mid-write can never leave a truncated key behind. The file is created
+	// with 0600 directly (os.Root.Create would umask it to 0644).
+	tmp, err := root.OpenFile(keyFileName+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create temp signing key in %q: %w", dir, err)
+	}
+	if _, err := tmp.Write(pemBytes); err != nil {
+		_ = tmp.Close()
+		_ = root.Remove(keyFileName + ".tmp")
+		return nil, fmt.Errorf("write signing key in %q: %w", dir, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = root.Remove(keyFileName + ".tmp")
+		return nil, fmt.Errorf("close signing key in %q: %w", dir, err)
+	}
+	if err := os.Rename(filepath.Join(dir, keyFileName+".tmp"), path); err != nil {
+		_ = root.Remove(keyFileName + ".tmp")
+		return nil, fmt.Errorf("persist signing key to %q: %w", path, err)
+	}
+	slog.Info("generated and persisted RSA signing key", "path", path)
 	return &signingKey{key: key, kid: "minidp-1", version: "1.0"}, nil
 }
 

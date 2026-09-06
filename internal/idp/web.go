@@ -41,6 +41,8 @@ type loginData struct {
 	Username string
 	// Hidden carries the OAuth2 parameters echoed back into the form.
 	Hidden []loginField
+	// CSRFToken is the signed form token; rendered as a hidden input.
+	CSRFToken string
 	// Message, when set, replaces the form (e.g. "Signed in as rego").
 	Message string
 }

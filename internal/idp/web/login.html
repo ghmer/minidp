@@ -22,6 +22,7 @@
             <div id="login-container">
                 {{if .Error}}<p class="login-error" role="alert">{{.Error}}</p>{{end}}
                 <form method="POST" action="{{.Action}}" class="login-form">
+                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                     {{range .Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
                     <div class="form-row">
                         <label for="username">Username</label>

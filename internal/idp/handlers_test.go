@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -114,11 +115,34 @@ func login(t *testing.T, base, user, pass, verifier string) string {
 	form := authorizeForm(verifier)
 	form.Set("username", user)
 	form.Set("password", pass)
+	form.Set("csrf_token", fetchCSRF(t, base+"/authorize", authorizeForm(verifier)))
 	resp := postForm(t, noFollow(), base+"/authorize", form)
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("POST /authorize: status = %d, want 302", resp.StatusCode)
 	}
 	return resp.Header.Get("Location")
+}
+
+var csrfFieldRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
+
+// fetchCSRF renders the login page at target (query built from form) and
+// extracts the signed CSRF token from the form.
+func fetchCSRF(t *testing.T, target string, form url.Values) string {
+	t.Helper()
+	resp, err := http.Get(target + "?" + form.Encode())
+	if err != nil {
+		t.Fatalf("GET %s: %v", target, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s: status = %d", target, resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	m := csrfFieldRe.FindStringSubmatch(string(body))
+	if m == nil {
+		t.Fatalf("no csrf_token in login form from %s", target)
+	}
+	return m[1]
 }
 
 func codeFrom(t *testing.T, location string) string {
@@ -204,6 +228,7 @@ func TestAuthorizeFormRendersHiddenParams(t *testing.T) {
 		`name="nonce" value="` + testNonceValue + `"`,
 		`name="state" value="` + testStateValue + `"`,
 		`href="/login.css"`,
+		`name="csrf_token"`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("login form missing %q", want)
@@ -233,6 +258,7 @@ func TestAuthorizeWrongPassword(t *testing.T) {
 	form := authorizeForm(verifier)
 	form.Set("username", "rego")
 	form.Set("password", "wrong")
+	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/authorize", authorizeForm(verifier)))
 	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -623,6 +649,7 @@ func TestLandingAndBareLogin(t *testing.T) {
 	}
 
 	form := url.Values{"username": {"rego"}, "password": {"adventure"}}
+	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/", url.Values{}))
 	ok := postForm(t, noFollow(), ts.URL+"/login", form)
 	if ok.StatusCode != http.StatusOK {
 		t.Fatalf("POST /login: status = %d", ok.StatusCode)
@@ -633,6 +660,7 @@ func TestLandingAndBareLogin(t *testing.T) {
 	}
 
 	form.Set("password", "nope")
+	form.Set("csrf_token", fetchCSRF(t, ts.URL+"/", url.Values{}))
 	bad := postForm(t, noFollow(), ts.URL+"/login", form)
 	if bad.StatusCode != http.StatusUnauthorized {
 		t.Errorf("POST /login with wrong password: status = %d, want 401", bad.StatusCode)
@@ -670,5 +698,99 @@ func TestStaticAssets(t *testing.T) {
 	defer func() { _ = health.Body.Close() }()
 	if health.StatusCode != http.StatusOK {
 		t.Errorf("/healthz: status = %d", health.StatusCode)
+	}
+}
+
+func TestAuthorizeRejectsInvalidCSRF(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	form := authorizeForm(verifier)
+	form.Set("username", "rego")
+	form.Set("password", "adventure")
+	form.Set("csrf_token", "not-a-valid-token")
+	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "session expired") {
+		t.Error("expected an explanatory error message")
+	}
+}
+
+func TestAuthorizeRejectsParamTampering(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	// Get a CSRF token bound to the legit parameters...
+	form := authorizeForm(verifier)
+	token := fetchCSRF(t, ts.URL+"/authorize", form)
+	// ...then swap the redirect_uri behind the server's back.
+	form.Set("redirect_uri", "http://evil.example.com/callback")
+	form.Set("username", "rego")
+	form.Set("password", "adventure")
+	form.Set("csrf_token", token)
+	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("tampered redirect_uri: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestLoginRateLimiting(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.LoginRateLimit = 2 })
+	verifier, _ := pkcePair()
+
+	attempt := func() int {
+		form := authorizeForm(verifier)
+		form.Set("username", "rego")
+		form.Set("password", "adventure")
+		form.Set("csrf_token", fetchCSRF(t, ts.URL+"/authorize", authorizeForm(verifier)))
+		resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
+		return resp.StatusCode
+	}
+	if s := attempt(); s != http.StatusFound {
+		t.Fatalf("attempt 1: status = %d, want 302", s)
+	}
+	if s := attempt(); s != http.StatusFound {
+		t.Fatalf("attempt 2: status = %d, want 302", s)
+	}
+	if s := attempt(); s != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3: status = %d, want 429", s)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	for header, want := range map[string]string{
+		"Content-Security-Policy": "frame-ancestors 'none'",
+		"X-Frame-Options":         "DENY",
+		"X-Content-Type-Options":  "nosniff",
+		"Referrer-Policy":         "strict-origin-when-cross-origin",
+	} {
+		if got := resp.Header.Get(header); got == "" || !strings.Contains(got, want) {
+			t.Errorf("%s = %q, want it set and containing %q", header, got, want)
+		}
+	}
+}
+
+func TestClientIPHonoursTrustedProxies(t *testing.T) {
+	_, srv := testIDP(t, func(c *Config) { c.TrustedProxies = []string{"10.0.0.0/8"} })
+
+	r := httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r.RemoteAddr = "10.1.2.3:5555" // trusted proxy
+	r.Header.Set("X-Forwarded-For", "203.0.113.7, 10.1.2.3")
+	if got := srv.clientIP(r); got != "203.0.113.7" {
+		t.Errorf("trusted proxy: clientIP = %q, want the forwarded address", got)
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/authorize", nil)
+	r.RemoteAddr = "192.0.2.9:1234" // not a trusted proxy
+	r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if got := srv.clientIP(r); got != "192.0.2.9" {
+		t.Errorf("untrusted peer: clientIP = %q, want the socket address (no header spoofing)", got)
 	}
 }

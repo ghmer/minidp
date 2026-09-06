@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test, lint and security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Unit tests (race detector)
+        run: go test -race -timeout 120s ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          args: --timeout 5m
+
+      - name: Security scan (gosec)
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -quiet ./...
+
+      - name: Build
+        run: go build ./...

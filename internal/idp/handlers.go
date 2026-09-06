@@ -3,6 +3,7 @@ package idp
 import (
 	"crypto/subtle"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +36,21 @@ func oauthHiddenFields(q url.Values) []loginField {
 	return fields
 }
 
+// oauthParamsOf extracts the OAuth2 parameters relevant for CSRF binding from
+// a request: the query for GET (initial render) and the echoed form fields for
+// POST (verification), merged via r.Form so both sides produce the same
+// fingerprint.
+func oauthParamsOf(r *http.Request) url.Values {
+	_ = r.ParseForm() // r.Form merges query and body; errors yield an empty set
+	out := url.Values{}
+	for _, key := range oauthParamKeys {
+		if vals, ok := r.Form[key]; ok {
+			out[key] = vals
+		}
+	}
+	return out
+}
+
 // validateAuthorizeRequest checks the authorization request and returns a
 // human-readable problem description, or "" when the request is acceptable.
 func (s *Server) validateAuthorizeRequest(q url.Values) string {
@@ -59,8 +75,13 @@ func (s *Server) validateAuthorizeRequest(q url.Values) string {
 	return ""
 }
 
-// renderLoginPage renders the login form (or an error message page).
-func (s *Server) renderLoginPage(w http.ResponseWriter, status int, data loginData) {
+// renderLoginPage renders the login form (or an error message page). The form
+// carries a fresh CSRF token bound to the form action and the OAuth2 request
+// parameters.
+func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status int, data loginData) {
+	if data.Action != "" {
+		data.CSRFToken = s.csrf.issue(data.Action, oauthParamsOf(r))
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := s.template.render(w, data); err != nil {
@@ -72,10 +93,10 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, status int, data loginDa
 func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if problem := s.validateAuthorizeRequest(q); problem != "" {
-		s.renderLoginPage(w, http.StatusBadRequest, loginData{Message: problem})
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
 		return
 	}
-	s.renderLoginPage(w, http.StatusOK, loginData{
+	s.renderLoginPage(w, r, http.StatusOK, loginData{
 		Action: "/authorize",
 		Hidden: oauthHiddenFields(q),
 	})
@@ -84,11 +105,33 @@ func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 // handleAuthorizePost authenticates the user and, on success, redirects the
 // browser back to the client with a single-use authorization code.
 func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	if !s.limiter.allow(ip) {
+		slog.Warn("login rate limited", "ip", ip)
+		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
+			Action: "/authorize",
+			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
+		})
+		return
+	}
 	if err := r.ParseForm(); err != nil {
-		s.renderLoginPage(w, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
 		return
 	}
 	form := r.PostForm
+
+	// The CSRF token must be valid before anything else is processed, so a
+	// crafted cross-site form cannot smuggle attacker-chosen OAuth2 parameters
+	// through an authenticated user's browser.
+	if !s.csrf.verify("/authorize", oauthParamsOf(r), form.Get("csrf_token")) {
+		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
+			Action: "/authorize",
+			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
+			Hidden: oauthHiddenFields(form),
+		})
+		return
+	}
 
 	// Re-validate the OAuth2 context that was echoed through the form.
 	q := url.Values{}
@@ -96,13 +139,14 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		q.Set(f.Name, f.Value)
 	}
 	if problem := s.validateAuthorizeRequest(q); problem != "" {
-		s.renderLoginPage(w, http.StatusBadRequest, loginData{Message: problem})
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
 		return
 	}
 
 	sub, ok := s.authenticate(form.Get("username"), form.Get("password"))
 	if !ok {
-		s.renderLoginPage(w, http.StatusUnauthorized, loginData{
+		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
+		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
 			Action:   "/authorize",
 			Error:    "Invalid username or password.",
 			Username: form.Get("username"),
@@ -110,6 +154,7 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	slog.Info("login succeeded", "ip", ip, "user", sub)
 
 	code := s.store.addCode(&authCode{
 		Sub:                 sub,
@@ -120,10 +165,11 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		Nonce:               q.Get("nonce"),
 		Scopes:              parseScopes(q.Get("scope")),
 	}, authCodeTTL)
+	slog.Info("authorization code issued", "client", q.Get("client_id"), "redirect", q.Get("redirect_uri"))
 
 	target, err := url.Parse(q.Get("redirect_uri"))
 	if err != nil {
-		s.renderLoginPage(w, http.StatusBadRequest, loginData{Message: "Invalid redirect_uri."})
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Invalid redirect_uri."})
 		return
 	}
 	params := target.Query()
@@ -137,28 +183,47 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLanding renders the bare login page for direct visits to the IdP root.
-func (s *Server) handleLanding(w http.ResponseWriter, _ *http.Request) {
-	s.renderLoginPage(w, http.StatusOK, loginData{Action: "/login"})
+func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
+	s.renderLoginPage(w, r, http.StatusOK, loginData{Action: "/login"})
 }
 
 // handleBareLogin authenticates a direct (non-OAuth2) login from the landing
 // page. It issues no tokens; tokens always require a real authorize request.
 func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	if !s.limiter.allow(ip) {
+		slog.Warn("login rate limited", "ip", ip)
+		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
+			Action: "/login",
+			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
+		})
+		return
+	}
 	if err := r.ParseForm(); err != nil {
-		s.renderLoginPage(w, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
 		return
 	}
 	form := r.PostForm
+	if !s.csrf.verify("/login", oauthParamsOf(r), form.Get("csrf_token")) {
+		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
+		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
+			Action: "/login",
+			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
+		})
+		return
+	}
 	sub, ok := s.authenticate(form.Get("username"), form.Get("password"))
 	if !ok {
-		s.renderLoginPage(w, http.StatusUnauthorized, loginData{
+		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
+		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
 			Action:   "/login",
 			Error:    "Invalid username or password.",
 			Username: form.Get("username"),
 		})
 		return
 	}
-	s.renderLoginPage(w, http.StatusOK, loginData{
+	slog.Info("login succeeded", "ip", ip, "user", sub)
+	s.renderLoginPage(w, r, http.StatusOK, loginData{
 		Action:  "/login",
 		Message: "Signed in as " + sub + ". This page issues tokens only via the /authorize endpoint.",
 	})
@@ -209,6 +274,7 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	ac := s.store.takeCode(code)
 	if ac == nil {
+		slog.Warn("code rejected: unknown, expired or already redeemed", "ip", s.clientIP(r))
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
 		return
 	}
@@ -222,6 +288,7 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !verifyPKCE(ac.CodeChallenge, ac.CodeChallengeMethod, form.Get("code_verifier")) {
+		slog.Warn("code rejected: PKCE verification failed", "ip", s.clientIP(r), "client", ac.ClientID)
 		writeAuthError(w, "invalid_grant", "PKCE verification failed.")
 		return
 	}
@@ -236,6 +303,7 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	slog.Info("tokens issued", "grant", "authorization_code", "client", ac.ClientID, "sub", ac.Sub)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -249,6 +317,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	entry := s.store.takeRefresh(token)
 	if entry == nil {
+		slog.Warn("refresh token rejected: unknown, expired or already used", "ip", s.clientIP(r))
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already used refresh token.")
 		return
 	}
@@ -263,6 +332,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	slog.Info("tokens issued", "grant", "refresh_token", "client", entry.ClientID, "sub", entry.Sub)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -357,7 +427,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.renderLoginPage(w, http.StatusOK, loginData{
+	s.renderLoginPage(w, r, http.StatusOK, loginData{
 		Action:  "/login",
 		Message: "You have been signed out.",
 	})

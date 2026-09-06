@@ -1,8 +1,12 @@
 package idp
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -10,12 +14,17 @@ func TestLoadConfigDefaults(t *testing.T) {
 	for _, key := range []string{
 		"IDP_HOST", "IDP_PORT", "IDP_ISSUER", "IDP_USERNAME", "IDP_PASSWORD",
 		"IDP_ACCESS_TOKEN_TTL", "IDP_REFRESH_TOKEN_TTL", "ALLOWED_REDIRECTS",
-		"IDP_TITLE", "IDP_SUBTITLE", "IDP_RSA_PEM",
+		"IDP_TITLE", "IDP_SUBTITLE", "IDP_RSA_PEM", "IDP_KEY_DIR",
+		"IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE", "TRUSTED_PROXIES",
+		"IDP_LOGIN_RATE_LIMIT",
 	} {
 		t.Setenv(key, "")
 	}
 
-	cfg := LoadConfig()
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
 	if cfg.Host != "0.0.0.0" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "0.0.0.0")
 	}
@@ -43,6 +52,18 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.RSAPeM != "" {
 		t.Errorf("RSAPeM = %q, want empty", cfg.RSAPeM)
 	}
+	if cfg.KeyDir != "" {
+		t.Errorf("KeyDir = %q, want empty (ephemeral key)", cfg.KeyDir)
+	}
+	if cfg.PasswordBcrypt != "" {
+		t.Errorf("PasswordBcrypt = %q, want empty", cfg.PasswordBcrypt)
+	}
+	if cfg.LoginRateLimit != 20 {
+		t.Errorf("LoginRateLimit = %d, want 20", cfg.LoginRateLimit)
+	}
+	if cfg.TrustedProxies != nil {
+		t.Errorf("TrustedProxies = %v, want nil", cfg.TrustedProxies)
+	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
@@ -56,7 +77,10 @@ func TestLoadConfigOverrides(t *testing.T) {
 	t.Setenv("ALLOWED_REDIRECTS", "https://a.example.com/cb, https://b.example.com/cb ,")
 	t.Setenv("IDP_RSA_PEM", "/keys/idp.pem")
 
-	cfg := LoadConfig()
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
 	if cfg.Issuer != "https://idp.example.com" {
 		t.Errorf("Issuer = %q", cfg.Issuer)
 	}
@@ -85,7 +109,91 @@ func TestLoadConfigOverrides(t *testing.T) {
 
 func TestLoadConfigInvalidTTLFallsBackToDefault(t *testing.T) {
 	t.Setenv("IDP_ACCESS_TOKEN_TTL", "not-a-number")
-	if cfg := LoadConfig(); cfg.AccessTokenTTL != time.Hour {
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.AccessTokenTTL != time.Hour {
 		t.Errorf("AccessTokenTTL = %v, want the 1h default", cfg.AccessTokenTTL)
+	}
+}
+
+func TestLoadConfigPasswordFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "password")
+	if err := os.WriteFile(path, []byte(" s3cret \n"), 0o600); err != nil {
+		t.Fatalf("write password file: %v", err)
+	}
+	t.Setenv("IDP_PASSWORD", "")
+	t.Setenv("IDP_PASSWORD_BCRYPT", "")
+	t.Setenv("IDP_PASSWORD_FILE", path)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Password != "s3cret" {
+		t.Errorf("Password = %q, want the trimmed file contents", cfg.Password)
+	}
+}
+
+func TestLoadConfigPasswordFileErrors(t *testing.T) {
+	t.Setenv("IDP_PASSWORD", "")
+	t.Setenv("IDP_PASSWORD_FILE", filepath.Join(t.TempDir(), "missing"))
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an error for a missing password file")
+	}
+
+	path := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write empty file: %v", err)
+	}
+	t.Setenv("IDP_PASSWORD_FILE", path)
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an error for an empty password file")
+	}
+}
+
+func TestLoadConfigPasswordBcrypt(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("adventure"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	t.Setenv("IDP_PASSWORD", "")
+	t.Setenv("IDP_PASSWORD_FILE", "")
+	t.Setenv("IDP_PASSWORD_BCRYPT", string(hash))
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.PasswordBcrypt != string(hash) {
+		t.Error("PasswordBcrypt not picked up")
+	}
+	if cfg.Password != "" {
+		t.Errorf("Password = %q, want empty when a bcrypt hash is configured", cfg.Password)
+	}
+}
+
+func TestLoadConfigConflictingPasswordSources(t *testing.T) {
+	t.Setenv("IDP_PASSWORD", "plain")
+	t.Setenv("IDP_PASSWORD_BCRYPT", "$2a$10$abc")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an error when IDP_PASSWORD and IDP_PASSWORD_BCRYPT are both set")
+	}
+	t.Setenv("IDP_PASSWORD_BCRYPT", "")
+	path := filepath.Join(t.TempDir(), "pw")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	t.Setenv("IDP_PASSWORD_FILE", path)
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an error when IDP_PASSWORD and IDP_PASSWORD_FILE are both set")
+	}
+}
+
+func TestLoadConfigInvalidTrustedProxies(t *testing.T) {
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, not-a-cidr")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an error for an invalid TRUSTED_PROXIES CIDR")
 	}
 }

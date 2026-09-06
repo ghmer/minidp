@@ -28,7 +28,7 @@ func TestPKCES256RFC7636Vector(t *testing.T) {
 }
 
 func TestNewSigningKeyGeneratesUsableKey(t *testing.T) {
-	k, err := NewSigningKey("")
+	k, err := NewSigningKey("", "")
 	if err != nil {
 		t.Fatalf("NewSigningKey: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestNewSigningKeyGeneratesUsableKey(t *testing.T) {
 // RSA public key from n/e and verifies a token signed by the private key. This
 // is exactly what the rego-adventure backend does.
 func TestJWKSPublishedKeyVerifiesToken(t *testing.T) {
-	k, err := NewSigningKey("")
+	k, err := NewSigningKey("", "")
 	if err != nil {
 		t.Fatalf("NewSigningKey: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestLoadSigningKeyFromPEM(t *testing.T) {
 		t.Fatalf("write pem: %v", err)
 	}
 
-	loaded, err := NewSigningKey(path)
+	loaded, err := NewSigningKey(path, "")
 	if err != nil {
 		t.Fatalf("NewSigningKey(%q): %v", path, err)
 	}
@@ -134,7 +134,7 @@ func TestLoadSigningKeyFromPEM(t *testing.T) {
 }
 
 func TestLoadSigningKeyErrors(t *testing.T) {
-	if _, err := NewSigningKey(filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+	if _, err := NewSigningKey(filepath.Join(t.TempDir(), "missing.pem"), ""); err == nil {
 		t.Fatal("expected an error for a missing key file")
 	}
 
@@ -142,7 +142,7 @@ func TestLoadSigningKeyErrors(t *testing.T) {
 	if err := os.WriteFile(garbage, []byte("not a pem file"), 0o600); err != nil {
 		t.Fatalf("write garbage pem: %v", err)
 	}
-	if _, err := NewSigningKey(garbage); err == nil {
+	if _, err := NewSigningKey(garbage, ""); err == nil {
 		t.Fatal("expected an error for a file without a PEM block")
 	}
 }
@@ -150,4 +150,49 @@ func TestLoadSigningKeyErrors(t *testing.T) {
 // base64RawURL decodes a standard base64url string without padding.
 func base64RawURL(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+func TestPersistentSigningKeyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	first, err := NewSigningKey("", dir)
+	if err != nil {
+		t.Fatalf("NewSigningKey: %v", err)
+	}
+	path := filepath.Join(dir, keyFileName)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("key file not persisted: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("key file mode = %o, want 600", perm)
+	}
+
+	second, err := NewSigningKey("", dir)
+	if err != nil {
+		t.Fatalf("NewSigningKey (second run): %v", err)
+	}
+	if second.key.N.Cmp(first.key.N) != 0 {
+		t.Error("second run did not load the persisted key")
+	}
+	// No temp file may be left behind.
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Error("temp key file was not cleaned up")
+	}
+}
+
+func TestPersistentSigningKeyRequiresExistingDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if _, err := NewSigningKey("", missing); err == nil {
+		t.Error("expected an error for a missing key dir (fail fast instead of silently going ephemeral)")
+	}
+}
+
+func TestPersistentSigningKeyRejectsCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, keyFileName), []byte("garbage"), 0o600); err != nil {
+		t.Fatalf("write garbage key: %v", err)
+	}
+	if _, err := NewSigningKey("", dir); err == nil {
+		t.Error("expected an error for a corrupt persisted key")
+	}
 }

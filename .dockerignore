@@ -1,0 +1,6 @@
+.git
+.github
+minidp
+data/
+*.md
+smoke-test.sh
