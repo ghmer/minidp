@@ -22,7 +22,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"token_endpoint_auth_methods_supported":         []string{"none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"none"},
 		"introspection_endpoint_auth_methods_supported": []string{"none"},
-		"code_challenge_methods_supported":              []string{"S256", "plain"},
+		"code_challenge_methods_supported":              []string{"S256"},
 		"scopes_supported":                              []string{"openid", "profile", "email"},
 		"claims_supported": []string{
 			"iss", "sub", "aud", "exp", "iat", "auth_time", "nonce",

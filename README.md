@@ -23,7 +23,7 @@ designed to work out of the box as the IdP for
 - **Multi-user mode** via a mounted JSON file of bcrypt-hashed accounts
   (managed with the bundled `minidp-users` tool), or single-user mode via env
 - OIDC discovery document (`/.well-known/openid-configuration`)
-- Authorization Code flow for public clients with **PKCE** (`S256`, `plain`) — PKCE is mandatory
+- Authorization Code flow for public clients with **PKCE** (`S256` only, per RFC 9700) — PKCE is mandatory
 - RS256-signed access and id tokens (JWT), `iss`/`aud`/`nonce` claims included
 - Refresh token grant with **single-use rotation**
 - `userinfo`, `introspect` (RFC 7662) and `revoke` (RFC 7009) endpoints

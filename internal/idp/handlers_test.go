@@ -270,6 +270,33 @@ func TestAuthorizeRejectsMissingPKCE(t *testing.T) {
 	}
 }
 
+// TestAuthorizeRejectsPlainPKCE pins the RFC 9700 requirement: only S256 is
+// accepted, both at authorization and (defensively) at token verification.
+func TestAuthorizeRejectsPlainPKCE(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	for _, method := range []string{"plain", "", "s256"} {
+		target := ts.URL + "/authorize?client_id=c1&redirect_uri=" + url.QueryEscape(testRedirect) +
+			"&response_type=code&code_challenge=abc&code_challenge_method=" + url.QueryEscape(method)
+		resp, err := http.Get(target)
+		if err != nil {
+			t.Fatalf("GET /authorize (method=%q): %v", method, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("method=%q: status = %d, want 400", method, resp.StatusCode)
+		}
+		if !strings.Contains(string(body), "S256") {
+			t.Errorf("method=%q: expected an explanation mentioning S256", method)
+		}
+	}
+
+	// Defense in depth: a stored plain challenge must not verify either.
+	if verifyPKCE("some-verifier", "plain", "some-verifier") {
+		t.Error("verifyPKCE must reject the plain method")
+	}
+}
+
 func TestAuthorizeWrongPassword(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()

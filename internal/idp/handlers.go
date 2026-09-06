@@ -91,8 +91,10 @@ func (s *Server) validateAuthorizeRequest(q url.Values) string {
 	if q.Get("code_challenge") == "" {
 		return "Missing code_challenge: this IdP requires PKCE for public clients."
 	}
-	if m := q.Get("code_challenge_method"); m != "" && m != "S256" && m != "plain" {
-		return "Unsupported code_challenge_method; use S256 or plain."
+	// RFC 9700 (OAuth 2.0 Security BCP) mandates S256; plain offers no
+	// protection over the wire and a browser SPA can always do S256.
+	if m := q.Get("code_challenge_method"); m != "S256" {
+		return "Unsupported code_challenge_method; only S256 is supported."
 	}
 	return ""
 }
@@ -290,7 +292,9 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// verifyPKCE checks the code_verifier against the stored challenge.
+// verifyPKCE checks the code_verifier against the stored challenge. Only
+// S256 is accepted (RFC 9700); an absent method is treated as S256 for
+// robustness, anything else fails closed.
 func verifyPKCE(challenge, method, verifier string) bool {
 	if challenge == "" {
 		// No PKCE was requested at authorization time.
@@ -299,11 +303,10 @@ func verifyPKCE(challenge, method, verifier string) bool {
 	if verifier == "" {
 		return false
 	}
-	computed := verifier // "plain"
-	if method == "" || method == "S256" {
-		computed = pkceS256(verifier)
+	if method != "" && method != "S256" {
+		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(computed), []byte(challenge)) == 1
+	return subtle.ConstantTimeCompare([]byte(pkceS256(verifier)), []byte(challenge)) == 1
 }
 
 // handleCodeGrant redeems an authorization code for a token set.
