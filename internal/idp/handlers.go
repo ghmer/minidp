@@ -154,9 +154,12 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if !s.limiter.allow(ip) {
 		slog.Warn("login rate limited", "ip", ip)
+		// Carry the OAuth2 context through the re-render (like every other
+		// error branch) so a retry after the cooldown submits a complete form.
 		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
 			Action: "/authorize",
 			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
+			Hidden: oauthHiddenFields(oauthParamsOf(r)),
 		})
 		return
 	}

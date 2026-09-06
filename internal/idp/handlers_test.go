@@ -1010,22 +1010,32 @@ func TestLoginRateLimiting(t *testing.T) {
 	verifier, _ := pkcePair()
 
 	browser := newBrowser()
-	attempt := func() int {
+	attempt := func() (*http.Response, url.Values) {
 		form := authorizeForm(verifier)
 		form.Set("username", "rego")
 		form.Set("password", "adventure")
 		form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
 		resp := postForm(t, browser, ts.URL+"/authorize", form)
-		return resp.StatusCode
+		return resp, form
 	}
-	if s := attempt(); s != http.StatusFound {
-		t.Fatalf("attempt 1: status = %d, want 302", s)
+	if resp, _ := attempt(); resp.StatusCode != http.StatusFound {
+		t.Fatalf("attempt 1: status = %d, want 302", resp.StatusCode)
 	}
-	if s := attempt(); s != http.StatusFound {
-		t.Fatalf("attempt 2: status = %d, want 302", s)
+	if resp, _ := attempt(); resp.StatusCode != http.StatusFound {
+		t.Fatalf("attempt 2: status = %d, want 302", resp.StatusCode)
 	}
-	if s := attempt(); s != http.StatusTooManyRequests {
-		t.Fatalf("attempt 3: status = %d, want 429", s)
+	resp, form := attempt()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("attempt 3: status = %d, want 429", resp.StatusCode)
+	}
+	// The 429 re-render must keep the OAuth2 context so a retry after the
+	// cooldown submits a complete form instead of losing client_id & co.
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	for _, key := range []string{"client_id", "redirect_uri", "code_challenge", "state", "nonce"} {
+		if !strings.Contains(string(body), `name="`+key+`" value="`+form.Get(key)+`"`) {
+			t.Errorf("429 page is missing the hidden field %q", key)
+		}
 	}
 }
 
