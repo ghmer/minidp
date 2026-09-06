@@ -1,7 +1,9 @@
 # minidp
 
 A minimal OIDC/OAuth2 identity provider written in Go. It implements the
-**public-client Authorization Code flow with PKCE (S256)**, issues signed
+**Authorization Code flow** for **public clients with mandatory PKCE (S256)**
+and for **confidential clients with client authentication at the token
+endpoint** (`MINIDP_MODE`), issues signed
 **access tokens**, **id tokens** and **rotating refresh tokens**, and is
 designed to work out of the box as the IdP for
 [github.com/ghmer/rego-adventure](https://github.com/ghmer/rego-adventure).
@@ -31,8 +33,10 @@ designed to work out of the box as the IdP for
 - **Mandatory redirect policy** (`ALLOWED_REDIRECTS`): the registered client's
   redirect URIs; minidp refuses to start without it
 - OIDC discovery document (`/.well-known/openid-configuration`)
-- Authorization Code flow for public clients with **PKCE** (`S256` only, per
-  RFC 9700, RFC 7636 syntax enforced) — PKCE is mandatory
+- Authorization Code flow for **public clients** with **mandatory PKCE**
+  (`S256` only, per RFC 9700, RFC 7636 syntax enforced) — see
+  [Client modes](#client-modes-public-vs-confidential) for the confidential
+  variant
 - RS256-signed tokens with the RFC 9068 `at+jwt` token profile for access
   tokens (`typ` header) — an **id token can never be replayed as an access
   token**
@@ -80,6 +84,11 @@ designed to work out of the box as the IdP for
   belongs to (`sid` claim = token family).
 - **Security headers**: strict CSP (`frame-ancestors 'none'`, no
   `unsafe-inline`), `X-Frame-Options: DENY`, `nosniff`, strict referrer policy.
+- **Confidential client authentication** (`MINIDP_MODE=confidential`):
+  constant-time secret comparison (Basic and form methods), client
+  authentication **before** codes/refresh tokens are consumed, RFC 9700
+  §2.3.2 Basic-vs-form `client_id` conflict rejection, and fail-fast startup
+  validation of the mode/secret combination.
 - **Audit logging**: login success/failure (with client IP and attempted
   username), code issuance, token grants and rejections via slog.
 - **Graceful shutdown** on SIGTERM/SIGINT for k8s/compose rolling updates.
@@ -116,30 +125,74 @@ on port 8099 and exercises the whole flow):
 
 All settings are provided through environment variables.
 
-| Variable                | Default                              | Description                                                                                         |
-| ----------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `IDP_HOST`              | `0.0.0.0`                            | Interface to bind                                                                                   |
-| `IDP_PORT`              | `8080`                               | TCP port to listen on                                                                               |
-| `IDP_ISSUER`            | `http://localhost:8080`              | Issuer URL; written into every token's `iss` and the discovery doc                                  |
-| `IDP_CLIENT_ID`         | `rego-adventure`                     | The single registered client; every other `client_id` is rejected at `/authorize` and `/token`      |
-| `IDP_AUDIENCE`          | *(= `IDP_CLIENT_ID`)*                | `aud` claim of every token; `/userinfo` and `/introspect` reject tokens with a foreign audience     |
-| `IDP_USERS_FILE`        | *(required)*                         | JSON file with user accounts (bcrypt hashes, see below) — **the only credential source**            |
-| `IDP_ACCESS_TOKEN_TTL`  | `3600`                               | Access/id token lifetime in seconds                                                                 |
-| `IDP_REFRESH_TOKEN_TTL` | `7200`                               | Refresh token lifetime in seconds                                                                   |
-| `ALLOWED_REDIRECTS`     | *(required)*                         | Comma-separated registered `redirect_uri` values of the client — minidp refuses to start without it |
-| `IDP_ALLOWED_ORIGINS`   | *(derived from `ALLOWED_REDIRECTS`)* | Explicit CORS origin allowlist; other origins are never reflected with credentials                  |
-| `IDP_RSA_PEM`           | *(unset)*                            | Path to a PKCS#1/PKCS#8 RSA private key; takes precedence over `IDP_KEY_DIR`                        |
-| `IDP_KEY_DIR`           | *(unset)*                            | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`)                          |
-| `TRUSTED_PROXIES`       | *(empty)*                            | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted                           |
-| `IDP_CLIENT_SECRET`     | *(unset = open)*                     | When set, `/introspect` and `/revoke` require client auth (Basic or `client_secret` form field)     |
-| `IDP_LOGIN_RATE_LIMIT`  | `20`                                 | Login attempts per minute and client IP                                                             |
-| `IDP_TITLE`             | `Rego Adventure`                     | Title shown on the login page                                                                       |
-| `IDP_SUBTITLE`          | `Sign in to begin …`                 | Subtitle shown on the login page                                                                    |
+| Variable                | Default                              | Description                                                                                                                                                                          |
+| ----------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `IDP_HOST`              | `0.0.0.0`                            | Interface to bind                                                                                                                                                                    |
+| `IDP_PORT`              | `8080`                               | TCP port to listen on                                                                                                                                                                |
+| `IDP_ISSUER`            | `http://localhost:8080`              | Issuer URL; written into every token's `iss` and the discovery doc                                                                                                                   |
+| `IDP_CLIENT_ID`         | `rego-adventure`                     | The single registered client; every other `client_id` is rejected at `/authorize` and `/token`                                                                                       |
+| `IDP_AUDIENCE`          | *(= `IDP_CLIENT_ID`)*                | `aud` claim of every token; `/userinfo` and `/introspect` reject tokens with a foreign audience                                                                                      |
+| `IDP_USERS_FILE`        | *(required)*                         | JSON file with user accounts (bcrypt hashes, see below) — **the only credential source**                                                                                             |
+| `IDP_ACCESS_TOKEN_TTL`  | `3600`                               | Access/id token lifetime in seconds                                                                                                                                                  |
+| `IDP_REFRESH_TOKEN_TTL` | `7200`                               | Refresh token lifetime in seconds                                                                                                                                                    |
+| `ALLOWED_REDIRECTS`     | *(required)*                         | Comma-separated registered `redirect_uri` values of the client — minidp refuses to start without it                                                                                  |
+| `IDP_ALLOWED_ORIGINS`   | *(derived from `ALLOWED_REDIRECTS`)* | Explicit CORS origin allowlist; other origins are never reflected with credentials                                                                                                   |
+| `IDP_RSA_PEM`           | *(unset)*                            | Path to a PKCS#1/PKCS#8 RSA private key; takes precedence over `IDP_KEY_DIR`                                                                                                         |
+| `IDP_KEY_DIR`           | *(unset)*                            | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`)                                                                                                           |
+| `TRUSTED_PROXIES`       | *(empty)*                            | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted                                                                                                            |
+| `MINIDP_MODE`           | `public`                             | Client profile: `public` (mandatory PKCE, no secret allowed) or `confidential` (client auth at `/token`, secret required) — see [Client modes](#client-modes-public-vs-confidential) |
+| `IDP_CLIENT_SECRET`     | *(unset)*                            | The registered client's secret; **only valid in `confidential` mode** — also gates `/introspect` and `/revoke`                                                                       |
+| `IDP_LOGIN_RATE_LIMIT`  | `20`                                 | Login attempts per minute and client IP                                                                                                                                              |
+| `IDP_TITLE`             | `Rego Adventure`                     | Title shown on the login page                                                                                                                                                        |
+| `IDP_SUBTITLE`          | `Sign in to begin …`                 | Subtitle shown on the login page                                                                                                                                                     |
 
 The single-user credential variables of earlier versions (`IDP_USERNAME`,
 `IDP_PASSWORD`, `IDP_PASSWORD_BCRYPT`, `IDP_PASSWORD_FILE`) were **removed**;
 setting any of them aborts startup with a migration hint. Manage accounts in
 the users file.
+
+## Client modes: public vs confidential
+
+`MINIDP_MODE` selects the RFC 6749 client profile of the single registered
+client. minidp refuses to start on inconsistent combinations (a secret in
+public mode is dead configuration; a confidential mode without a secret would
+authenticate every caller), so the mode and the secret are validated together
+at startup.
+
+**`MINIDP_MODE=public`** (default) — the SPA profile used by rego-adventure:
+
+- PKCE (S256) is **mandatory** at `/authorize` and verified at `/token`
+- `/token` accepts only `client_id` identification — public clients cannot
+  keep secrets, so none is configured (`IDP_CLIENT_SECRET` must be unset)
+- `/introspect` and `/revoke` are open (tokens are 256-bit random)
+
+**`MINIDP_MODE=confidential`** — the backend/profile for a client that can
+hold a secret (requires `IDP_CLIENT_SECRET`):
+
+- `/token` (and `/revoke`, `/introspect`) **require client authentication**:
+  `client_secret_basic` (HTTP Basic, RFC 6749 §2.3.1 form-urlencoded
+  credentials) or `client_secret_post` (`client_id` + `client_secret` form
+  fields). Failures answer `401 invalid_client` and are **logged** (audit/IDS),
+  not rate limited — the same rationale as the token endpoint itself.
+- PKCE becomes **optional**: the secret is the client's proof of identity. If
+  the client still sends a `code_challenge`, it is validated as strictly as in
+  public mode (S256, RFC 7636 shape) and the matching `code_verifier` is
+  required at `/token`. RFC 9700 §2.1.1 recommends PKCE for all clients —
+  keep using it if you can.
+- Failed client authentication happens **before** the authorization code or
+  refresh token is consumed: a wrong secret can never burn a valid code.
+- Client authentication is also required on the **refresh token grant**
+  (RFC 6749 §6); on success the refresh chain (rotation, family revocation on
+  reuse) behaves exactly as in public mode.
+- Discovery advertises `client_secret_basic` + `client_secret_post` for the
+  token/revocation/introspection endpoints instead of `none`.
+
+```sh
+MINIDP_MODE=confidential IDP_CLIENT_SECRET="$(openssl rand -base64 32)" minidp
+```
+
+Use a cryptographically random secret of at least 128 bits; shorter secrets
+trigger a startup warning.
 
 ## Using minidp with rego-adventure
 

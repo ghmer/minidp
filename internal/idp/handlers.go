@@ -110,17 +110,25 @@ func (s *Server) validateAuthorizeRequest(q url.Values) (code, description strin
 	if q.Get("response_type") != "code" {
 		return "unsupported_response_type", `Unsupported response_type; only "code" (authorization code flow) is supported.`
 	}
-	// RFC 9700 (OAuth 2.0 Security BCP) mandates S256; plain offers no
-	// protection over the wire and a browser SPA can always do S256.
+	// PKCE: mandatory for public clients (RFC 9700); optional but validated
+	// when a confidential client chooses to use it. The token endpoint
+	// re-verifies whatever challenge was stored with the code.
 	challenge := q.Get("code_challenge")
 	if challenge == "" {
-		return "invalid_request", "Missing code_challenge: this IdP requires PKCE for public clients."
-	}
-	if m := q.Get("code_challenge_method"); m != "S256" {
-		return "invalid_request", "Unsupported code_challenge_method; only S256 is supported."
-	}
-	if !validPKCEChallenge(challenge) {
-		return "invalid_request", "Malformed code_challenge: expected 43-128 base64url characters (S256 digest)."
+		if !s.cfg.Confidential() {
+			return "invalid_request", "Missing code_challenge: PKCE is required for public clients."
+		}
+		// Confidential client without PKCE: accepted, the secret is the
+		// client's proof of identity at the token endpoint.
+	} else {
+		// RFC 9700 (OAuth 2.0 Security BCP) mandates S256; plain offers no
+		// protection over the wire and a browser SPA can always do S256.
+		if m := q.Get("code_challenge_method"); m != "S256" {
+			return "invalid_request", "Unsupported code_challenge_method; only S256 is supported."
+		}
+		if !validPKCEChallenge(challenge) {
+			return "invalid_request", "Malformed code_challenge: expected 43-128 base64url characters (S256 digest)."
+		}
 	}
 	// Unsupported OIDC parameters are rejected explicitly instead of being
 	// accepted and ignored (review finding M3).
@@ -420,6 +428,81 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// authenticateClient authenticates the client presenting a request to the
+// token endpoint (RFC 6749 §2.3, RFC 9700 §2.3).
+//
+//   - Confidential client (MINIDP_MODE=confidential): client_secret_basic —
+//     HTTP Basic with form-urlencoded credentials per RFC 6749 §2.3.1 — or
+//     client_secret_post (client_id + client_secret form fields). Both the
+//     client id and the secret are compared in constant time. If the request
+//     also carries a form client_id that differs from the authenticated one,
+//     it is rejected (RFC 9700 §2.3.2).
+//   - Public client: no authentication is possible; the client_id form field
+//     is mere identification and is returned unverified (the caller binds it
+//     against the authorization context).
+//
+// On failure the RFC 6749 §5.2 invalid_client response (401 with a
+// WWW-Authenticate: Basic header when Basic auth was attempted) has already
+// been written. Failures are logged for audit/IDS purposes but deliberately
+// NOT rate limited — see the handleToken rationale.
+func (s *Server) authenticateClient(w http.ResponseWriter, r *http.Request) (clientID string, ok bool) {
+	if !s.cfg.Confidential() {
+		id := r.PostForm.Get("client_id")
+		if id == "" {
+			writeAuthError(w, "invalid_request", "Missing client_id.")
+			return "", false
+		}
+		return id, true
+	}
+	if id, pw, basic := r.BasicAuth(); basic {
+		// RFC 6749 §2.3.1: client_id and secret are
+		// application/x-www-form-urlencoded before being placed in the Basic
+		// credentials, so they are decoded first.
+		id, idErr := url.QueryUnescape(id)
+		pw, pwErr := url.QueryUnescape(pw)
+		if idErr != nil || pwErr != nil ||
+			subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
+			s.tokenClientAuthFailed(r, "client_secret_basic")
+			s.invalidClient(w)
+			return "", false
+		}
+		// A Basic-authenticated request must not smuggle a different
+		// identification through the form body.
+		if formID := r.PostForm.Get("client_id"); formID != "" && formID != s.cfg.ClientID {
+			s.tokenClientAuthFailed(r, "client_secret_basic")
+			s.invalidClient(w)
+			return "", false
+		}
+		return s.cfg.ClientID, true
+	}
+	id := r.PostForm.Get("client_id")
+	pw := r.PostForm.Get("client_secret")
+	if subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
+		s.tokenClientAuthFailed(r, "client_secret_post")
+		s.invalidClient(w)
+		return "", false
+	}
+	return s.cfg.ClientID, true
+}
+
+// tokenClientAuthFailed logs a failed token-endpoint client authentication.
+// Log only, by design: limiting would hand attackers a denial-of-service
+// against the token endpoint, while audit consumers get a distinct,
+// greppable message.
+func (s *Server) tokenClientAuthFailed(r *http.Request, method string) {
+	slog.Warn("token endpoint client authentication failed", "ip", s.clientIP(r), "auth_method", method)
+}
+
+// invalidClient writes the RFC 6749 §5.2 invalid_client error. The
+// WWW-Authenticate header is always sent: clients attempting Basic auth are
+// required to receive it, and it is harmless for client_secret_post clients.
+func (s *Server) invalidClient(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="minidp", error="invalid_client"`)
+	writeError(w, http.StatusUnauthorized, "invalid_client", "Client authentication failed.")
+}
+
 // handleToken implements the RFC 6749 token endpoint for the
 // authorization_code and refresh_token grants.
 //
@@ -474,23 +557,26 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_request", "Missing code.")
 		return
 	}
-	ac := s.store.takeCode(code)
-	if ac == nil {
-		slog.Warn("code rejected: unknown, expired or already redeemed", "ip", s.clientIP(r))
-		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
-		return
-	}
+	// Client authentication/identification happens BEFORE the code is
+	// consumed, so a failed or unauthenticated request cannot burn the
+	// one-time code (RFC 6749 §4.1.3, RFC 9700 §4.4.1).
+	//
 	// RFC 6749 §4.1.3: the token request must repeat client_id (public
-	// clients cannot authenticate) and the same redirect_uri that was used in
-	// the authorization request (which this IdP always requires). The
-	// presenting client must also be the one registered client.
-	clientID := form.Get("client_id")
-	if clientID == "" {
-		writeAuthError(w, "invalid_request", "Missing client_id.")
+	// clients cannot authenticate; confidential clients present Basic or
+	// client_secret_post credentials). The presenting client must also be
+	// the one registered client.
+	clientID, ok := s.authenticateClient(w, r)
+	if !ok {
 		return
 	}
 	if clientID != s.cfg.ClientID {
 		writeAuthError(w, "invalid_grant", "Unknown client_id.")
+		return
+	}
+	ac := s.store.takeCode(code)
+	if ac == nil {
+		slog.Warn("code rejected: unknown, expired or already redeemed", "ip", s.clientIP(r))
+		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
 		return
 	}
 	if clientID != ac.ClientID {
@@ -536,12 +622,12 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_request", "Missing refresh_token.")
 		return
 	}
-	// RFC 6749 §6: a public client must identify itself with client_id. Only
-	// the registered client is accepted — checked before the token is
+	// RFC 6749 §6: a public client must identify itself with client_id; a
+	// confidential client MUST authenticate (Basic or client_secret_post).
+	// Only the registered client is accepted — checked before the token is
 	// consumed so a foreign client cannot burn a stolen refresh token.
-	clientID := r.PostForm.Get("client_id")
-	if clientID == "" {
-		writeAuthError(w, "invalid_request", "Missing client_id.")
+	clientID, ok := s.authenticateClient(w, r)
+	if !ok {
 		return
 	}
 	if clientID != s.cfg.ClientID {
@@ -680,12 +766,13 @@ func bearerToken(r *http.Request) string {
 }
 
 // requireClientAuth enforces client authentication on the introspection and
-// revocation endpoints when IDP_CLIENT_SECRET is configured (RFC 7662
-// strongly recommends authenticating introspection; an open /revoke is a free
-// probe endpoint). Accepted: HTTP Basic auth (any username, the configured
-// secret as password) or a client_secret form field. Unconfigured -> open.
+// revocation endpoints in confidential mode (RFC 7662 strongly recommends
+// authenticating introspection; an open /revoke is a free probe endpoint).
+// Accepted: HTTP Basic auth (any username, the configured secret as password)
+// or a client_secret form field. In public mode (no secret configured) both
+// endpoints are open.
 func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.ClientSecret == "" {
+	if !s.cfg.Confidential() {
 		return true
 	}
 	secret := []byte(s.cfg.ClientSecret)

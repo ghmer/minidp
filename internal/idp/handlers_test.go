@@ -1055,16 +1055,22 @@ func TestEndSessionRevokesTokenFamily(t *testing.T) {
 	}
 }
 
-// TestIntrospectRevokeClientAuth pins the review fix: with IDP_CLIENT_SECRET
-// configured, /introspect and /revoke require client authentication.
+// TestIntrospectRevokeClientAuth pins the review fix: in confidential mode
+// (MINIDP_MODE=confidential with IDP_CLIENT_SECRET), /introspect and /revoke
+// require client authentication. The token redemption inside also exercises
+// the client_secret_post method at /token.
 func TestIntrospectRevokeClientAuth(t *testing.T) {
-	ts, _ := testIDP(t, func(c *Config) { c.ClientSecret = "s3cret" })
+	ts, _ := testIDP(t, func(c *Config) {
+		c.Mode = ModeConfidential
+		c.ClientSecret = "s3cret"
+	})
 	verifier, _ := pkcePair()
 	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"client_id":     {testClientID},
+		"client_secret": {"s3cret"},
 		"redirect_uri":  {testRedirect},
 		"code_verifier": {verifier},
 	}))

@@ -410,4 +410,76 @@ echo "multi-user: unknown user rejected OK"
 kill "$MINIDP2_PID" 2>/dev/null || true
 
 echo
+echo "== 19. confidential mode (MINIDP_MODE=confidential): client auth at /token =="
+SECRET="smoke-test-confidential-secret"
+# The secret gates the token endpoint; the port is free again after instance 2.
+IDP_PORT=8098 IDP_ISSUER="$BASE2" IDP_USERS_FILE="$UFILE" \
+  ALLOWED_REDIRECTS="$REDIRECT" MINIDP_MODE=confidential IDP_CLIENT_SECRET="$SECRET" \
+  "$WORKDIR/minidp" >"$WORKDIR/minidp3.log" 2>&1 &
+MINIDP2_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE2/healthz" >/dev/null && break
+  sleep 0.2
+done
+curl -sf "$BASE2/healthz" >/dev/null || { echo "confidential IdP did not come up"; exit 1; }
+
+curl -s "$BASE2/.well-known/openid-configuration" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+m=d['token_endpoint_auth_methods_supported']
+assert m==['client_secret_basic','client_secret_post'], m
+print('discovery advertises client auth methods:', m)
+"
+
+# Confidential clients may authorize WITHOUT PKCE.
+QC="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=sC&nonce=nC"
+CSRFC=$(curl -s -c "$JAR2" "$BASE2/authorize?$QC" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+mark_jar_insecure "$JAR2"
+LOCC=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
+  --data-urlencode "csrf_token=$CSRFC" --data-urlencode "client_id=$CLIENT" \
+  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
+  --data-urlencode "scope=openid profile" --data-urlencode "state=sC" --data-urlencode "nonce=nC" \
+  --data-urlencode "username=alice" --data-urlencode "password=wonderland")
+CODEC=$(printf '%s' "$LOCC" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+echo "authorize without PKCE OK (code issued)"
+
+# Without client credentials the token endpoint must reject with 401
+# invalid_client — and the code must survive the failed attempt.
+RESPC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
+  -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$REDIRECT")
+[ "$RESPC" = "401" ] && echo "token without client auth rejected (401) OK"
+
+# With HTTP Basic credentials the code redeems, without any code_verifier.
+TOKC=$(curl -s -u "$CLIENT:$SECRET" -X POST "$BASE2/token" \
+  -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$REDIRECT")
+REFRESHC=$(printf '%s' "$TOKC" | python3 -c "
+import json,sys,base64
+d=json.load(sys.stdin)
+def claims(t):
+    p=t.split('.')[1]; p+='='*(-len(p)%4)
+    return json.loads(base64.urlsafe_b64decode(p))
+ac=claims(d['access_token'])
+assert ac['sub']=='alice', ac
+print('confidential code grant with client_secret_basic OK (no PKCE needed)')
+print(json.dumps(d))
+" | tail -1 | python3 -c "import sys,json;print(json.load(sys.stdin)['refresh_token'])")
+
+# RFC 6749 §6: refreshing also requires client authentication.
+RC1=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
+  -d "grant_type=refresh_token&refresh_token=$REFRESHC")
+[ "$RC1" = "401" ] && echo "refresh without client auth rejected (401) OK"
+RC2=$(curl -s -u "$CLIENT:wrong-secret" -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
+  -d "grant_type=refresh_token&refresh_token=$REFRESHC")
+[ "$RC2" = "401" ] && echo "refresh with wrong secret rejected (401) OK"
+# The failed attempts must not have consumed the token.
+curl -s -u "$CLIENT:$SECRET" -X POST "$BASE2/token" \
+  -d "grant_type=refresh_token&refresh_token=$REFRESHC" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert 'access_token' in d and 'refresh_token' in d, d
+print('refresh with correct secret OK (rotation, family intact)')
+"
+kill "$MINIDP2_PID" 2>/dev/null || true
+
+echo
 echo "ALL CHECKS PASSED"

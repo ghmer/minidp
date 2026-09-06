@@ -1,5 +1,8 @@
 // Package idp is a minimal OIDC/OAuth2 identity provider that speaks the
-// public-client Authorization Code flow with PKCE. It is designed to be
+// Authorization Code flow with PKCE for public clients and, in
+// MINIDP_MODE=confidential, the confidential-client flow with client
+// authentication (client_secret_basic / client_secret_post) at the token
+// endpoint. It is designed to be
 // drop-in compatible with the OAuth2/OIDC client used by
 // github.com/ghmer/rego-adventure (oidc-client-ts on the front-end, JWKS-based
 // validation on the back-end).
@@ -14,6 +17,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
+
+// ClientMode is the type of the single registered OAuth client. It selects
+// which RFC 6749 client profile the provider serves.
+type ClientMode string
+
+const (
+	// ModePublic serves the public-client profile: the client cannot keep a
+	// secret, PKCE (S256) is mandatory at /authorize and the token endpoint
+	// accepts only client_id identification.
+	ModePublic ClientMode = "public"
+	// ModeConfidential serves the confidential-client profile: /token
+	// requires client authentication (client_secret_basic or
+	// client_secret_post), PKCE becomes optional, and /introspect//revoke
+	// require the secret.
+	ModeConfidential ClientMode = "confidential"
 )
 
 // Config holds all tunable IdP settings. Every field is overridable through an
@@ -73,11 +92,17 @@ type Config struct {
 	// limiting and audit logs. Empty means: trust no proxy, use the socket
 	// address.
 	TrustedProxies []string
-	// ClientSecret (IDP_CLIENT_SECRET), when set, makes /introspect and
-	// /revoke require client authentication: HTTP Basic auth with any
-	// username and this secret as the password, or a client_secret form
-	// field. Unset leaves both endpoints open (bounded risk: tokens are
-	// 256-bit random, but an open /revoke is a free probe endpoint).
+	// Mode (MINIDP_MODE, "public" or "confidential") selects the client
+	// profile of the single registered client. "public" (default) requires
+	// PKCE and forbids IDP_CLIENT_SECRET; "confidential" requires
+	// IDP_CLIENT_SECRET and authenticates the client at /token.
+	Mode ClientMode
+	// ClientSecret (IDP_CLIENT_SECRET) is the registered client's credential
+	// in MINIDP_MODE=confidential: /token then requires client
+	// authentication — HTTP Basic (RFC 6749 §2.3.1, client_secret_basic) or
+	// a client_id/client_secret form body (client_secret_post) — PKCE
+	// becomes optional for the client, and the same secret gates /introspect
+	// and /revoke. In MINIDP_MODE=public the secret must be unset.
 	ClientSecret string
 	// LoginRateLimit is the number of login attempts (POST /authorize and
 	// POST /login) allowed per minute and client IP.
@@ -115,6 +140,7 @@ func LoadConfig() (Config, error) {
 		Port:            envOr("IDP_PORT", "8080"),
 		Issuer:          envOr("IDP_ISSUER", "http://localhost:8080"),
 		ClientID:        envOr("IDP_CLIENT_ID", "rego-adventure"),
+		Mode:            ClientMode(os.Getenv("MINIDP_MODE")),
 		AccessTokenTTL:  accessTokenTTL,
 		RefreshTokenTTL: refreshTokenTTL,
 		Title:           envOr("IDP_TITLE", "Rego Adventure"),
@@ -123,6 +149,29 @@ func LoadConfig() (Config, error) {
 		KeyDir:          os.Getenv("IDP_KEY_DIR"),
 		LoginRateLimit:  loginRateLimit,
 		ClientSecret:    os.Getenv("IDP_CLIENT_SECRET"),
+	}
+	// The mode decides the client profile. It is validated together with the
+	// client secret because the two are two halves of one registration: a
+	// secret without the confidential mode would be silently dead config, a
+	// confidential mode without a secret would authenticate every caller.
+	switch cfg.Mode {
+	case "", ModePublic:
+		cfg.Mode = ModePublic
+		if cfg.ClientSecret != "" {
+			return cfg, fmt.Errorf("IDP_CLIENT_SECRET is set but MINIDP_MODE is %q: a public client must not have a secret; set MINIDP_MODE=confidential or unset IDP_CLIENT_SECRET", cfg.Mode)
+		}
+	case ModeConfidential:
+		if cfg.ClientSecret == "" {
+			return cfg, fmt.Errorf("MINIDP_MODE=%s requires IDP_CLIENT_SECRET to be set: the client must have a credential to authenticate with", ModeConfidential)
+		}
+		if len(cfg.ClientSecret) < 16 {
+			// Loud warning, not an error: the operator may accept the risk,
+			// but a secret governing the token endpoint should be
+			// cryptographically random (RFC 9700 §2.4 wants ≥128 bits).
+			slog.Warn("IDP_CLIENT_SECRET is shorter than 16 characters: use a cryptographically random secret of at least 128 bits for a confidential client")
+		}
+	default:
+		return cfg, fmt.Errorf("invalid MINIDP_MODE %q: must be %q or %q", string(cfg.Mode), ModePublic, ModeConfidential)
 	}
 	// The token audience defaults to the registered client id, matching what
 	// rego-adventure expects (AUTH_AUDIENCE = AUTH_CLIENT_ID). A distinct
@@ -174,6 +223,13 @@ func LoadConfig() (Config, error) {
 	cfg.TrustedProxies = proxies
 	return cfg, nil
 }
+
+// Confidential reports whether the single registered client is a confidential
+// client (MINIDP_MODE=confidential). Confidential clients must authenticate at
+// the token endpoint (client_secret_basic or client_secret_post) and may use
+// the flow without PKCE; public clients cannot keep secrets and must always
+// use PKCE.
+func (c Config) Confidential() bool { return c.Mode == ModeConfidential }
 
 // parseTrustedProxies validates a comma-separated list of CIDR ranges.
 func parseTrustedProxies(raw string) ([]string, error) {

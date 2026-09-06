@@ -6,10 +6,11 @@ import "net/http"
 // AUTH_DISCOVERY_URL (= issuer + /.well-known/openid-configuration) to learn the
 // endpoint URLs and the jwks_uri used for JWT validation.
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
-	// Client authentication on introspection/revocation depends on whether a
-	// shared client secret is configured (IDP_CLIENT_SECRET).
+	// Client authentication methods depend on the configured client mode: a
+	// confidential client (MINIDP_MODE=confidential) authenticates with its
+	// secret, a public client with none.
 	clientAuthMethods := []string{"none"}
-	if s.cfg.ClientSecret != "" {
+	if s.cfg.Confidential() {
 		clientAuthMethods = []string{"client_secret_basic", "client_secret_post"}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -25,7 +26,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"grant_types_supported":                         []string{"authorization_code", "refresh_token"},
 		"subject_types_supported":                       []string{"public"},
 		"id_token_signing_alg_values_supported":         []string{"RS256"},
-		"token_endpoint_auth_methods_supported":         []string{"none"},
+		"token_endpoint_auth_methods_supported":         clientAuthMethods,
 		"revocation_endpoint_auth_methods_supported":    clientAuthMethods,
 		"introspection_endpoint_auth_methods_supported": clientAuthMethods,
 		"code_challenge_methods_supported":              []string{"S256"},

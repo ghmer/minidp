@@ -75,6 +75,7 @@ func New(cfg Config) (*Server, error) {
 	slog.Info("minidp starting",
 		"issuer", cfg.Issuer,
 		"client", cfg.ClientID,
+		"mode", string(cfg.Mode),
 		"audience", cfg.Audience,
 		"users", userCount(users),
 		"accessTTL", cfg.AccessTokenTTL,

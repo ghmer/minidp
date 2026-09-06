@@ -1,5 +1,7 @@
 // Command minidp is a minimal OIDC/OAuth2 identity provider implementing the
-// public-client Authorization Code flow with PKCE (S256). It issues signed
+// Authorization Code flow with PKCE (S256) for public clients and, with
+// MINIDP_MODE=confidential, the confidential-client profile with client
+// authentication at the token endpoint. It issues signed
 // access tokens, id tokens and rotating refresh tokens, and is designed to work
 // out of the box as the IdP for github.com/ghmer/rego-adventure.
 //

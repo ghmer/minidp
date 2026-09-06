@@ -15,6 +15,7 @@ func setBaseEnv(t *testing.T) {
 		"IDP_ACCESS_TOKEN_TTL", "IDP_REFRESH_TOKEN_TTL", "ALLOWED_REDIRECTS",
 		"IDP_TITLE", "IDP_SUBTITLE", "IDP_RSA_PEM", "IDP_KEY_DIR",
 		"TRUSTED_PROXIES", "IDP_LOGIN_RATE_LIMIT", "IDP_USERS_FILE",
+		"MINIDP_MODE", "IDP_CLIENT_SECRET",
 		// Removed single-user variables must be cleared: LoadConfig rejects
 		// them even when the ambient shell has them set.
 		"IDP_USERNAME", "IDP_PASSWORD", "IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE",
@@ -67,6 +68,13 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if len(cfg.AllowedRedirects) != 1 || cfg.AllowedRedirects[0] != "https://app.example.com/callback" {
 		t.Errorf("AllowedRedirects = %v", cfg.AllowedRedirects)
+	}
+	// The client profile defaults to public with no client secret.
+	if cfg.Mode != ModePublic {
+		t.Errorf("Mode = %q, want %q", cfg.Mode, ModePublic)
+	}
+	if cfg.Confidential() {
+		t.Error("Confidential() = true, want false for the default public mode")
 	}
 	if cfg.UsersFile != "/etc/minidp/users.json" {
 		t.Errorf("UsersFile = %q", cfg.UsersFile)
@@ -214,5 +222,49 @@ func TestLoadConfigValidatesAllowedRedirects(t *testing.T) {
 	}
 	if len(cfg.AllowedRedirects) != 2 {
 		t.Errorf("AllowedRedirects = %v, want 2 entries", cfg.AllowedRedirects)
+	}
+}
+
+// TestLoadConfigModeValidation pins the MINIDP_MODE contract: the mode and the
+// client secret are two halves of one client registration, so every
+// inconsistent combination must abort startup instead of silently weakening a
+// security boundary.
+func TestLoadConfigModeValidation(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("IDP_USERS_FILE", "/etc/minidp/users.json")
+
+	// Confidential mode without a secret: every caller would pass client
+	// authentication, so this must fail fast.
+	t.Setenv("MINIDP_MODE", "confidential")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("MINIDP_MODE=confidential without IDP_CLIENT_SECRET: expected a fail-fast error")
+	}
+
+	// Public mode with a secret: the secret would be dead configuration an
+	// operator could mistake for a working control.
+	t.Setenv("MINIDP_MODE", "public")
+	t.Setenv("IDP_CLIENT_SECRET", "a-secret-of-sufficient-length")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("MINIDP_MODE=public with IDP_CLIENT_SECRET: expected a fail-fast error")
+	}
+
+	// Anything other than the two documented values is rejected.
+	t.Setenv("IDP_CLIENT_SECRET", "")
+	for _, bad := range []string{"Confidential", "hybrid", "public "} {
+		t.Setenv("MINIDP_MODE", bad)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("MINIDP_MODE=%q: expected a fail-fast error", bad)
+		}
+	}
+
+	// A valid confidential configuration passes and flips the profile.
+	t.Setenv("MINIDP_MODE", "confidential")
+	t.Setenv("IDP_CLIENT_SECRET", "a-secret-of-sufficient-length")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("MINIDP_MODE=confidential with secret rejected: %v", err)
+	}
+	if cfg.Mode != ModeConfidential || !cfg.Confidential() {
+		t.Errorf("Mode = %q, Confidential() = %v, want confidential/true", cfg.Mode, cfg.Confidential())
 	}
 }
