@@ -185,7 +185,7 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub, ok := s.authenticate(form.Get("username"), form.Get("password"))
+	who, ok := s.authenticate(form.Get("username"), form.Get("password"))
 	if !ok {
 		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
 		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
@@ -196,10 +196,10 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	slog.Info("login succeeded", "ip", ip, "user", sub)
+	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
 
 	code := s.store.addCode(&authCode{
-		Sub:                 sub,
+		Sub:                 who.Sub,
 		ClientID:            q.Get("client_id"),
 		RedirectURI:         q.Get("redirect_uri"),
 		CodeChallenge:       q.Get("code_challenge"),
@@ -254,7 +254,7 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	sub, ok := s.authenticate(form.Get("username"), form.Get("password"))
+	who, ok := s.authenticate(form.Get("username"), form.Get("password"))
 	if !ok {
 		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
 		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
@@ -264,10 +264,10 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	slog.Info("login succeeded", "ip", ip, "user", sub)
+	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
 	s.renderLoginPage(w, r, http.StatusOK, loginData{
 		Action:  "/login",
-		Message: "Signed in as " + sub + ". This page issues tokens only via the /authorize endpoint.",
+		Message: "Signed in as " + who.Sub + ". This page issues tokens only via the /authorize endpoint.",
 	})
 }
 
@@ -417,10 +417,14 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub, _ := claims["sub"].(string)
+	email, _ := claims["email"].(string)
+	if email == "" {
+		email = sub + "@example.com"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sub":                sub,
 		"preferred_username": sub,
-		"email":              sub + "@example.com",
+		"email":              email,
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -879,5 +880,73 @@ func TestClientIPHonoursTrustedProxies(t *testing.T) {
 	r.Header.Set("X-Forwarded-For", "203.0.113.7")
 	if got := srv.clientIP(r); got != "192.0.2.9" {
 		t.Errorf("untrusted peer: clientIP = %q, want the socket address (no header spoofing)", got)
+	}
+}
+
+// TestMultiUserFlow drives the complete PKCE flow for two users from a users
+// file and asserts that each token carries the right subject and profile.
+func TestMultiUserFlow(t *testing.T) {
+	usersFile := filepath.Join(t.TempDir(), "users.json")
+	if err := SaveUsers(usersFile, []User{
+		{Username: "alice", PasswordHash: testHash(t, "wonderland"), Email: "alice@wonderland.example", Name: "Alice"},
+		{Username: "bob", PasswordHash: testHash(t, "builder")},
+	}); err != nil {
+		t.Fatalf("SaveUsers: %v", err)
+	}
+	ts, _ := testIDP(t, func(c *Config) {
+		c.UsersFile = usersFile
+		c.Username = "" // multi-user mode
+	})
+
+	redeem := func(user, pass, verifier string) map[string]any {
+		code := codeFrom(t, login(t, ts.URL, user, pass, verifier))
+		return decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {code},
+			"client_id":     {testClientID},
+			"redirect_uri":  {testRedirect},
+			"code_verifier": {verifier},
+		}))
+	}
+
+	// Alice: subject and the email/name claims from the users file.
+	verifierA, _ := pkcePair()
+	tokensA := redeem("alice", "wonderland", verifierA)
+	accessA := verifyTokenString(t, tokensA["access_token"].(string), ts.URL)
+	if accessA["sub"] != "alice" {
+		t.Errorf("alice access sub = %v", accessA["sub"])
+	}
+	if accessA["email"] != "alice@wonderland.example" {
+		t.Errorf("alice access email = %v", accessA["email"])
+	}
+	idA := verifyTokenString(t, tokensA["id_token"].(string), ts.URL)
+	if idA["email"] != "alice@wonderland.example" || idA["name"] != "Alice" {
+		t.Errorf("alice id claims = %v/%v", idA["email"], idA["name"])
+	}
+
+	// Bob: no email in the file -> placeholder fallback, no name claim.
+	verifierB, _ := pkcePair()
+	tokensB := redeem("bob", "builder", verifierB)
+	idB := verifyTokenString(t, tokensB["id_token"].(string), ts.URL)
+	if idB["sub"] != "bob" {
+		t.Errorf("bob id sub = %v", idB["sub"])
+	}
+	if idB["email"] != "bob@example.com" {
+		t.Errorf("bob id email = %v, want the placeholder", idB["email"])
+	}
+	if _, has := idB["name"]; has {
+		t.Error("bob has no name in the users file; the claim must be absent")
+	}
+
+	// The single-user demo credentials must no longer authenticate.
+	verifierC, _ := pkcePair()
+	form := authorizeForm(verifierC)
+	form.Set("username", "rego")
+	form.Set("password", "adventure")
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifierC)))
+	resp := postForm(t, browser, ts.URL+"/authorize", form)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("single-user credentials in multi-user mode: status = %d, want 401", resp.StatusCode)
 	}
 }

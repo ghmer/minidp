@@ -206,5 +206,61 @@ curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_
   --data-urlencode "client_id=$CLIENT" --data-urlencode "username=rego" --data-urlencode "password=adventure" \
   | grep -q "400" && echo "login without CSRF token rejected OK"
 
+echo "== 18. multi-user mode (users file + minidp-users tool) =="
+TOOL=/tmp/minidp-users
+go build -o "$TOOL" ./cmd/minidp-users
+UFILE="$(mktemp -d)/users.json"
+"$TOOL" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example >/dev/null
+"$TOOL" add -file "$UFILE" -username bob -password builder >/dev/null
+"$TOOL" list -file "$UFILE" | grep -q "^alice" && echo "tool: users added and listed"
+"$TOOL" update -file "$UFILE" -username bob -password builder2 >/dev/null && echo "tool: password updated"
+"$TOOL" remove -file "$UFILE" -username bob >/dev/null && echo "tool: user removed"
+
+IDP_PORT=8098 IDP_ISSUER=http://localhost:8098 IDP_USERS_FILE="$UFILE" /tmp/minidp &
+MINIDP2_PID=$!
+sleep 1
+
+BASE2="http://localhost:8098"
+V2=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+C2=$(printf '%s' "$V2" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+Q2="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s9&nonce=n9&code_challenge=$C2&code_challenge_method=S256"
+JAR2=$(mktemp)
+CSRF2=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+LOC9=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
+  --data-urlencode "csrf_token=$CSRF2" --data-urlencode "client_id=$CLIENT" \
+  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
+  --data-urlencode "scope=openid" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
+  --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=alice" --data-urlencode "password=wonderland")
+CODE9=$(printf '%s' "$LOC9" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+TOK9=$(curl -s -X POST "$BASE2/token" \
+  -d "grant_type=authorization_code&code=$CODE9&client_id=$CLIENT&redirect_uri=$REDIRECT" \
+  --data-urlencode "code_verifier=$V2")
+printf '%s' "$TOK9" | python3 -c "
+import json,sys,base64
+d=json.load(sys.stdin)
+def claims(t):
+    p=t.split('.')[1]; p+='='*(-len(p)%4)
+    return json.loads(base64.urlsafe_b64decode(p))
+ac=claims(d['access_token']); ic=claims(d['id_token'])
+assert ac['sub']=='alice' and ic['sub']=='alice', (ac['sub'], ic['sub'])
+assert ic['email']=='alice@wonderland.example', ic['email']
+print('multi-user: alice logged in, sub/email claims correct')
+"
+
+# The former single-user demo credentials must not work in multi-user mode.
+CSRF3=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+ST9=$(curl -s -b "$JAR2" -o /dev/null -w '%{http_code}' -X POST "$BASE2/authorize" \
+  --data-urlencode "csrf_token=$CSRF3" --data-urlencode "client_id=$CLIENT" \
+  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
+  --data-urlencode "scope=openid" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
+  --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+if [ "$ST9" != "401" ]; then
+  echo "UNEXPECTED: rego/adventure in multi-user mode -> $ST9 (want 401)"; exit 1
+fi
+echo "multi-user: rego/adventure rejected OK"
+kill "$MINIDP2_PID" 2>/dev/null
+
 echo
 echo "ALL CHECKS PASSED"

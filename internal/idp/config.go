@@ -7,11 +7,9 @@ package idp
 
 import (
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,12 +27,18 @@ type Config struct {
 	// published in the discovery document. rego-adventure compares this against
 	// its AUTH_ISSUER, so it must line up with whatever the relying party expects.
 	Issuer string
-	// Username / Password are the single user accepted by the IdP.
+	// Username / Password are the single user accepted by the IdP (used in
+	// single-user mode; empty in multi-user mode when UsersFile is set).
 	Username string
 	Password string
 	// PasswordBcrypt, when set, is a bcrypt hash of the password; the plaintext
 	// then never needs to appear in configuration or manifests.
 	PasswordBcrypt string
+	// UsersFile, when set, switches the IdP to multi-user mode: the file is a
+	// JSON array of User entries with bcrypt password hashes, managed with the
+	// minidp-users tool. It takes precedence over the single-user credentials,
+	// which must then not be configured at all. Changes take effect on restart.
+	UsersFile string
 	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
 	AccessTokenTTL time.Duration
 	// RefreshTokenTTL is how long a refresh_token stays valid.
@@ -90,47 +94,31 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	// Credential source resolution. Exactly one source should be configured;
-	// bcrypt wins over a password file, both win over the plaintext default.
+	// Credential source resolution. IDP_USERS_FILE enables multi-user mode and
+	// excludes the single-user sources; otherwise exactly one single-user
+	// source should be configured.
+	usersFile := os.Getenv("IDP_USERS_FILE")
 	bcryptHash := os.Getenv("IDP_PASSWORD_BCRYPT")
 	passwordFile := os.Getenv("IDP_PASSWORD_FILE")
 	plainPassword := os.Getenv("IDP_PASSWORD")
-	switch {
-	case bcryptHash != "":
-		if plainPassword != "" {
-			return cfg, fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_BCRYPT are both set; configure exactly one password source")
+	if usersFile != "" {
+		for key, val := range map[string]string{
+			"IDP_USERNAME":        os.Getenv("IDP_USERNAME"),
+			"IDP_PASSWORD":        plainPassword,
+			"IDP_PASSWORD_BCRYPT": bcryptHash,
+			"IDP_PASSWORD_FILE":   passwordFile,
+		} {
+			if val != "" {
+				return cfg, fmt.Errorf("%s is set together with IDP_USERS_FILE; configure either multi-user mode or a single user, not both", key)
+			}
 		}
-		cfg.PasswordBcrypt = bcryptHash
-	case passwordFile != "":
-		if plainPassword != "" {
-			return cfg, fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_FILE are both set; configure exactly one password source")
+		cfg.UsersFile = usersFile
+		cfg.Username = "" // multi-user mode has no single configured identity
+	} else {
+		cfg.Username = envOr("IDP_USERNAME", "rego")
+		if err := loadSingleUserCredentials(&cfg, bcryptHash, passwordFile, plainPassword); err != nil {
+			return cfg, err
 		}
-		// Scope the read to the directory holding the secret file so a crafted
-		// path cannot traverse outside it (gosec G304/G703).
-		dir, name := filepath.Split(filepath.Clean(passwordFile))
-		if dir == "" {
-			dir = "."
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			return cfg, fmt.Errorf("open password file directory %q: %w", dir, err)
-		}
-		defer func() { _ = root.Close() }()
-		f, err := root.Open(name)
-		if err != nil {
-			return cfg, fmt.Errorf("read IDP_PASSWORD_FILE: %w", err)
-		}
-		raw, err := io.ReadAll(f)
-		_ = f.Close()
-		if err != nil {
-			return cfg, fmt.Errorf("read IDP_PASSWORD_FILE: %w", err)
-		}
-		cfg.Password = strings.TrimSpace(string(raw))
-		if cfg.Password == "" {
-			return cfg, fmt.Errorf("IDP_PASSWORD_FILE %q is empty", passwordFile)
-		}
-	default:
-		cfg.Password = envOr("IDP_PASSWORD", "adventure")
 	}
 
 	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
@@ -139,6 +127,35 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.TrustedProxies = proxies
 	return cfg, nil
+}
+
+// loadSingleUserCredentials resolves the password for single-user mode:
+// bcrypt hash wins over a password file, both win over the plaintext default.
+func loadSingleUserCredentials(cfg *Config, bcryptHash, passwordFile, plainPassword string) error {
+	switch {
+	case bcryptHash != "":
+		if plainPassword != "" {
+			return fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_BCRYPT are both set; configure exactly one password source")
+		}
+		cfg.PasswordBcrypt = bcryptHash
+	case passwordFile != "":
+		if plainPassword != "" {
+			return fmt.Errorf("IDP_PASSWORD and IDP_PASSWORD_FILE are both set; configure exactly one password source")
+		}
+		// The read is scoped via os.Root so a crafted path cannot traverse
+		// outside the file's directory (gosec G304/G703).
+		raw, err := readScopedFile(passwordFile)
+		if err != nil {
+			return fmt.Errorf("read IDP_PASSWORD_FILE: %w", err)
+		}
+		cfg.Password = strings.TrimSpace(string(raw))
+		if cfg.Password == "" {
+			return fmt.Errorf("IDP_PASSWORD_FILE %q is empty", passwordFile)
+		}
+	default:
+		cfg.Password = envOr("IDP_PASSWORD", "adventure")
+	}
+	return nil
 }
 
 // parseTrustedProxies validates a comma-separated list of CIDR ranges.

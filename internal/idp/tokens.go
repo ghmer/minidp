@@ -26,6 +26,7 @@ type accessClaims struct {
 	jwt.RegisteredClaims
 	Scope    string `json:"scope,omitempty"`
 	Username string `json:"preferred_username,omitempty"`
+	Email    string `json:"email,omitempty"`
 }
 
 // idClaims are the OIDC claims embedded in the issued id_token.
@@ -33,6 +34,7 @@ type idClaims struct {
 	jwt.RegisteredClaims
 	Nonce             string `json:"nonce,omitempty"`
 	Email             string `json:"email,omitempty"`
+	Name              string `json:"name,omitempty"`
 	PreferredUsername string `json:"preferred_username,omitempty"`
 }
 
@@ -43,6 +45,19 @@ type idClaims struct {
 func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
+
+	// Profile claims come from the user store when the subject exists there;
+	// single-user mode falls back to a placeholder email.
+	email := ctx.Sub + "@example.com"
+	name := ""
+	if s.users != nil {
+		if u, ok := s.users.Lookup(ctx.Sub); ok {
+			if u.Email != "" {
+				email = u.Email
+			}
+			name = u.Name
+		}
+	}
 
 	access := &accessClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -55,6 +70,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 		},
 		Scope:    joinScopes(ctx.Scopes),
 		Username: ctx.Sub,
+		Email:    email,
 	}
 	accessTokenString, err := s.key.sign(access)
 	if err != nil {
@@ -79,7 +95,8 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 				ID:        randomJTI(),
 			},
 			Nonce:             ctx.Nonce,
-			Email:             ctx.Sub + "@example.com",
+			Email:             email,
+			Name:              name,
 			PreferredUsername: ctx.Sub,
 		}
 		idTokenString, err := s.key.sign(id)

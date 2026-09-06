@@ -16,7 +16,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		"IDP_ACCESS_TOKEN_TTL", "IDP_REFRESH_TOKEN_TTL", "ALLOWED_REDIRECTS",
 		"IDP_TITLE", "IDP_SUBTITLE", "IDP_RSA_PEM", "IDP_KEY_DIR",
 		"IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE", "TRUSTED_PROXIES",
-		"IDP_LOGIN_RATE_LIMIT",
+		"IDP_LOGIN_RATE_LIMIT", "IDP_USERS_FILE",
 	} {
 		t.Setenv(key, "")
 	}
@@ -195,5 +195,44 @@ func TestLoadConfigInvalidTrustedProxies(t *testing.T) {
 	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, not-a-cidr")
 	if _, err := LoadConfig(); err == nil {
 		t.Error("expected an error for an invalid TRUSTED_PROXIES CIDR")
+	}
+}
+
+func TestLoadConfigUsersFileMode(t *testing.T) {
+	t.Setenv("IDP_USERNAME", "")
+	t.Setenv("IDP_PASSWORD", "")
+	t.Setenv("IDP_PASSWORD_BCRYPT", "")
+	t.Setenv("IDP_PASSWORD_FILE", "")
+	t.Setenv("IDP_USERS_FILE", "/etc/minidp/users.json")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.UsersFile != "/etc/minidp/users.json" {
+		t.Errorf("UsersFile = %q", cfg.UsersFile)
+	}
+	if cfg.Username != "" {
+		t.Errorf("Username = %q, want empty in multi-user mode", cfg.Username)
+	}
+}
+
+func TestLoadConfigUsersFileConflicts(t *testing.T) {
+	t.Setenv("IDP_USERS_FILE", "/etc/minidp/users.json")
+	t.Setenv("IDP_PASSWORD_BCRYPT", "")
+	t.Setenv("IDP_PASSWORD_FILE", "")
+	t.Setenv("IDP_PASSWORD", "")
+
+	for key, val := range map[string]string{
+		"IDP_USERNAME":        "rego",
+		"IDP_PASSWORD":        "adventure",
+		"IDP_PASSWORD_BCRYPT": "$2a$10$0123456789012345678901234567890123456789012345678901234",
+		"IDP_PASSWORD_FILE":   "/tmp/pw",
+	} {
+		t.Setenv(key, val)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("%s together with IDP_USERS_FILE must be rejected", key)
+		}
+		t.Setenv(key, "")
 	}
 }

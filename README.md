@@ -6,19 +6,22 @@ A minimal OIDC/OAuth2 identity provider written in Go. It implements the
 designed to work out of the box as the IdP for
 [github.com/ghmer/rego-adventure](https://github.com/ghmer/rego-adventure).
 
-> **Scope.** minidp is production-ready **for what it is**: a single-user,
-> lightweight IdP for demo and pilot deployments such as rego-adventure. It
-> deliberately has no user database, no admin UI and no clustering — that is
-> what keeps it a 10 MB container instead of a Keycloak. The sections below
-> describe the hardening that ships (CSRF, rate limiting, key persistence) and
-> the operational decisions you must make (key management, secret handling,
-> TLS termination).
+> **Scope.** minidp is production-ready **for what it is**: a lightweight IdP
+> for demo and pilot deployments such as rego-adventure — with a single user,
+> or a small set of users managed through a mounted JSON file. It deliberately
+> has no user database, no admin UI and no clustering — that is what keeps it
+> a 10 MB container instead of a Keycloak. The sections below describe the
+> hardening that ships (CSRF, rate limiting, key persistence) and the
+> operational decisions you must make (key management, secret handling, TLS
+> termination).
 >
 > If you need multi-user, HA or user self-service, use Keycloak/Zitadel/Ory —
 > that is a different tier of problem.
 
 ## Features
 
+- **Multi-user mode** via a mounted JSON file of bcrypt-hashed accounts
+  (managed with the bundled `minidp-users` tool), or single-user mode via env
 - OIDC discovery document (`/.well-known/openid-configuration`)
 - Authorization Code flow for public clients with **PKCE** (`S256`, `plain`) — PKCE is mandatory
 - RS256-signed access and id tokens (JWT), `iss`/`aud`/`nonce` claims included
@@ -90,6 +93,7 @@ All settings are provided through environment variables.
 | `IDP_KEY_DIR`           | *(unset)*               | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`) |
 | `TRUSTED_PROXIES`       | *(empty)*               | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted |
 | `IDP_LOGIN_RATE_LIMIT`  | `20`                    | Login attempts per minute and client IP                            |
+| `IDP_USERS_FILE`        | *(unset)*               | JSON file with user accounts — enables multi-user mode (see below) |
 | `IDP_TITLE`             | `Rego Adventure`        | Title shown on the login page                                      |
 | `IDP_SUBTITLE`          | `Sign in to begin …`    | Subtitle shown on the login page                                   |
 
@@ -107,6 +111,53 @@ Point the rego-adventure authentication environment variables at minidp:
 
 The frontend performs the PKCE code exchange directly against minidp (CORS is
 enabled for this); the backend validates the Bearer JWT against minidp's JWKS.
+
+## Multi-user mode
+
+Set `IDP_USERS_FILE` to a JSON file containing an array of users. Passwords
+must be **salted bcrypt hashes** (the salt is embedded in the bcrypt format) —
+the IdP refuses to start on a file with plaintext passwords, duplicate
+usernames or malformed entries. Create and maintain the file with the bundled
+tool:
+
+```sh
+# build the tool
+go build -o minidp-users ./cmd/minidp-users
+
+minidp-users add    -file users.json -username alice -email alice@example.com   # prompts for the password
+minidp-users add    -file users.json -username bob -password -                   # reads one line from stdin
+minidp-users update -file users.json -username bob -password 'new-secret'        # rotate a password
+minidp-users remove -file users.json -username bob
+minidp-users list   -file users.json                                             # never prints hashes
+minidp-users hash   -password '...'                                              # print a hash for manual editing
+```
+
+The file format:
+
+```json
+[
+  {
+    "username": "alice",
+    "password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+    "email": "alice@example.com",
+    "name": "Alice"
+  }
+]
+```
+
+Notes:
+
+- The file is read **once at startup**; tool changes take effect on restart.
+  Keep the file mode `0600` (the tool does) and mount it read-only into the
+  container.
+- `sub`, `preferred_username` and the audit log use the username; `email` and
+  `name` appear in the access/id tokens when set in the file.
+- Usernames cannot be probed: failed lookups burn the same bcrypt cost as a
+  real hash comparison (timing equalisation).
+- Single-user mode (`IDP_USERNAME`/`IDP_PASSWORD*`) and `IDP_USERS_FILE` are
+  mutually exclusive — minidp fails fast if both are configured.
+- The account backend is an interface (`idp.UserStore`); swapping the JSON
+  file for a database later only requires implementing `Lookup` and `Count`.
 
 ## Deployment
 

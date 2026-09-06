@@ -25,6 +25,15 @@ type authContext struct {
 	Nonce       string
 }
 
+// subject identifies the authenticated user carried through to token
+// issuance. In single-user mode only Sub is set; multi-user mode supplies
+// Email and Name from the users file.
+type subject struct {
+	Sub   string
+	Email string
+	Name  string
+}
+
 // Server is the in-memory OIDC provider.
 type Server struct {
 	cfg      Config
@@ -33,6 +42,7 @@ type Server struct {
 	template *loginTemplate
 	csrf     *csrfManager
 	limiter  *loginLimiter
+	users    UserStore
 }
 
 // New constructs a Server, resolving the signing key (persisted, loaded or
@@ -46,6 +56,12 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	var users UserStore
+	if cfg.UsersFile != "" {
+		if users, err = LoadUsers(cfg.UsersFile); err != nil {
+			return nil, err
+		}
+	}
 	csrfSecret := make([]byte, 32)
 	if _, err := rand.Read(csrfSecret); err != nil {
 		return nil, err
@@ -57,10 +73,12 @@ func New(cfg Config) (*Server, error) {
 		template: tmpl,
 		csrf:     newCSRFManager(csrfSecret, 15*time.Minute),
 		limiter:  newLimiter(cfg.LoginRateLimit),
+		users:    users,
 	}
 	slog.Info("minidp starting",
 		"issuer", cfg.Issuer,
-		"user", cfg.Username,
+		"authMode", authModeName(cfg, users),
+		"users", userCount(users),
 		"accessTTL", cfg.AccessTokenTTL,
 		"refreshTTL", cfg.RefreshTokenTTL,
 		"loginRateLimit", cfg.LoginRateLimit,
@@ -74,7 +92,7 @@ func New(cfg Config) (*Server, error) {
 		slog.Warn("using an ephemeral signing key: all tokens become invalid on restart; " +
 			"set IDP_KEY_DIR or IDP_RSA_PEM for production use")
 	}
-	if cfg.PasswordBcrypt == "" && cfg.Password == "adventure" && len(cfg.AllowedRedirects) == 0 {
+	if s.users == nil && cfg.PasswordBcrypt == "" && cfg.Password == "adventure" && len(cfg.AllowedRedirects) == 0 {
 		slog.Warn("running with the default demo credentials and an open redirect policy; " +
 			"set IDP_PASSWORD_BCRYPT / IDP_PASSWORD_FILE and ALLOWED_REDIRECTS for production use")
 	}
@@ -124,13 +142,49 @@ func (s *Server) Handler() http.Handler {
 // authenticate checks the supplied credentials against the configured user and
 // returns the subject identifier when they match. Both the username and the
 // password checks run in constant time.
-func (s *Server) authenticate(username, password string) (string, bool) {
+func (s *Server) authenticate(username, password string) (subject, bool) {
+	if s.users != nil {
+		return s.authenticateUserFile(username, password)
+	}
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.Username)) == 1
 	passOK := s.checkPassword(password)
 	if !userOK || !passOK {
-		return "", false
+		return subject{}, false
 	}
-	return s.cfg.Username, true
+	return subject{Sub: s.cfg.Username}, true
+}
+
+// authenticateUserFile verifies credentials against the loaded user store.
+// Unknown users are checked against a dummy bcrypt hash so that response
+// timing does not reveal which usernames exist.
+func (s *Server) authenticateUserFile(username, password string) (subject, bool) {
+	u, ok := s.users.Lookup(username)
+	if !ok {
+		_ = verifyHash(string(dummyHash), password)
+		return subject{}, false
+	}
+	if !verifyHash(u.PasswordHash, password) {
+		return subject{}, false
+	}
+	return subject{Sub: u.Username, Email: u.Email, Name: u.Name}, true
+}
+
+// authModeName describes the active credential backend for startup logging.
+func authModeName(cfg Config, users UserStore) string {
+	if users != nil {
+		return "users-file"
+	}
+	if cfg.PasswordBcrypt != "" {
+		return "single-user (bcrypt)"
+	}
+	return "single-user"
+}
+
+func userCount(users UserStore) int {
+	if users == nil {
+		return 1
+	}
+	return users.Count()
 }
 
 // checkPassword verifies the password against the configured credential
