@@ -624,9 +624,11 @@ func TestRedirectURIAllowed(t *testing.T) {
 }
 
 func TestCORS(t *testing.T) {
-	ts, _ := testIDP(t, nil)
+	// With a redirect allowlist, its hosts are credited as CORS origins.
+	ts, _ := testIDP(t, func(c *Config) { c.AllowedRedirects = []string{testRedirect} })
+	allowedOrigin := "http://localhost:3000" // derived from testRedirect
 	req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/token", nil)
-	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Origin", allowedOrigin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
 	req.Header.Set("Access-Control-Request-Headers", "content-type")
 	resp, err := http.DefaultClient.Do(req)
@@ -637,21 +639,74 @@ func TestCORS(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("preflight: status = %d, want 204", resp.StatusCode)
 	}
-	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
-		t.Errorf("Access-Control-Allow-Origin = %q", got)
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != allowedOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, allowedOrigin)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want true", got)
 	}
 
-	// A normal request must also carry the CORS headers.
-	origin := "https://adventure.example.com"
+	// A normal request from an allowed origin must also carry the CORS headers.
 	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"/.well-known/openid-configuration", nil)
-	req2.Header.Set("Origin", origin)
+	req2.Header.Set("Origin", allowedOrigin)
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("GET discovery: %v", err)
 	}
 	defer func() { _ = resp2.Body.Close() }()
-	if got := resp2.Header.Get("Access-Control-Allow-Origin"); got != origin {
-		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, origin)
+	if got := resp2.Header.Get("Access-Control-Allow-Origin"); got != allowedOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, allowedOrigin)
+	}
+}
+
+// TestCORSRejectsArbitraryOrigins pins the review fix: an Origin that is not
+// on the allowlist (redirect hosts + IDP_ALLOWED_ORIGINS) must never be
+// reflected, let alone with credentials.
+func TestCORSRejectsArbitraryOrigins(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.AllowedRedirects = []string{testRedirect} })
+	for _, origin := range []string{"https://evil.example.com", "http://localhost:3000.evil.com"} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/.well-known/openid-configuration", nil)
+		req.Header.Set("Origin", origin)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET discovery with Origin %q: %v", origin, err)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("origin %q: Access-Control-Allow-Origin = %q, want no CORS grant", origin, got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Errorf("origin %q: Access-Control-Allow-Credentials = %q, want unset", origin, got)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Without any allowlist, nothing is credited cross-origin.
+	ts2, _ := testIDP(t, nil)
+	req, _ := http.NewRequest(http.MethodGet, ts2.URL+"/healthz", nil)
+	req.Header.Set("Origin", "https://adventure.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("no allowlist configured: Access-Control-Allow-Origin = %q, want unset", got)
+	}
+}
+
+// TestCORSExplicitOrigins covers the IDP_ALLOWED_ORIGINS escape hatch for
+// origins that have no corresponding redirect allowlist entry.
+func TestCORSExplicitOrigins(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.AllowedOrigins = []string{"https://spa.example.com"} })
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
+	req.Header.Set("Origin", "https://spa.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://spa.example.com" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want the explicit origin (trailing slash tolerated)", got)
 	}
 }
 

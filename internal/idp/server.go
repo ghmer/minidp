@@ -36,13 +36,14 @@ type subject struct {
 
 // Server is the in-memory OIDC provider.
 type Server struct {
-	cfg      Config
-	key      *signingKey
-	store    *store
-	template *loginTemplate
-	csrf     *csrfManager
-	limiter  *loginLimiter
-	users    UserStore
+	cfg            Config
+	key            *signingKey
+	store          *store
+	template       *loginTemplate
+	csrf           *csrfManager
+	limiter        *loginLimiter
+	users          UserStore
+	allowedOrigins map[string]bool
 }
 
 // New constructs a Server, resolving the signing key (persisted, loaded or
@@ -67,13 +68,14 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:      cfg,
-		key:      key,
-		store:    newStore(),
-		template: tmpl,
-		csrf:     newCSRFManager(csrfSecret, 15*time.Minute),
-		limiter:  newLimiter(cfg.LoginRateLimit),
-		users:    users,
+		cfg:            cfg,
+		key:            key,
+		store:          newStore(),
+		template:       tmpl,
+		csrf:           newCSRFManager(csrfSecret, 15*time.Minute),
+		limiter:        newLimiter(cfg.LoginRateLimit),
+		users:          users,
+		allowedOrigins: allowedOrigins(cfg),
 	}
 	slog.Info("minidp starting",
 		"issuer", cfg.Issuer,
@@ -97,6 +99,22 @@ func New(cfg Config) (*Server, error) {
 			"set IDP_PASSWORD_BCRYPT / IDP_PASSWORD_FILE and ALLOWED_REDIRECTS for production use")
 	}
 	return s, nil
+}
+
+// allowedOrigins builds the CORS origin allowlist: every host of an
+// ALLOWED_REDIRECTS entry plus the explicit IDP_ALLOWED_ORIGINS list. Only
+// these origins are reflected with credentials (see withCORS).
+func allowedOrigins(cfg Config) map[string]bool {
+	origins := make(map[string]bool)
+	for _, r := range cfg.AllowedRedirects {
+		if u, err := url.Parse(r); err == nil && u.Host != "" {
+			origins[u.Scheme+"://"+u.Host] = true
+		}
+	}
+	for _, o := range cfg.AllowedOrigins {
+		origins[strings.TrimSuffix(o, "/")] = true
+	}
+	return origins
 }
 
 // Handler returns the fully wired HTTP handler with CORS middleware applied.
@@ -269,18 +287,19 @@ func (s *Server) redirectURIAllowed(raw string) bool {
 const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'self'; " +
 	"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 
-// withCORS wraps next with security headers and CORS handling. The IdP
-// reflects the request Origin so the browser-based rego-adventure client can
-// perform the cross-origin code-for-token exchange with credentials (which
-// disallows a wildcard).
+// withCORS wraps next with security headers and CORS handling. Browser-based
+// clients (e.g. oidc-client-ts in rego-adventure) exchange the code for tokens
+// cross-origin with credentials, which disallows a wildcard — so the request
+// Origin is reflected ONLY when it is on the allowlist (hosts of the
+// ALLOWED_REDIRECTS entries plus IDP_ALLOWED_ORIGINS). Any other origin
+// receives no CORS grant and the browser blocks the response.
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		origin := r.Header.Get("Origin")
-		if origin != "" {
+		if origin := r.Header.Get("Origin"); origin != "" && s.allowedOrigins[strings.TrimSuffix(origin, "/")] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")

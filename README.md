@@ -27,7 +27,10 @@ designed to work out of the box as the IdP for
 - RS256-signed access and id tokens (JWT), `iss`/`aud`/`nonce` claims included
 - Refresh token grant with **single-use rotation**
 - `userinfo`, `introspect` (RFC 7662) and `revoke` (RFC 7009) endpoints
-- CORS support so browser-based SPAs (e.g. `oidc-client-ts`) can exchange codes
+- CORS support so browser-based SPAs (e.g. `oidc-client-ts`) can exchange codes —
+  only origins derived from `ALLOWED_REDIRECTS` (or listed in
+  `IDP_ALLOWED_ORIGINS`) are reflected, with credentials; any other `Origin`
+  gets no CORS grant
 - Login page styled after the **Rego Adventure** theme
 
 ## Hardening
@@ -69,7 +72,8 @@ and sign in with the default user **rego** / **adventure**.
 Run the end-to-end smoke test (expects the server on port 8099):
 
 ```sh
-IDP_PORT=8099 IDP_ISSUER=http://localhost:8099 ./minidp &
+IDP_PORT=8099 IDP_ISSUER=http://localhost:8099 \
+ALLOWED_REDIRECTS=http://localhost:3000/callback ./minidp &
 ./smoke-test.sh
 ```
 
@@ -89,6 +93,7 @@ All settings are provided through environment variables.
 | `IDP_ACCESS_TOKEN_TTL`  | `3600`                  | Access/id token lifetime in seconds                                |
 | `IDP_REFRESH_TOKEN_TTL` | `7200`                  | Refresh token lifetime in seconds                                  |
 | `ALLOWED_REDIRECTS`     | *(empty = any http(s))* | Comma-separated allowlist of `redirect_uri` values — **set this in production** |
+| `IDP_ALLOWED_ORIGINS`   | *(derived from `ALLOWED_REDIRECTS`)* | Explicit CORS origin allowlist; other origins are never reflected with credentials |
 | `IDP_RSA_PEM`           | *(unset)*               | Path to a PKCS#1/PKCS#8 RSA private key; takes precedence over `IDP_KEY_DIR` |
 | `IDP_KEY_DIR`           | *(unset)*               | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`) |
 | `TRUSTED_PROXIES`       | *(empty)*               | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted |

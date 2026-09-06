@@ -46,6 +46,11 @@ type Config struct {
 	// AllowedRedirects restricts the redirect_uri values honoured on /authorize.
 	// When empty, any well-formed http(s) redirect_uri is accepted.
 	AllowedRedirects []string
+	// AllowedOrigins is the explicit CORS origin allowlist (IDP_ALLOWED_ORIGINS).
+	// Origins are additionally derived from the ALLOWED_REDIRECTS entries.
+	// Only allowlisted origins are reflected with credentials; any other
+	// Origin header receives no CORS grant at all.
+	AllowedOrigins []string
 	// Title / Subtitle are rendered on rego-adventure-styled login form.
 	Title    string
 	Subtitle string
@@ -90,6 +95,13 @@ func LoadConfig() (Config, error) {
 		for _, r := range strings.Split(raw, ",") {
 			if r = strings.TrimSpace(r); r != "" {
 				cfg.AllowedRedirects = append(cfg.AllowedRedirects, r)
+			}
+		}
+	}
+	if raw := os.Getenv("IDP_ALLOWED_ORIGINS"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				cfg.AllowedOrigins = append(cfg.AllowedOrigins, o)
 			}
 		}
 	}
