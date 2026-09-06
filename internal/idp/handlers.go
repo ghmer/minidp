@@ -127,7 +127,11 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := s.template.render(w, data); err != nil {
-		_, _ = w.Write([]byte("template error: " + err.Error()))
+		// The headers and possibly part of the body are already sent, so a
+		// clean error page is impossible; log the details and show the user
+		// nothing internal.
+		slog.Error("login template render failed", "error", err)
+		_, _ = w.Write([]byte("<!-- render failed -->\nInternal error."))
 	}
 }
 
