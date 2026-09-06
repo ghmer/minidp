@@ -159,7 +159,7 @@ func LoadConfig() (Config, error) {
 		cfg.UsersFile = usersFile
 		cfg.Username = "" // multi-user mode has no single configured identity
 	} else {
-		cfg.Username = envOr("IDP_USERNAME", "rego")
+		// Username is already resolved in the struct literal above.
 		if err := loadSingleUserCredentials(&cfg, bcryptHash, passwordFile, plainPassword); err != nil {
 			return cfg, err
 		}
