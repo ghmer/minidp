@@ -11,6 +11,12 @@ STATE="st-123"
 NONCE="n-abc"
 JAR=$(mktemp)
 
+# Remove the scratch files when the script exits (success or failure).
+cleanup() {
+  rm -rf "${JAR:-}" "${JAR2:-}" "$(dirname "${UFILE:-/nonexistent}")" /tmp/login.html
+}
+trap cleanup EXIT
+
 # Browsers (Chrome/Firefox) treat localhost as a "potentially trustworthy
 # origin" and send Secure cookies over plain-HTTP localhost; curl implements
 # RFC 6265 literally and would keep them for https only. Flip the secure flag
@@ -51,8 +57,8 @@ print('jwks ok, kid =', k['kid'])
 
 echo "== 3. GET /authorize renders login form =="
 curl -s -c "$JAR" "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256" -o /tmp/login.html
-grep -q 'name="code_challenge" value="'$CHALLENGE'"' /tmp/login.html && echo "PKCE challenge echoed into form"
-grep -q 'name="nonce" value="'$NONCE'"' /tmp/login.html && echo "nonce echoed into form"
+grep -q 'name="code_challenge" value="'"$CHALLENGE"'"' /tmp/login.html && echo "PKCE challenge echoed into form"
+grep -q 'name="nonce" value="'"$NONCE"'"' /tmp/login.html && echo "nonce echoed into form"
 
 echo "== 4. POST /authorize with WRONG password =="
 CSRF=$(csrf_for "$AUTH_QUERY")
