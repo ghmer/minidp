@@ -13,10 +13,24 @@ STATE="st-123"
 NONCE="n-abc"
 JAR=$(mktemp)
 
-# Scratch files and the test instance are removed when the script exits
+# Fail fast when a previous (interrupted) run left an IdP bound to the smoke
+# ports: the health-check below would silently talk to that stale instance
+# (old code/users file) and every later assertion would mismatch.
+for port in 8099 8098; do
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "ERROR: port $port is already in use — a previous smoke-test run" >&2
+    echo "probably left a minidp instance behind. Kill it and retry:" >&2
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
+    exit 1
+  fi
+done
+
+# Scratch files and both test instances are removed when the script exits
 # (success or failure).
 cleanup() {
-  [ -n "${MINIDP_PID:-}" ] && kill "$MINIDP_PID" 2>/dev/null || true
+  for pid in "${MINIDP_PID:-}" "${MINIDP2_PID:-}"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  done
   rm -rf "${JAR:-}" "${JAR2:-}" "${WORKDIR:-}"
   rm -f /tmp/login.html
 }
@@ -44,7 +58,7 @@ WORKDIR=$(mktemp -d)
 go build -o "$WORKDIR/minidp" .
 go build -o "$WORKDIR/minidp-users" ./cmd/minidp-users
 "$WORKDIR/minidp-users" add -file "$WORKDIR/users.json" -username rego \
-  -password adventure -email rego@adventure.example -roles admin >/dev/null
+  -password adventure -email regoadventure@r5i.xyz -roles user >/dev/null
 mkdir -p "$WORKDIR/keys"
 IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_USERS_FILE="$WORKDIR/users.json" \
   ALLOWED_REDIRECTS="$REDIRECT" IDP_KEY_DIR="$WORKDIR/keys" \
@@ -90,7 +104,7 @@ ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=other-app
 ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=https://attacker.example/cb&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
 [ "$ST" = "400" ] && echo "unregistered redirect_uri rejected (400) OK"
 # Unsupported scopes/params are answered with a redirect carrying the error.
-LOC=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=admin&code_challenge=$CHALLENGE&code_challenge_method=S256&state=$STATE")
+LOC=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=user&code_challenge=$CHALLENGE&code_challenge_method=S256&state=$STATE")
 case "$LOC" in
   "$REDIRECT?error=invalid_scope"*) echo "invalid_scope redirect OK" ;;
   *) echo "UNEXPECTED: $LOC"; exit 1 ;;
@@ -182,8 +196,8 @@ assert ac['sub']=='rego' and ic['sub']=='rego'
 assert ic['nonce']=='$NONCE', ic['nonce']
 assert typ(d['access_token'])=='at+jwt', 'access token must carry the RFC 9068 typ header'
 assert typ(d['id_token'])=='JWT', 'id token must carry typ JWT'
-assert ac['email']=='rego@adventure.example', ac.get('email')
-assert ac['roles']==['admin'] and ic['roles']==['admin'], 'roles must be released on both tokens when set'
+assert ac['email']=='regoadventure@r5i.xyz', ac.get('email')
+assert ac['roles']==['user'] and ic['roles']==['user'], 'roles must be released on both tokens when set'
 print('access+id token claims OK (iss/aud/sub/nonce/typ/scope/roles claims)')
 print('refresh token present, scope =', d['scope'])
 "
@@ -334,20 +348,16 @@ curl -s -D - -o /dev/null -X POST "$BASE/token" -d "grant_type=refresh_token&ref
 
 echo "== 18. minidp-users tool + a second users-file instance =="
 UFILE="$WORKDIR/users2.json"
-"$WORKDIR/minidp-users" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example -name Alice -roles admin,auditor >/dev/null
+"$WORKDIR/minidp-users" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example -name Alice -roles user,auditor >/dev/null
 "$WORKDIR/minidp-users" add -file "$UFILE" -username bob -password builder >/dev/null
-"$WORKDIR/minidp-users" list -file "$UFILE" | grep -q "^alice.*roles: admin,auditor" && echo "tool: users added and listed"
-"$WORKDIR/minidp-users" update -file "$UFILE" -username alice -roles admin >/dev/null && echo "tool: roles updated"
+"$WORKDIR/minidp-users" list -file "$UFILE" | grep -q "^alice.*roles: user,auditor" && echo "tool: users added and listed"
+"$WORKDIR/minidp-users" update -file "$UFILE" -username alice -roles user >/dev/null && echo "tool: roles updated"
 "$WORKDIR/minidp-users" update -file "$UFILE" -username bob -password builder2 >/dev/null && echo "tool: password updated"
 "$WORKDIR/minidp-users" remove -file "$UFILE" -username bob >/dev/null && echo "tool: user removed"
 
 IDP_PORT=8098 IDP_ISSUER=http://localhost:8098 IDP_USERS_FILE="$UFILE" \
   ALLOWED_REDIRECTS="$REDIRECT" "$WORKDIR/minidp" >"$WORKDIR/minidp2.log" 2>&1 &
 MINIDP2_PID=$!
-cleanup() {
-  [ -n "${MINIDP2_PID:-}" ] && kill "$MINIDP2_PID" 2>/dev/null || true
-}
-trap 'cleanup; exit' EXIT
 for _ in $(seq 1 50); do
   curl -sf http://localhost:8098/healthz >/dev/null && break
   sleep 0.2
@@ -380,7 +390,7 @@ ac=claims(d['access_token']); ic=claims(d['id_token'])
 assert ac['sub']=='alice' and ic['sub']=='alice', (ac['sub'], ic['sub'])
 assert ic['email']=='alice@wonderland.example', ic['email']
 assert ic['name']=='Alice', ic.get('name')
-assert ac['roles']==['admin'] and ic['roles']==['admin'], ac.get('roles')
+assert ac['roles']==['user'] and ic['roles']==['user'], ac.get('roles')
 print('multi-user: alice logged in, sub/email/name/roles claims correct')
 "
 
