@@ -25,8 +25,10 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"code_challenge_methods_supported":              []string{"S256"},
 		"scopes_supported":                              []string{"openid", "profile", "email"},
 		"claims_supported": []string{
-			"iss", "sub", "aud", "exp", "iat", "auth_time", "nonce",
-			"preferred_username", "email",
+			// Exactly the claims minidp actually issues. auth_time was
+			// previously advertised but never embedded in any token.
+			"iss", "sub", "aud", "exp", "iat", "nonce",
+			"preferred_username", "email", "name",
 		},
 	})
 }

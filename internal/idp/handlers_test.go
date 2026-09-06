@@ -198,8 +198,15 @@ func TestDiscoveryDocument(t *testing.T) {
 	if grants, _ := d["grant_types_supported"].([]any); len(grants) != 2 {
 		t.Errorf("grant_types_supported = %v", grants)
 	}
-	if methods, _ := d["code_challenge_methods_supported"].([]any); len(methods) == 0 {
-		t.Error("code_challenge_methods_supported must not be empty")
+	if methods, _ := d["code_challenge_methods_supported"].([]any); len(methods) != 1 || methods[0] != "S256" {
+		t.Errorf("code_challenge_methods_supported = %v, want [S256]", methods)
+	}
+	// claims_supported must advertise exactly what is issued: auth_time was
+	// once listed although no token ever carried it.
+	for _, claim := range d["claims_supported"].([]any) {
+		if claim == "auth_time" {
+			t.Error("claims_supported must not advertise auth_time: it is never issued")
+		}
 	}
 }
 

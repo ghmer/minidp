@@ -47,7 +47,10 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
 
 	// Profile claims come from the user store when the subject exists there;
-	// single-user mode falls back to a placeholder email.
+	// single-user mode falls back to a placeholder email. Deliberate
+	// simplification for a minimal IdP: email and name are embedded whenever
+	// they are known, regardless of the granted scopes (the discovery document
+	// lists exactly the claims that are issued).
 	email := ctx.Sub + "@example.com"
 	name := ""
 	if s.users != nil {
