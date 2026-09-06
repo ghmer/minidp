@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -105,9 +106,21 @@ func LoadConfig() (Config, error) {
 	}
 	if raw := os.Getenv("ALLOWED_REDIRECTS"); raw != "" {
 		for _, r := range strings.Split(raw, ",") {
-			if r = strings.TrimSpace(r); r != "" {
-				cfg.AllowedRedirects = append(cfg.AllowedRedirects, r)
+			if r = strings.TrimSpace(r); r == "" {
+				continue
 			}
+			// Fail fast on entries that could never be honoured safely: in
+			// allowlist mode redirectURIAllowed is a plain string comparison,
+			// so a typo'd or non-http(s) entry would otherwise be accepted
+			// silently (e.g. a javascript: URI in the allowlist).
+			u, err := url.Parse(r)
+			if err != nil {
+				return cfg, fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: %w", r, err)
+			}
+			if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Fragment != "" {
+				return cfg, fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: must be an absolute http(s) URL with a host", r)
+			}
+			cfg.AllowedRedirects = append(cfg.AllowedRedirects, r)
 		}
 	}
 	if raw := os.Getenv("IDP_ALLOWED_ORIGINS"); raw != "" {

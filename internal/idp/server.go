@@ -271,6 +271,8 @@ func (s *Server) ipTrusted(ip net.IP) bool {
 }
 
 // redirectURIAllowed reports whether an incoming redirect_uri may be used.
+// In allowlist mode this is an exact string comparison against entries that
+// LoadConfig has already validated as absolute http(s) URLs.
 func (s *Server) redirectURIAllowed(raw string) bool {
 	if len(s.cfg.AllowedRedirects) == 0 {
 		u, err := url.Parse(raw)

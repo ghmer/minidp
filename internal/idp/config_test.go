@@ -206,6 +206,32 @@ func TestLoadConfigInvalidTrustedProxies(t *testing.T) {
 	}
 }
 
+// TestLoadConfigValidatesAllowedRedirects pins the fail-fast validation of
+// ALLOWED_REDIRECTS: allowlist mode compares strings, so a non-http(s) or
+// malformed entry must abort startup instead of being honoured silently.
+func TestLoadConfigValidatesAllowedRedirects(t *testing.T) {
+	for _, bad := range []string{
+		"javascript:alert(1)",
+		"http://",           // no host
+		"https://x/cb#frag", // fragment cannot survive a redirect round-trip
+		"/relative/path",    // not absolute
+		"not a url at all",  // contains spaces
+	} {
+		t.Setenv("ALLOWED_REDIRECTS", bad)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("ALLOWED_REDIRECTS=%q: expected a fail-fast error", bad)
+		}
+	}
+	t.Setenv("ALLOWED_REDIRECTS", "https://good.example.com/cb, http://other.example.com:8080/cb")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("valid allowlist rejected: %v", err)
+	}
+	if len(cfg.AllowedRedirects) != 2 {
+		t.Errorf("AllowedRedirects = %v, want 2 entries", cfg.AllowedRedirects)
+	}
+}
+
 func TestLoadConfigUsersFileMode(t *testing.T) {
 	t.Setenv("IDP_USERNAME", "")
 	t.Setenv("IDP_PASSWORD", "")
