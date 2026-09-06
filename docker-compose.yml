@@ -36,9 +36,16 @@ services:
       # Redirect URI of the rego-adventure service below; the policy is
       # mandatory, minidp refuses to start without it.
       ALLOWED_REDIRECTS: ${APP_DOMAIN:-http://localhost:3000}/callback
+      # Client profile: "public" (default, mandatory PKCE, no secret) or
+      # "confidential" (client auth at /token, requires IDP_CLIENT_SECRET
+      # below). rego-adventure is a browser SPA — a public client — so the
+      # default must stay public here. For a backend client, switch the mode
+      # and give it a real random secret (>= 128 bits):
+      #   MINIDP_MODE: confidential
+      #   IDP_CLIENT_SECRET: ${MINIDP_CLIENT_SECRET:?set a random secret, e.g. openssl rand -base64 32}
     volumes:
       - ./users.json:/config/users.json:ro
-      - github.com/ghmer/minidp-data:/data
+      - minidp-data:/data
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 30s
