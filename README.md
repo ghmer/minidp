@@ -63,7 +63,10 @@ designed to work out of the box as the IdP for
 - **Audit logging**: login success/failure (with client IP and attempted
   username), code issuance, token grants and rejections via slog.
 - **Graceful shutdown** on SIGTERM/SIGINT for k8s/compose rolling updates.
-- Golang-ci-lint and gosec clean (enforced in CI); `#nosec` is not used.
+- Golang-ci-lint and gosec clean (enforced in CI). Exactly one `#nosec`
+  directive exists (the CSRF nonce cookie's `Secure` flag, which is
+  deliberately conditional on the issuer scheme so the plain-HTTP demo keeps
+  working) and it carries the justifying comment inline.
 
 ## Quick start
 
