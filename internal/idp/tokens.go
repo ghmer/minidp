@@ -29,13 +29,16 @@ type accessClaims struct {
 	Email    string `json:"email,omitempty"`
 }
 
-// idClaims are the OIDC claims embedded in the issued id_token.
+// idClaims are the OIDC claims embedded in the issued id_token. sid carries
+// the token family (one authorization) so /end_session can revoke exactly
+// that authorization's tokens from an id_token_hint.
 type idClaims struct {
 	jwt.RegisteredClaims
 	Nonce             string `json:"nonce,omitempty"`
 	Email             string `json:"email,omitempty"`
 	Name              string `json:"name,omitempty"`
 	PreferredUsername string `json:"preferred_username,omitempty"`
+	SessionID         string `json:"sid,omitempty"`
 }
 
 // issueTokens mints a fresh access token, an id_token (when the openid scope is
@@ -79,6 +82,9 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
+	// Track the access token so /revoke and /end_session can deny it (the
+	// JWT itself is stateless and cannot be deleted).
+	s.store.registerJTI(access.ID, ctx.Sub, ctx.Family, accessExpires)
 
 	resp := &tokenResponse{
 		AccessToken: accessTokenString,
@@ -101,6 +107,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 			Email:             email,
 			Name:              name,
 			PreferredUsername: ctx.Sub,
+			SessionID:         ctx.Family,
 		}
 		idTokenString, err := s.key.sign(id)
 		if err != nil {

@@ -697,6 +697,101 @@ func TestIntrospectAndRevoke(t *testing.T) {
 	}
 }
 
+// TestRevokeAccessTokenDeniesIt pins the L4 fix: revoking an access token
+// must make it immediately unusable at /userinfo instead of leaving it valid
+// for its full TTL.
+func TestRevokeAccessTokenDeniesIt(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+	access := tokens["access_token"].(string)
+
+	userinfo := func() int {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+access)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /userinfo: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+	if got := userinfo(); got != http.StatusOK {
+		t.Fatalf("userinfo before revoke: status = %d, want 200", got)
+	}
+	if resp := postForm(t, http.DefaultClient, ts.URL+"/revoke", url.Values{"token": {access}}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke: status = %d, want 200", resp.StatusCode)
+	}
+	if got := userinfo(); got != http.StatusUnauthorized {
+		t.Errorf("userinfo after revoke: status = %d, want 401", got)
+	}
+}
+
+// TestEndSessionRevokesTokenFamily pins the L19 fix: /end_session with an
+// id_token_hint revokes the authorization the hint belongs to — its refresh
+// token becomes unredeemable and its access token denied.
+func TestEndSessionRevokesTokenFamily(t *testing.T) {
+	ts, _ := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+	access := tokens["access_token"].(string)
+	refresh := tokens["refresh_token"].(string)
+	idToken := tokens["id_token"].(string)
+
+	// Logout with the id_token_hint identifies the family via sid.
+	resp, err := http.Get(ts.URL + "/end_session?id_token_hint=" + url.QueryEscape(idToken))
+	if err != nil {
+		t.Fatalf("GET /end_session: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// The access token is denied.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+	req.Header.Set("Authorization", "Bearer "+access)
+	ui, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /userinfo: %v", err)
+	}
+	_ = ui.Body.Close()
+	if ui.StatusCode != http.StatusUnauthorized {
+		t.Errorf("userinfo after logout: status = %d, want 401", ui.StatusCode)
+	}
+
+	// The refresh token is gone.
+	grant := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refresh},
+		"client_id":     {testClientID},
+	}))
+	if grant["error"] != "invalid_grant" {
+		t.Errorf("refresh after logout: %v, want invalid_grant", grant["error"])
+	}
+
+	// Without a hint the endpoint still renders the logout page.
+	resp2, err := http.Get(ts.URL + "/end_session")
+	if err != nil {
+		t.Fatalf("GET /end_session without hint: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("/end_session without hint: status = %d, want 200", resp2.StatusCode)
+	}
+}
+
 func TestEndSessionRequiresAllowlist(t *testing.T) {
 	// Without an allowlist, no redirect may happen (open-redirect hardening).
 	ts, _ := testIDP(t, nil)

@@ -47,6 +47,20 @@ type store struct {
 	// expiry so a replayed (stolen) token can be recognised and its entire
 	// family revoked instead of merely failing (RFC 9700 §4.14.2).
 	usedRefresh map[string]*refreshEntry
+	// accessJTI registers issued access tokens (jti -> sub/family/exp). The
+	// JWTs themselves are stateless; this registry is what lets revocation
+	// and logout deny them.
+	accessJTI map[string]jtiRecord
+	// deniedJTI is the revocation denylist: jti -> denial expiry. Denied
+	// tokens fail verification until their natural expiry.
+	deniedJTI map[string]time.Time
+}
+
+// jtiRecord tracks one issued access token.
+type jtiRecord struct {
+	sub    string
+	family string
+	exp    time.Time
 }
 
 func newStore() *store {
@@ -54,6 +68,8 @@ func newStore() *store {
 		codes:       make(map[string]*authCode),
 		refresh:     make(map[string]*refreshEntry),
 		usedRefresh: make(map[string]*refreshEntry),
+		accessJTI:   make(map[string]jtiRecord),
+		deniedJTI:   make(map[string]time.Time),
 	}
 }
 
@@ -116,16 +132,38 @@ func (s *store) takeRefresh(id string) (entry *refreshEntry, reused bool) {
 	return f, false
 }
 
-// revokeFamily drops every live and consumed refresh token derived from the
-// same authorization. An empty family is a no-op (untracked entries).
-func (s *store) revokeFamily(family string) {
+// registerJTI records an issued access token so it can be denied later
+// (revocation endpoint, logout).
+func (s *store) registerJTI(jti, sub, family string, exp time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accessJTI[jti] = jtiRecord{sub: sub, family: family, exp: exp}
+}
+
+// denyJTI puts an access token on the denylist until its expiry.
+func (s *store) denyJTI(jti string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deniedJTI[jti] = until
+}
+
+// deniedJTIOf reports whether the given jti is on the denylist.
+func (s *store) isDeniedJTI(jti string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Now().Before(s.deniedJTI[jti])
+}
+
+// revokeFamilyTokens drops every refresh token of the family and denies all
+// of its live access tokens. Used by /revoke, reuse detection and logout.
+func (s *store) revokeFamilyTokens(family string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.revokeFamilyLocked(family)
 }
 
-// revokeFamilyLocked is revokeFamily without locking. The caller must hold
-// the lock.
+// revokeFamilyLocked is revokeFamilyTokens without locking. The caller must
+// hold the lock.
 func (s *store) revokeFamilyLocked(family string) {
 	if family == "" {
 		return
@@ -138,6 +176,16 @@ func (s *store) revokeFamilyLocked(family string) {
 	for id, f := range s.usedRefresh {
 		if f.Family == family {
 			delete(s.usedRefresh, id)
+		}
+	}
+	// RFC 7009 §2.1: revoking a refresh token SHOULD also invalidate the
+	// access tokens based on the same authorization. Access tokens are
+	// stateless, so they are denied by jti until their expiry.
+	now := time.Now()
+	for jti, rec := range s.accessJTI {
+		if rec.family == family && now.Before(rec.exp) {
+			s.deniedJTI[jti] = rec.exp
+			delete(s.accessJTI, jti)
 		}
 	}
 }
@@ -176,6 +224,16 @@ func (s *store) dropExpired() {
 	for id, f := range s.usedRefresh {
 		if now.After(f.ExpiresAt) {
 			delete(s.usedRefresh, id)
+		}
+	}
+	for jti, rec := range s.accessJTI {
+		if now.After(rec.exp) {
+			delete(s.accessJTI, jti)
+		}
+	}
+	for jti, until := range s.deniedJTI {
+		if now.After(until) {
+			delete(s.deniedJTI, jti)
 		}
 	}
 }

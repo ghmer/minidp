@@ -51,7 +51,13 @@ designed to work out of the box as the IdP for
   once (mode 0600, temp-file + rename) and reloaded on restart, so tokens
   survive restarts and the JWKS stays stable.
 - **Single-use authorization codes** (10 min TTL) and **single-use refresh
-  tokens** with rotation — replay is rejected.
+  tokens** with rotation — replay is rejected, and replaying a rotated token
+  revokes the **whole token family** of that authorization (RFC 9700 §4.14.2).
+- **Working revocation**: `/revoke` deletes refresh tokens (with their family,
+  RFC 7009) and denies access tokens by `jti` denylist until their expiry, so
+  `/userinfo` and `/introspect` reject them immediately instead of after the
+  full TTL. `/end_session?id_token_hint=…` revokes the authorization the hint
+  belongs to (`sid` claim = token family).
 - **Security headers**: strict CSP (`frame-ancestors 'none'`, no
   `unsafe-inline`), `X-Frame-Options: DENY`, `nosniff`, strict referrer policy.
 - **Audit logging**: login success/failure (with client IP and attempted
@@ -216,8 +222,8 @@ it effectively is.
 | `POST /token`                              | `authorization_code` and `refresh_token` grants |
 | `GET/POST /userinfo`                       | Claims of the bearer token's subject      |
 | `POST /introspect`                         | RFC 7662 token introspection              |
-| `POST /revoke`                             | RFC 7009 token revocation                 |
-| `GET  /end_session`                        | Minimal logout                            |
+| `POST /revoke`                             | RFC 7009 revocation (refresh + access tokens via `jti` denylist) |
+| `GET  /end_session`                        | Logout; with `id_token_hint` the whole authorization's tokens are revoked |
 | `GET  /healthz`                            | Liveness probe                            |
 
 ## Development

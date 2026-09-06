@@ -417,7 +417,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	if clientID != entry.ClientID {
 		slog.Warn("refresh rejected: client_id mismatch", "ip", s.clientIP(r), "client", clientID)
-		s.store.revokeFamily(entry.Family)
+		s.store.revokeFamilyTokens(entry.Family)
 		writeAuthError(w, "invalid_grant", "client_id does not match the refresh token.")
 		return
 	}
@@ -460,6 +460,9 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	aud, _ := claims.GetAudience()
 	if len(aud) == 0 {
 		return nil, fmt.Errorf("invalid token: missing audience")
+	}
+	if jti, _ := claims["jti"].(string); jti != "" && s.store.isDeniedJTI(jti) {
+		return nil, fmt.Errorf("invalid token: revoked")
 	}
 	return claims, nil
 }
@@ -516,11 +519,30 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRevoke revokes a refresh token (RFC 7009). Per the spec it responds
-// 200 even when the token is unknown, to avoid leaking token validity.
+// handleRevoke revokes refresh tokens (RFC 7009) and access tokens. Per the
+// spec it responds 200 even when the token is unknown, to avoid leaking token
+// validity. Access tokens are stateless JWTs: when the presented token is a
+// valid access token of this IdP, its jti is put on the denylist until its
+// natural expiry, so /userinfo and /introspect reject it immediately.
+// (Without this, a revoked session's access token would stay valid for its
+// full TTL.)
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
-	s.store.revokeToken(r.PostForm.Get("token"))
+	token := r.PostForm.Get("token")
+	if token != "" {
+		if claims, err := s.verifyAccessToken(token); err == nil {
+			if jti, _ := claims["jti"].(string); jti != "" {
+				until := time.Now().Add(s.cfg.AccessTokenTTL) // fail-safe horizon
+				if exp, _ := claims.GetExpirationTime(); exp != nil {
+					until = exp.Time
+				}
+				s.store.denyJTI(jti, until)
+				slog.Info("access token denied by revocation", "sub", claims["sub"])
+			}
+		} else {
+			s.store.revokeToken(token)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -529,7 +551,22 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // allowlist, and the redirect always targets the allowlist entry itself — never
 // the user-supplied string — so the endpoint cannot be abused for open
 // redirects (gosec G710).
+//
+// Logout is only as real as the tokens it kills: when the caller passes an
+// id_token_hint (the OIDC end-session parameter), the hint's sid claim
+// identifies the token family of that authorization, and the whole family is
+// revoked — refresh tokens deleted and live access tokens denied by jti.
+// Without a hint there is no session cookie to identify a caller, so no
+// server-side state is dropped.
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
+	if hint := r.URL.Query().Get("id_token_hint"); hint != "" {
+		if claims, err := s.verifyAccessToken(hint); err == nil {
+			if sid, _ := claims["sid"].(string); sid != "" {
+				s.store.revokeFamilyTokens(sid)
+				slog.Info("logout: token family revoked", "sub", claims["sub"])
+			}
+		}
+	}
 	target := r.URL.Query().Get("post_logout_redirect_uri")
 	if target != "" {
 		for _, allowed := range s.cfg.AllowedRedirects {
