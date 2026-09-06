@@ -67,7 +67,10 @@ func (l *loginLimiter) sweepLocked(now time.Time) {
 		return
 	}
 	l.lastSweep = now
-	idle := 2 * time.Duration(l.perMinute) * time.Second
+	// Refill to a full bucket always takes 60 s regardless of perMinute, so
+	// "twice the refill period" is a fixed two minutes (a fixed constant also
+	// keeps high-rate configurations from sweeping buckets too eagerly).
+	idle := 2 * time.Minute
 	for key, b := range l.buckets {
 		if now.Sub(b.last) > idle {
 			delete(l.buckets, key)
