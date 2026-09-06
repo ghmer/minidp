@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} &ndash; Sign in</title>
+    <link rel="icon" type="image/svg+xml" href="/logo.svg">
+    <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+    <section class="start-screen" aria-label="Sign in">
+        <div class="start-content surface-bg">
+            <img src="/logo.svg" alt="{{.Title}} logo" class="landing-logo">
+            <h1 class="main-title">{{.Title}}</h1>
+            <p class="subtitle">{{.Subtitle}}</p>
+
+            {{if .Message}}
+            <div id="login-container" class="login-message" role="status">
+                <p>{{.Message}}</p>
+            </div>
+            {{else}}
+            <div id="login-container">
+                {{if .Error}}<p class="login-error" role="alert">{{.Error}}</p>{{end}}
+                <form method="POST" action="{{.Action}}" class="login-form">
+                    {{range .Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
+                    <div class="form-row">
+                        <label for="username">Username</label>
+                        <input id="username" name="username" type="text" autocomplete="username"
+                               value="{{.Username}}" required autofocus>
+                    </div>
+                    <div class="form-row">
+                        <label for="password">Password</label>
+                        <input id="password" name="password" type="password"
+                               autocomplete="current-password" required>
+                    </div>
+                    <button type="submit" class="action-btn login-btn"
+                            aria-label="Sign in to start the adventure">Sign in</button>
+                </form>
+            </div>
+            {{end}}
+        </div>
+    </section>
+</body>
+</html>
