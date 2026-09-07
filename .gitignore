@@ -9,3 +9,4 @@ coverage.txt
 
 # OS noise
 .DS_Store
+users.json
