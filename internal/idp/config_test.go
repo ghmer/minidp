@@ -29,7 +29,7 @@ func writeUsersFile(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "users.json")
 	if err := SaveUsers(path, []User{
-		{Username: "rego", PasswordHash: testHash(t, "adventure"), Email: "rego@example.com", Name: "Rego"},
+		{Username: "demo", PasswordHash: testHash(t, "demo-password"), Email: "demo@example.com", Name: "Demo User"},
 	}); err != nil {
 		t.Fatalf("SaveUsers: %v", err)
 	}
@@ -53,11 +53,11 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Issuer != "http://localhost:8080" {
 		t.Errorf("Issuer = %q, want %q", cfg.Issuer, "http://localhost:8080")
 	}
-	if cfg.ClientID != "rego-adventure" {
-		t.Errorf("ClientID = %q, want %q", cfg.ClientID, "rego-adventure")
+	if cfg.ClientID != "demo-app" {
+		t.Errorf("ClientID = %q, want %q", cfg.ClientID, "demo-app")
 	}
 	// The audience defaults to the registered client id.
-	if cfg.Audience != "rego-adventure" {
+	if cfg.Audience != "demo-app" {
 		t.Errorf("Audience = %q, want the client id", cfg.Audience)
 	}
 	if cfg.AccessTokenTTL != time.Hour {

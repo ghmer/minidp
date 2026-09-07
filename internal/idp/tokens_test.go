@@ -14,14 +14,14 @@ func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	usersFile := filepath.Join(t.TempDir(), "users.json")
 	if err := SaveUsers(usersFile, []User{
-		{Username: "rego", PasswordHash: testHash(t, "adventure"), Email: "rego@example.com", Name: "Rego"},
+		{Username: "demo", PasswordHash: testHash(t, "demo-password"), Email: "demo@example.com", Name: "Demo User"},
 	}); err != nil {
 		t.Fatalf("SaveUsers: %v", err)
 	}
 	srv, err := New(Config{
 		Issuer:          "https://idp.test",
-		ClientID:        "rego-adventure",
-		Audience:        "rego-adventure",
+		ClientID:        "demo-app",
+		Audience:        "demo-app",
 		UsersFile:       usersFile,
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 2 * time.Hour,
@@ -50,7 +50,7 @@ func parseWithServer(t *testing.T, srv *Server, tokenString string) jwt.MapClaim
 func TestIssueTokensAccessAndIDClaims(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
-		Sub:      "rego",
+		Sub:      "demo",
 		ClientID: srv.cfg.ClientID,
 		Scopes:   []string{"openid", "profile", "email"},
 		Nonce:    "n-abc",
@@ -78,32 +78,32 @@ func TestIssueTokensAccessAndIDClaims(t *testing.T) {
 	if access["iss"] != "https://idp.test" {
 		t.Errorf("access iss = %v", access["iss"])
 	}
-	if access["sub"] != "rego" {
+	if access["sub"] != "demo" {
 		t.Errorf("access sub = %v", access["sub"])
 	}
 	aud, _ := access.GetAudience()
-	if len(aud) != 1 || aud[0] != "rego-adventure" {
-		t.Errorf("access aud = %v, want [rego-adventure]", aud)
+	if len(aud) != 1 || aud[0] != "demo-app" {
+		t.Errorf("access aud = %v, want [demo-app]", aud)
 	}
 	if access["scope"] != "openid profile email" {
 		t.Errorf("access scope = %v", access["scope"])
 	}
-	if access["preferred_username"] != "rego" {
+	if access["preferred_username"] != "demo" {
 		t.Errorf("access preferred_username = %v", access["preferred_username"])
 	}
-	if access["email"] != "rego@example.com" {
+	if access["email"] != "demo@example.com" {
 		t.Errorf("access email = %v", access["email"])
 	}
 
 	id := parseWithServer(t, srv, resp.IDToken)
-	if id["iss"] != "https://idp.test" || id["sub"] != "rego" {
+	if id["iss"] != "https://idp.test" || id["sub"] != "demo" {
 		t.Errorf("id iss/sub = %v/%v", id["iss"], id["sub"])
 	}
 	if id["nonce"] != "n-abc" {
 		t.Errorf("id nonce = %v, want n-abc (oidc-client-ts validates this)", id["nonce"])
 	}
 	audID, _ := id.GetAudience()
-	if len(audID) != 1 || audID[0] != "rego-adventure" {
+	if len(audID) != 1 || audID[0] != "demo-app" {
 		t.Errorf("id aud = %v", audID)
 	}
 }
@@ -116,7 +116,7 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 
 	// openid only: no profile claims.
 	resp, err := srv.issueTokens(&authContext{
-		Sub:      "rego",
+		Sub:      "demo",
 		ClientID: srv.cfg.ClientID,
 		Scopes:   []string{"openid"},
 	})
@@ -161,8 +161,8 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 	}
 	srv, err := New(Config{
 		Issuer:          "https://idp.test",
-		ClientID:        "rego-adventure",
-		Audience:        "rego-adventure",
+		ClientID:        "demo-app",
+		Audience:        "demo-app",
 		UsersFile:       usersFile,
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 2 * time.Hour,
@@ -212,7 +212,7 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 func TestIssueTokensWithoutOpenIDScopeOmitsIDToken(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
-		Sub:      "rego",
+		Sub:      "demo",
 		ClientID: srv.cfg.ClientID,
 		Scopes:   []string{"profile"},
 	})
@@ -227,7 +227,7 @@ func TestIssueTokensWithoutOpenIDScopeOmitsIDToken(t *testing.T) {
 func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
-		Sub:      "rego",
+		Sub:      "demo",
 		ClientID: srv.cfg.ClientID,
 		Scopes:   []string{"openid"},
 		Nonce:    "keep-me",
@@ -239,7 +239,7 @@ func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	if entry == nil || reused {
 		t.Fatal("issued refresh token is not redeemable")
 	}
-	if entry.Sub != "rego" || entry.ClientID != srv.cfg.ClientID {
+	if entry.Sub != "demo" || entry.ClientID != srv.cfg.ClientID {
 		t.Errorf("unexpected refresh entry: %+v", entry)
 	}
 	if entry.Nonce != "keep-me" {
@@ -272,7 +272,7 @@ func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
 	srv := newTestServer(t)
 	base := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
 	}
@@ -309,7 +309,7 @@ func TestIDTokenRejectedAsAccessToken(t *testing.T) {
 	srv := newTestServer(t)
 	claims := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"aud": srv.cfg.Audience,
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
@@ -330,7 +330,7 @@ func TestParseIDTokenHintAcceptsExpired(t *testing.T) {
 	srv := newTestServer(t)
 	claims := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"aud": srv.cfg.Audience,
 		"exp": time.Now().Add(-time.Hour).Unix(),
 		"iat": time.Now().Add(-2 * time.Hour).Unix(),

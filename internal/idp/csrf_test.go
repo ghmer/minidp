@@ -10,7 +10,7 @@ var testNonce = []byte("0123456789abcdef0123456789abcdef")
 
 func TestCSRFIssueVerifyRoundTrip(t *testing.T) {
 	m := newCSRFManager([]byte("0123456789abcdef0123456789abcdef"), time.Minute)
-	params := url.Values{"client_id": {"rego-adventure"}, "state": {"xyz"}}
+	params := url.Values{"client_id": {"demo-app"}, "state": {"xyz"}}
 
 	token := m.issue("/authorize", params, testNonce)
 	if !m.verify("/authorize", params, testNonce, token) {

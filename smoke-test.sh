@@ -5,7 +5,7 @@
 set -euo pipefail
 
 BASE="http://localhost:8099"
-CLIENT="rego-adventure"
+CLIENT="demo-app"
 REDIRECT="http://localhost:3000/callback"
 VERIFIER=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
 CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
@@ -57,8 +57,8 @@ echo "== 0. build + boot a self-contained IdP instance =="
 WORKDIR=$(mktemp -d)
 go build -o "$WORKDIR/minidp" .
 go build -o "$WORKDIR/minidp-users" ./cmd/minidp-users
-"$WORKDIR/minidp-users" add -file "$WORKDIR/users.json" -username rego \
-  -password adventure -email regoadventure@r5i.xyz -roles user >/dev/null
+"$WORKDIR/minidp-users" add -file "$WORKDIR/users.json" -username demo \
+  -password demo-password -email demo@example.com -roles user >/dev/null
 mkdir -p "$WORKDIR/keys"
 IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_USERS_FILE="$WORKDIR/users.json" \
   ALLOWED_REDIRECTS="$REDIRECT" IDP_KEY_DIR="$WORKDIR/keys" \
@@ -127,7 +127,7 @@ LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize"
   --data-urlencode "nonce=$NONCE" \
   --data-urlencode "code_challenge=$CHALLENGE" \
   --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" \
+  --data-urlencode "username=demo" \
   --data-urlencode "password=wrongpass")
 [ "$LOC" = "401" ] && echo "wrong password rejected (401) OK"
 
@@ -143,8 +143,8 @@ LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authori
   --data-urlencode "nonce=$NONCE" \
   --data-urlencode "code_challenge=$CHALLENGE" \
   --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" \
-  --data-urlencode "password=adventure")
+  --data-urlencode "username=demo" \
+  --data-urlencode "password=demo-password")
 echo "redirect: $LOC"
 case "$LOC" in
   "$REDIRECT?code="*"&state=$STATE") echo "redirect with code+state OK" ;;
@@ -161,7 +161,7 @@ LOC2=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/author
   --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
   --data-urlencode "state=s2" --data-urlencode "nonce=n2" \
   --data-urlencode "code_challenge=$CHALLENGE" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
 CODE2=$(printf '%s' "$LOC2" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=authorization_code&code=$CODE2&client_id=$CLIENT&redirect_uri=$REDIRECT")
 echo "$RESP" | python3 -c "
@@ -192,11 +192,11 @@ def typ(t):
 ac=claims(d['access_token']); ic=claims(d['id_token'])
 assert ac['iss']=='$BASE' and ic['iss']=='$BASE'
 assert ac['aud']==['$CLIENT'] and ic['aud']==['$CLIENT']
-assert ac['sub']=='rego' and ic['sub']=='rego'
+assert ac['sub']=='demo' and ic['sub']=='demo'
 assert ic['nonce']=='$NONCE', ic['nonce']
 assert typ(d['access_token'])=='at+jwt', 'access token must carry the RFC 9068 typ header'
 assert typ(d['id_token'])=='JWT', 'id token must carry typ JWT'
-assert ac['email']=='regoadventure@r5i.xyz', ac.get('email')
+assert ac['email']=='demo@example.com', ac.get('email')
 assert ac['roles']==['user'] and ic['roles']==['user'], 'roles must be released on both tokens when set'
 print('access+id token claims OK (iss/aud/sub/nonce/typ/scope/roles claims)')
 print('refresh token present, scope =', d['scope'])
@@ -220,7 +220,7 @@ d=json.load(sys.stdin)
 assert 'access_token' in d and 'refresh_token' in d and 'id_token' in d
 p=d['id_token'].split('.')[1]; p+='='*(-len(p)%4)
 ic=json.loads(base64.urlsafe_b64decode(p))
-assert ic['sub']=='rego' and ic['nonce']=='$NONCE'
+assert ic['sub']=='demo' and ic['nonce']=='$NONCE'
 print('refresh grant OK, rotated refresh token issued, nonce preserved')
 "
 NEWREFRESH=$(printf '%s' "$TOK2" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
@@ -263,7 +263,7 @@ LOC3=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/author
   --data-urlencode "response_type=code" --data-urlencode "scope=openid profile" \
   --data-urlencode "state=s3" --data-urlencode "nonce=n3" \
   --data-urlencode "code_challenge=$C3" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
 CODE3=$(printf '%s' "$LOC3" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 TOK3=$(curl -s -X POST "$BASE/token" \
   -d "grant_type=authorization_code&code=$CODE3&client_id=$CLIENT&redirect_uri=$REDIRECT" \
@@ -274,7 +274,7 @@ IDTOK3=$(printf '%s' "$TOK3" | python3 -c "import json,sys;print(json.load(sys.s
 curl -s -H "Authorization: Bearer $AT" "$BASE/userinfo" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-assert d['sub']=='rego' and d['preferred_username']=='rego', d
+assert d['sub']=='demo' and d['preferred_username']=='demo', d
 assert 'email' not in d, 'email must not be released without the email scope'
 print('userinfo OK (profile scope):', d['sub'])
 "
@@ -289,7 +289,7 @@ echo "== 13. introspect + revocation + logout =="
 curl -s -X POST "$BASE/introspect" -d "token=$AT" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-assert d['active'] is True and d['sub']=='rego', d
+assert d['active'] is True and d['sub']=='demo', d
 assert d['aud']==['$CLIENT'], d
 print('introspect OK (active)')
 "
@@ -313,7 +313,7 @@ LOC4=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/author
   --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
   --data-urlencode "state=s4" --data-urlencode "nonce=n4" \
   --data-urlencode "code_challenge=$C3" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
 CODE4=$(printf '%s' "$LOC4" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 AT4=$(curl -s -X POST "$BASE/token" \
   -d "grant_type=authorization_code&code=$CODE4&client_id=$CLIENT&redirect_uri=$REDIRECT" \
@@ -331,7 +331,7 @@ curl -s -o /dev/null -X OPTIONS "$BASE/token" \
 
 echo "== 15. landing page + login page styling =="
 curl -s "$BASE/" | grep -q 'href="/login.css"' && echo "landing links themed css"
-curl -s "$BASE/login.css" | grep -q -- '--accent-color: #c77d00' && echo "rego-adventure theme css served"
+curl -s "$BASE/login.css" | grep -Eqi -- '--accent:[[:space:]]*#0d8570;' && echo "Deep Water theme css served"
 curl -s "$BASE/logo.svg" | grep -qi '<svg' && echo "logo served"
 
 echo "== 16. security headers =="
@@ -341,7 +341,7 @@ curl -s -o /dev/null -D - "$BASE/" | grep -i "x-frame-options: DENY" >/dev/null 
 
 echo "== 17. CSRF-protected login + token responses not cacheable =="
 curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_code}\n' -X POST "$BASE/authorize" \
-  --data-urlencode "client_id=$CLIENT" --data-urlencode "username=rego" --data-urlencode "password=adventure" \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode "username=demo" --data-urlencode "password=demo-password" \
   | grep -q "400" && echo "login without CSRF token rejected OK"
 curl -s -D - -o /dev/null -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=x&client_id=$CLIENT" \
   | grep -qi "cache-control: no-store" && echo "token response Cache-Control: no-store OK"
@@ -402,7 +402,7 @@ ST9=$(curl -s -b "$JAR2" -o /dev/null -w '%{http_code}' -X POST "$BASE2/authoriz
   --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
   --data-urlencode "scope=openid profile email" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
   --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=rego" --data-urlencode "password=adventure")
+  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
 if [ "$ST9" != "401" ]; then
   echo "UNEXPECTED: unknown user in users-file mode -> $ST9 (want 401)"; exit 1
 fi

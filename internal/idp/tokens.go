@@ -121,7 +121,7 @@ func newIDClaims(rc jwt.RegisteredClaims, nonce, family string, wantProfile bool
 }
 
 // issueTokens mints a fresh access token, an id_token (when the openid scope is
-// present, as it is for rego-adventure) and a brand-new refresh token. Refresh
+// present, as it is for any OIDC client) and a brand-new refresh token. Refresh
 // tokens are rotated: every issuance retires the previous one, so a refresh
 // token can only ever be used a single time.
 //

@@ -2,8 +2,8 @@ package idp
 
 import "net/http"
 
-// handleDiscovery serves the OIDC discovery document. rego-adventure fetches
-// AUTH_DISCOVERY_URL (= issuer + /.well-known/openid-configuration) to learn the
+// handleDiscovery serves the OIDC discovery document. Clients fetch
+// <issuer>/.well-known/openid-configuration to learn the
 // endpoint URLs and the jwks_uri used for JWT validation.
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	// Client authentication methods depend on the configured client mode: a
@@ -40,8 +40,8 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// handleJWKS serves the JSON Web Key Set with the RSA public signing key. The
-// rego-adventure back-end verifies access-token signatures against this key set.
+// handleJWKS serves the JSON Web Key Set with the RSA public signing key.
+// Resource servers verify access-token signatures against this key set.
 func (s *Server) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(s.key.JWKS())

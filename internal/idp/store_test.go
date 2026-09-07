@@ -28,13 +28,13 @@ func mustAddRefresh(t *testing.T, s *store, f *refreshEntry, ttl time.Duration) 
 
 func TestAddTakeCodeIsSingleUse(t *testing.T) {
 	s := newStore()
-	id := mustAddCode(t, s, &authCode{Sub: "rego", ClientID: "c1"}, time.Minute)
+	id := mustAddCode(t, s, &authCode{Sub: "demo", ClientID: "c1"}, time.Minute)
 
 	got := s.takeCode(id)
 	if got == nil {
 		t.Fatal("expected code to be redeemable")
 	}
-	if got.Sub != "rego" || got.ClientID != "c1" {
+	if got.Sub != "demo" || got.ClientID != "c1" {
 		t.Fatalf("unexpected code contents: %+v", got)
 	}
 	if again := s.takeCode(id); again != nil {
@@ -51,7 +51,7 @@ func TestTakeCodeUnknown(t *testing.T) {
 
 func TestTakeCodeExpired(t *testing.T) {
 	s := newStore()
-	id := mustAddCode(t, s, &authCode{Sub: "rego"}, -time.Minute) // already expired
+	id := mustAddCode(t, s, &authCode{Sub: "demo"}, -time.Minute) // already expired
 	if got := s.takeCode(id); got != nil {
 		t.Fatalf("expected expired code to be rejected, got %+v", got)
 	}
@@ -59,10 +59,10 @@ func TestTakeCodeExpired(t *testing.T) {
 
 func TestDropExpiredSweepsBothMaps(t *testing.T) {
 	s := newStore()
-	mustAddCode(t, s, &authCode{Sub: "rego"}, -time.Minute)
-	mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, -time.Minute)
-	mustAddCode(t, s, &authCode{Sub: "rego"}, time.Minute)        // stays
-	mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, time.Minute) // stays
+	mustAddCode(t, s, &authCode{Sub: "demo"}, -time.Minute)
+	mustAddRefresh(t, s, &refreshEntry{Sub: "demo"}, -time.Minute)
+	mustAddCode(t, s, &authCode{Sub: "demo"}, time.Minute)        // stays
+	mustAddRefresh(t, s, &refreshEntry{Sub: "demo"}, time.Minute) // stays
 
 	s.mu.Lock()
 	s.dropExpired()
@@ -79,13 +79,13 @@ func TestDropExpiredSweepsBothMaps(t *testing.T) {
 
 func TestRefreshTokenRotation(t *testing.T) {
 	s := newStore()
-	first := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	first := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
 	entry, reused := s.takeRefresh(first)
 	if entry == nil || reused {
 		t.Fatal("expected refresh token to be redeemable and not marked as reused")
 	}
-	if entry.Sub != "rego" || entry.ClientID != "c1" || entry.Family != "fam-1" {
+	if entry.Sub != "demo" || entry.ClientID != "c1" || entry.Family != "fam-1" {
 		t.Fatalf("unexpected refresh entry: %+v", entry)
 	}
 
@@ -97,7 +97,7 @@ func TestRefreshTokenRotation(t *testing.T) {
 	}
 
 	// A newly issued refresh token is independent of the old one.
-	second := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	second := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
 	if second == first {
 		t.Fatal("expected new refresh token id to differ from the old one")
 	}
@@ -108,7 +108,7 @@ func TestRefreshTokenRotation(t *testing.T) {
 
 func TestTakeRefreshExpired(t *testing.T) {
 	s := newStore()
-	id := mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, -time.Minute)
+	id := mustAddRefresh(t, s, &refreshEntry{Sub: "demo"}, -time.Minute)
 	if got, reused := s.takeRefresh(id); got != nil || reused {
 		t.Fatalf("expected expired refresh token to be rejected, got %+v (reused=%v)", got, reused)
 	}
@@ -119,10 +119,10 @@ func TestTakeRefreshExpired(t *testing.T) {
 // entire family derived from the same authorization.
 func TestRefreshFamilyReuseRevokesFamily(t *testing.T) {
 	s := newStore()
-	other := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-other"}, time.Minute)
+	other := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-other"}, time.Minute)
 
-	stolen := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
-	rotated := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	stolen := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	rotated := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
 	// Legitimate rotation consumes the stolen token...
 	if entry, reused := s.takeRefresh(stolen); entry == nil || reused {
@@ -146,16 +146,16 @@ func TestRefreshFamilyReuseRevokesFamily(t *testing.T) {
 // already-consumed one: either way the whole family goes.
 func TestRevokeTokenRevokesFamily(t *testing.T) {
 	s := newStore()
-	sibling := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	sibling := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
-	live := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	live := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-1"}, time.Minute)
 	s.revokeToken(live)
 	if entry, _ := s.takeRefresh(sibling); entry != nil {
 		t.Error("revoking a live token must drop its whole family")
 	}
 
-	sibling2 := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
-	consumed := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	sibling2 := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	consumed := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", ClientID: "c1", Family: "fam-2"}, time.Minute)
 	if _, reused := s.takeRefresh(consumed); reused {
 		t.Fatal("expected first use of the token to succeed")
 	}
@@ -167,8 +167,8 @@ func TestRevokeTokenRevokesFamily(t *testing.T) {
 
 func TestRevokeToken(t *testing.T) {
 	s := newStore()
-	codeID := mustAddCode(t, s, &authCode{Sub: "rego"}, time.Minute)
-	refreshID := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", Family: "fam-1"}, time.Minute)
+	codeID := mustAddCode(t, s, &authCode{Sub: "demo"}, time.Minute)
+	refreshID := mustAddRefresh(t, s, &refreshEntry{Sub: "demo", Family: "fam-1"}, time.Minute)
 
 	s.revokeToken(refreshID)
 	if got, _ := s.takeRefresh(refreshID); got != nil {

@@ -10,3 +10,7 @@ coverage.txt
 # OS noise
 .DS_Store
 users.json
+
+# Local-only files: personal demo stack and archived design drafts
+docker-compose.yml
+legacy-design/

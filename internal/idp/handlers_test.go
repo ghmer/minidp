@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -99,7 +100,7 @@ func pkcePair() (verifier, challenge string) {
 }
 
 const (
-	testClientID   = "rego-adventure"
+	testClientID   = "demo-app"
 	testRedirect   = "http://localhost:3000/callback"
 	testScopes     = "openid profile email"
 	testNonceValue = "n-abc"
@@ -137,6 +138,10 @@ func login(t *testing.T, base, user, pass, verifier string) string {
 }
 
 var csrfFieldRe = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
+
+// themeAccentRe matches the Deep Water accent token in the served stylesheet
+// (spacing-insensitive, so CSS re-formatting cannot silently break the check).
+var themeAccentRe = regexp.MustCompile(`(?i)--accent:\s*#0d8570\s*;`)
 
 // trustLocalhostTransport emulates the browsers' "localhost is a potentially
 // trustworthy origin" exception (W3C Secure Contexts; implemented by Chrome
@@ -465,7 +470,7 @@ func TestTokenResponseNoStore(t *testing.T) {
 
 	// A successful response must carry the headers as well.
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	ok := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -489,7 +494,7 @@ func TestAuthorizeWrongPassword(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
 	form := authorizeForm(verifier)
-	form.Set("username", "rego")
+	form.Set("username", "demo")
 	form.Set("password", "wrong")
 	browser := newBrowser()
 	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
@@ -530,7 +535,7 @@ func TestFullCodeGrantWithPKCE(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
 
-	location := login(t, ts.URL, "rego", "adventure", verifier)
+	location := login(t, ts.URL, "demo", "demo-password", verifier)
 	if !strings.HasPrefix(location, testRedirect+"?code=") {
 		t.Fatalf("redirect %q does not start with %s?code=", location, testRedirect)
 	}
@@ -559,7 +564,7 @@ func TestFullCodeGrantWithPKCE(t *testing.T) {
 	}
 
 	claims := verifyTokenString(t, tokens["access_token"].(string), ts.URL)
-	if claims["sub"] != "rego" {
+	if claims["sub"] != "demo" {
 		t.Errorf("access sub = %v", claims["sub"])
 	}
 	idClaims := verifyTokenString(t, tokens["id_token"].(string), ts.URL)
@@ -594,7 +599,7 @@ func verifyTokenString(t *testing.T, tokenString, issuer string) map[string]any 
 func TestTokenGrantRejectsWrongVerifier(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	form := authorizeForm(verifier)
 	form.Set("grant_type", "authorization_code")
@@ -618,7 +623,7 @@ func TestTokenGrantRejectsWrongVerifier(t *testing.T) {
 func TestTokenGrantRejectsCodeReplay(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	redeem := func() *http.Response {
 		form := url.Values{
@@ -646,7 +651,7 @@ func TestTokenGrantRejectsCodeReplay(t *testing.T) {
 func TestTokenGrantRejectsRedirectMismatch(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -664,7 +669,7 @@ func TestTokenGrantRejectsRedirectMismatch(t *testing.T) {
 func TestRefreshGrantRotatesTokens(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	first := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
@@ -716,7 +721,7 @@ func TestTokenGrantRequiresClientIDAndRedirect(t *testing.T) {
 	// A fresh code per case: the code is consumed before parameter validation
 	// fails, so reusing it would turn the second case into invalid_grant.
 	freshCode := func() string {
-		return codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+		return codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	}
 
 	// Missing client_id / redirect_uri -> invalid_request.
@@ -753,7 +758,7 @@ func TestTokenGrantRequiresClientIDAndRedirect(t *testing.T) {
 func TestRefreshReuseRevokesWholeFamily(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	redeemRefresh := func(token string) map[string]any {
 		return decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
@@ -791,7 +796,7 @@ func TestRefreshReuseRevokesWholeFamily(t *testing.T) {
 	// client_id must match the refresh token's client (RFC 6749 §6).
 	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
-		"code":          {codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))},
+		"code":          {codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))},
 		"client_id":     {testClientID},
 		"redirect_uri":  {testRedirect},
 		"code_verifier": {verifier},
@@ -821,7 +826,7 @@ func TestUnsupportedGrantType(t *testing.T) {
 func TestUserinfo(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -839,15 +844,15 @@ func TestUserinfo(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	info := decodeJSON(t, resp)
-	if info["sub"] != "rego" || info["preferred_username"] != "rego" {
+	if info["sub"] != "demo" || info["preferred_username"] != "demo" {
 		t.Errorf("userinfo = %v", info)
 	}
-	if info["email"] != "rego@example.com" {
+	if info["email"] != "demo@example.com" {
 		t.Errorf("userinfo email = %v, want the users-file value", info["email"])
 	}
 	// F3: discovery advertises `name` in claims_supported, so UserInfo must
 	// emit it too when the profile scope was granted.
-	if info["name"] != "Rego" {
+	if info["name"] != "Demo User" {
 		t.Errorf("userinfo name = %v, want the users-file value", info["name"])
 	}
 
@@ -876,8 +881,8 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 	form.Set("scope", "openid")
 	browser := newBrowser()
 	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", form))
-	form.Set("username", "rego")
-	form.Set("password", "adventure")
+	form.Set("username", "demo")
+	form.Set("password", "demo-password")
 	loginResp := postForm(t, browser, ts.URL+"/authorize", form)
 	if loginResp.StatusCode != http.StatusFound {
 		t.Fatalf("POST /authorize: status = %d", loginResp.StatusCode)
@@ -906,7 +911,7 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("userinfo (openid only): status = %d", status)
 	}
-	if info["sub"] != "rego" {
+	if info["sub"] != "demo" {
 		t.Errorf("userinfo sub = %v", info["sub"])
 	}
 	if _, has := info["preferred_username"]; has {
@@ -928,7 +933,7 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 	// A signed access token for a foreign audience must be rejected (H4).
 	foreign := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"aud": "some-other-client",
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
@@ -947,7 +952,7 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 func TestIntrospectAndRevoke(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -983,7 +988,7 @@ func TestIntrospectAndRevoke(t *testing.T) {
 func TestRevokeAccessTokenDeniesIt(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -1020,7 +1025,7 @@ func TestRevokeAccessTokenDeniesIt(t *testing.T) {
 func TestEndSessionRevokesTokenFamily(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -1080,7 +1085,7 @@ func TestEndSessionRevokesTokenFamily(t *testing.T) {
 func TestEndSessionHintValidatesAudience(t *testing.T) {
 	ts, srv := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -1109,7 +1114,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 	// logout hint: the family stays alive.
 	foreign := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"aud": "some-other-client",
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
@@ -1129,7 +1134,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 	// A matching-audience hint with an EXPIRED token still revokes the family.
 	expired := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
-		"sub": "rego",
+		"sub": "demo",
 		"aud": srv.cfg.Audience,
 		"exp": time.Now().Add(-time.Minute).Unix(),
 		"iat": time.Now().Add(-time.Hour).Unix(),
@@ -1157,7 +1162,7 @@ func TestIntrospectRevokeClientAuth(t *testing.T) {
 		c.ClientSecret = "s3cret"
 	})
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -1339,7 +1344,7 @@ func TestCORSRejectsArbitraryOrigins(t *testing.T) {
 	// listed in IDP_ALLOWED_ORIGINS is never credited.
 	ts2, _ := testIDP(t, nil)
 	req, _ := http.NewRequest(http.MethodGet, ts2.URL+"/healthz", nil)
-	req.Header.Set("Origin", "https://adventure.example.com")
+	req.Header.Set("Origin", "https://demo-password.example.com")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
@@ -1378,7 +1383,7 @@ func TestLandingAndBareLogin(t *testing.T) {
 		t.Fatalf("GET /: status = %d", resp.StatusCode)
 	}
 
-	form := url.Values{"username": {"rego"}, "password": {"adventure"}}
+	form := url.Values{"username": {"demo"}, "password": {"demo-password"}}
 	browser := newBrowser()
 	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/", url.Values{}))
 	ok := postForm(t, browser, ts.URL+"/login", form)
@@ -1386,7 +1391,7 @@ func TestLandingAndBareLogin(t *testing.T) {
 		t.Fatalf("POST /login: status = %d", ok.StatusCode)
 	}
 	body, _ := io.ReadAll(ok.Body)
-	if !strings.Contains(string(body), "Signed in as rego") {
+	if !strings.Contains(string(body), "Signed in as demo") {
 		t.Errorf("expected a signed-in confirmation, got %q", body)
 	}
 
@@ -1409,8 +1414,8 @@ func TestStaticAssets(t *testing.T) {
 		t.Errorf("login.css Content-Type = %q", ct)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "--accent-color: #c77d00") {
-		t.Error("login.css must carry the rego-adventure theme accent color")
+	if !themeAccentRe.Match(body) {
+		t.Error("login.css must carry the Deep Water theme accent color")
 	}
 
 	logoResp, err := http.Get(ts.URL + "/logo.svg")
@@ -1432,12 +1437,71 @@ func TestStaticAssets(t *testing.T) {
 	}
 }
 
+// TestAssetOverrides verifies the fixed assets directory: a file present at
+// <workdir>/assets/<name> overrides exactly its embedded default, and the
+// other asset keeps the shipped version (per-file fallback).
+func TestAssetOverrides(t *testing.T) {
+	const customCSS = "/* operator override */ .login-form { gap: 2rem; }"
+	const customLogo = `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>`
+
+	setup := func(t *testing.T, names ...string) {
+		t.Helper()
+		assets := filepath.Join(t.TempDir(), "assets")
+		if err := os.MkdirAll(assets, 0o700); err != nil {
+			t.Fatalf("mkdir assets: %v", err)
+		}
+		files := map[string]string{"login.css": customCSS, "logo.svg": customLogo}
+		for _, name := range names {
+			if err := os.WriteFile(filepath.Join(assets, name), []byte(files[name]), 0o600); err != nil {
+				t.Fatalf("write override %s: %v", name, err)
+			}
+		}
+		t.Chdir(filepath.Dir(assets))
+	}
+
+	get := func(t *testing.T, url string) string {
+		t.Helper()
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s: %v", url, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return string(body)
+	}
+
+	t.Run("both files overridden", func(t *testing.T) {
+		setup(t, "login.css", "logo.svg")
+		ts, _ := testIDP(t, nil)
+		if css := get(t, ts.URL+"/login.css"); css != customCSS {
+			t.Errorf("login.css not overridden: %q", css)
+		}
+		if logo := get(t, ts.URL+"/logo.svg"); logo != customLogo {
+			t.Errorf("logo.svg not overridden: %q", logo)
+		}
+	})
+
+	t.Run("per-file fallback to embedded default", func(t *testing.T) {
+		setup(t, "logo.svg")
+		ts, _ := testIDP(t, nil)
+		if css := get(t, ts.URL + "/login.css"); !themeAccentRe.MatchString(css) {
+			t.Error("login.css must fall back to the embedded Deep Water theme")
+		}
+		if logo := get(t, ts.URL+"/logo.svg"); logo != customLogo {
+			t.Errorf("logo.svg not overridden: %q", logo)
+		}
+	})
+}
+
 func TestAuthorizeRejectsInvalidCSRF(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
 	form := authorizeForm(verifier)
-	form.Set("username", "rego")
-	form.Set("password", "adventure")
+	form.Set("username", "demo")
+	form.Set("password", "demo-password")
 	form.Set("csrf_token", "not-a-valid-token")
 	resp := postForm(t, noFollow(), ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusBadRequest {
@@ -1458,8 +1522,8 @@ func TestAuthorizeRejectsParamTampering(t *testing.T) {
 	token := fetchCSRF(t, browser, ts.URL+"/authorize", form)
 	// ...then swap the redirect_uri behind the server's back.
 	form.Set("redirect_uri", "http://evil.example.com/callback")
-	form.Set("username", "rego")
-	form.Set("password", "adventure")
+	form.Set("username", "demo")
+	form.Set("password", "demo-password")
 	form.Set("csrf_token", token)
 	resp := postForm(t, browser, ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusBadRequest {
@@ -1486,8 +1550,8 @@ func TestCSRFTokenRequiresBrowserNonce(t *testing.T) {
 
 	submit := func(victim *http.Client) *http.Response {
 		form := attackerForm
-		form.Set("username", "rego")
-		form.Set("password", "adventure")
+		form.Set("username", "demo")
+		form.Set("password", "demo-password")
 		form.Set("csrf_token", token)
 		return postForm(t, victim, ts.URL+"/authorize", form)
 	}
@@ -1576,8 +1640,8 @@ func TestLoginFormsSurviveRerender(t *testing.T) {
 	_ = respB.Body.Close()
 
 	// Tab A's form, submitted after tab B's render, must still be accepted.
-	formA.Set("username", "rego")
-	formA.Set("password", "adventure")
+	formA.Set("username", "demo")
+	formA.Set("password", "demo-password")
 	formA.Set("csrf_token", tokenA[1])
 	resp := postForm(t, browser, ts.URL+"/authorize", formA)
 	if resp.StatusCode != http.StatusFound {
@@ -1598,8 +1662,8 @@ func TestLoginRateLimiting(t *testing.T) {
 	browser := newBrowser()
 	attempt := func() (*http.Response, url.Values) {
 		form := authorizeForm(verifier)
-		form.Set("username", "rego")
-		form.Set("password", "adventure")
+		form.Set("username", "demo")
+		form.Set("password", "demo-password")
 		form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
 		resp := postForm(t, browser, ts.URL+"/authorize", form)
 		return resp, form
@@ -1635,8 +1699,8 @@ func TestRateLimitIgnoresCSRFJunk(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		form := authorizeForm(verifier)
-		form.Set("username", "rego")
-		form.Set("password", "adventure")
+		form.Set("username", "demo")
+		form.Set("password", "demo-password")
 		form.Set("csrf_token", "forged")
 		resp := postForm(t, http.DefaultClient, ts.URL+"/authorize", form)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -1647,8 +1711,8 @@ func TestRateLimitIgnoresCSRFJunk(t *testing.T) {
 	// The legitimate user on the same IP is unaffected.
 	browser := newBrowser()
 	form := authorizeForm(verifier)
-	form.Set("username", "rego")
-	form.Set("password", "adventure")
+	form.Set("username", "demo")
+	form.Set("password", "demo-password")
 	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
 	resp := postForm(t, browser, ts.URL+"/authorize", form)
 	if resp.StatusCode != http.StatusFound {
@@ -1791,8 +1855,8 @@ func TestMultiUserFlow(t *testing.T) {
 	// Credentials that are not in the users file do not authenticate.
 	verifierC, _ := pkcePair()
 	form := authorizeForm(verifierC)
-	form.Set("username", "rego")
-	form.Set("password", "adventure")
+	form.Set("username", "demo")
+	form.Set("password", "demo-password")
 	browser := newBrowser()
 	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifierC)))
 	resp := postForm(t, browser, ts.URL+"/authorize", form)

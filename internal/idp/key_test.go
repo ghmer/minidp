@@ -40,7 +40,7 @@ func TestNewSigningKeyGeneratesUsableKey(t *testing.T) {
 	}
 
 	// Sign a token and verify it with the corresponding public key.
-	signed, err := k.sign(jwt.RegisteredClaims{Subject: "rego"})
+	signed, err := k.sign(jwt.RegisteredClaims{Subject: "demo"})
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestNewSigningKeyGeneratesUsableKey(t *testing.T) {
 
 // TestJWKSPublishedKeyVerifiesToken decodes the published JWKS, rebuilds the
 // RSA public key from n/e and verifies a token signed by the private key. This
-// is exactly what the rego-adventure backend does.
+// is exactly what a JWKS-based resource server does.
 func TestJWKSPublishedKeyVerifiesToken(t *testing.T) {
 	k, err := NewSigningKey("", "")
 	if err != nil {
@@ -91,7 +91,7 @@ func TestJWKSPublishedKeyVerifiesToken(t *testing.T) {
 	}
 	pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: int(new(big.Int).SetBytes(eBytes).Int64())}
 
-	signed, err := k.sign(jwt.RegisteredClaims{Subject: "rego"})
+	signed, err := k.sign(jwt.RegisteredClaims{Subject: "demo"})
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestLoadSigningKeyFromPEM(t *testing.T) {
 	}
 
 	// A token signed by the loaded key must verify with the original key.
-	signed, err := loaded.sign(jwt.RegisteredClaims{Subject: "rego"})
+	signed, err := loaded.sign(jwt.RegisteredClaims{Subject: "demo"})
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}

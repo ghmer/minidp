@@ -2,8 +2,8 @@
 // Authorization Code flow with PKCE (S256) for public clients and, with
 // MINIDP_MODE=confidential, the confidential-client profile with client
 // authentication at the token endpoint. It issues signed
-// access tokens, id tokens and rotating refresh tokens, and is designed to work
-// out of the box as the IdP for github.com/ghmer/rego-adventure.
+// access tokens, id tokens and rotating refresh tokens, and works with any
+// standards-compliant OIDC client library (e.g. oidc-client-ts).
 //
 // Configuration is done entirely through environment variables, see the
 // README.md for the full list.

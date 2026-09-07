@@ -1,5 +1,4 @@
-# Minimal production deployment of minidp for a single-user demo of
-# rego-adventure.
+# Minimal production deployment of minidp for a single-client demo.
 #
 # Key management: by default the signing key is generated on first start into
 # an emptyDir and is LOST when the pod is rescheduled (users simply log in
@@ -55,16 +54,16 @@ spec:
           env:
             - name: IDP_ISSUER
               value: https://idp.example.com # must be the URL browsers reach
-            # Single registered client; tokens carry aud=rego-adventure and
+            # Single registered client; tokens carry aud=demo-app and
             # both /authorize and /token reject every other client_id.
             - name: IDP_CLIENT_ID
-              value: rego-adventure
+              value: demo-app
             - name: IDP_AUDIENCE
-              value: rego-adventure
+              value: demo-app
             # Registered redirect URIs of the client (mandatory — minidp
             # refuses to start without a redirect policy).
             - name: ALLOWED_REDIRECTS
-              value: https://adventure.example.com/callback
+              value: https://app.example.com/callback
             # Accounts come from a users-file Secret (bcrypt hashes, managed
             # with minidp-users); there are no built-in credentials.
             - name: IDP_USERS_FILE
@@ -111,9 +110,16 @@ spec:
           # - name: IDP_RSA_PEM
           #   value: /keys/minidp-rsa.pem
           # plus mount "keys" at /keys (readOnly).
+          #
+          # Optional custom login branding: mount a directory containing
+          # login.css and/or logo.svg at the fixed assets location. Each
+          # present file overrides its embedded default per file.
+          # - name: assets
+          #   configMap: { name: minidp-assets }
+          # plus mount "assets" at /app/assets (readOnly).
 ---
 # Example secret — create it properly with kubectl, do not commit real
 # credentials. Build the file with the bundled tool (never prints hashes):
 #
-#   minidp-users add -file users.json -username rego -email rego@example.com
+#   minidp-users add -file users.json -username alice -email alice@example.com
 #   kubectl create secret generic minidp-users --from-file=users.json=users.json

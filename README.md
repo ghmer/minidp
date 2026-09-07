@@ -4,12 +4,13 @@ A minimal OIDC/OAuth2 identity provider written in Go. It implements the
 **Authorization Code flow** for **public clients with mandatory PKCE (S256)**
 and for **confidential clients with client authentication at the token
 endpoint** (`MINIDP_MODE`), issues signed
-**access tokens**, **id tokens** and **rotating refresh tokens**, and is
-designed to work out of the box as the IdP for
-[github.com/ghmer/rego-adventure](https://github.com/ghmer/rego-adventure).
+**access tokens**, **id tokens** and **rotating refresh tokens**, and works
+with any standards-compliant OIDC client — browser SPAs using libraries such
+as [oidc-client-ts](https://github.com/authts/oidc-client-ts) as well as
+backend resource servers that validate JWTs against the published JWKS.
 
 > **Scope.** minidp is production-ready **for what it is**: a lightweight IdP
-> for demo and pilot deployments such as rego-adventure — with a small set of
+> for demo and pilot deployments — with a small set of
 > users managed through a mounted JSON file and a **single registered client**.
 > It deliberately has no user database, no admin UI, no dynamic client
 > registration and no clustering — that is what keeps it a 10 MB container
@@ -23,7 +24,7 @@ designed to work out of the box as the IdP for
 ## Features
 
 - **Single registered client** with a configurable `client_id` (`IDP_CLIENT_ID`,
-  default `rego-adventure`) and a configurable token **audience**
+  default `demo-app`) and a configurable token **audience**
   (`IDP_AUDIENCE`, defaults to the client id) — every other `client_id` is
   rejected at `/authorize` and `/token`, and resource endpoints reject tokens
   whose `aud` does not match
@@ -51,7 +52,9 @@ designed to work out of the box as the IdP for
   codes — only origins derived from the registered redirects (or listed in
   `IDP_ALLOWED_ORIGINS`) are reflected, with credentials; any other `Origin`
   gets no CORS grant
-- Login page styled after the **Rego Adventure** theme
+- Login page with the built-in **Deep Water** theme — light and dark mode via
+  the OS `prefers-color-scheme` — configurable title/subtitle, and per-file
+  asset overrides (see [Login page branding](#login-page-branding))
 
 ## Hardening
 
@@ -123,12 +126,14 @@ changes:
 ## Quick start
 
 minidp has no built-in accounts and no open redirect fallback, so a users file
-and a redirect policy are mandatory. The repository ships `users.json` with
-the demo account **rego** / **adventure** (bcrypt-hashed):
+and a redirect policy are mandatory. Create the users file with the bundled
+tool (or copy `users.json.example` and rotate the credentials):
 
 ```sh
 go build -o minidp .
 go build -o minidp-users ./cmd/minidp-users
+
+minidp-users add -file users.json -username alice -email alice@example.com   # prompts for the password
 
 IDP_ISSUER=http://localhost:8080 \
 IDP_USERS_FILE=$PWD/users.json \
@@ -137,8 +142,8 @@ ALLOWED_REDIRECTS=http://localhost:3000/callback \
 ```
 
 Then open
-`http://localhost:8080/authorize?client_id=rego-adventure&redirect_uri=http://localhost:3000/callback&response_type=code&scope=openid&code_challenge=<challenge>&code_challenge_method=S256&state=x&nonce=y`
-and sign in with **rego** / **adventure**.
+`http://localhost:8080/authorize?client_id=demo-app&redirect_uri=http://localhost:3000/callback&response_type=code&scope=openid&code_challenge=<challenge>&code_challenge_method=S256&state=x&nonce=y`
+and sign in with the account you created.
 
 Run the self-contained end-to-end smoke test (builds, boots its own instance
 on port 8099 and exercises the whole flow):
@@ -156,7 +161,7 @@ All settings are provided through environment variables.
 | `IDP_HOST`              | `0.0.0.0`                            | Interface to bind                                                                                                                                                                    |
 | `IDP_PORT`              | `8080`                               | TCP port to listen on                                                                                                                                                                |
 | `IDP_ISSUER`            | `http://localhost:8080`              | Issuer URL; written into every token's `iss` and the discovery doc                                                                                                                   |
-| `IDP_CLIENT_ID`         | `rego-adventure`                     | The single registered client; every other `client_id` is rejected at `/authorize` and `/token`                                                                                       |
+| `IDP_CLIENT_ID`         | `demo-app`                           | The single registered client; every other `client_id` is rejected at `/authorize` and `/token`                                                                                       |
 | `IDP_AUDIENCE`          | *(= `IDP_CLIENT_ID`)*                | `aud` claim of every token; `/userinfo` and `/introspect` reject tokens with a foreign audience                                                                                      |
 | `IDP_USERS_FILE`        | *(required)*                         | JSON file with user accounts (bcrypt hashes, see below) — **the only credential source**                                                                                             |
 | `IDP_ACCESS_TOKEN_TTL`  | `3600`                               | Access/id token lifetime in seconds                                                                                                                                                  |
@@ -169,8 +174,8 @@ All settings are provided through environment variables.
 | `MINIDP_MODE`           | `public`                             | Client profile: `public` (mandatory PKCE, no secret allowed) or `confidential` (client auth at `/token`, secret required) — see [Client modes](#client-modes-public-vs-confidential) |
 | `IDP_CLIENT_SECRET`     | *(unset)*                            | The registered client's secret; **only valid in `confidential` mode** — also gates `/introspect` and `/revoke`                                                                       |
 | `IDP_LOGIN_RATE_LIMIT`  | `20`                                 | Login attempts per minute and client IP                                                                                                                                              |
-| `IDP_TITLE`             | `Rego Adventure`                     | Title shown on the login page                                                                                                                                                        |
-| `IDP_SUBTITLE`          | `Sign in to begin …`                 | Subtitle shown on the login page                                                                                                                                                     |
+| `IDP_TITLE`             | `minidp`                             | Title shown on the login page                                                                                                                                                        |
+| `IDP_SUBTITLE`          | `Sign in to continue`                | Subtitle shown on the login page                                                                                                                                                     |
 
 The single-user credential variables of earlier versions (`IDP_USERNAME`,
 `IDP_PASSWORD`, `IDP_PASSWORD_BCRYPT`, `IDP_PASSWORD_FILE`) were **removed**;
@@ -185,7 +190,7 @@ public mode is dead configuration; a confidential mode without a secret would
 authenticate every caller), so the mode and the secret are validated together
 at startup.
 
-**`MINIDP_MODE=public`** (default) — the SPA profile used by rego-adventure:
+**`MINIDP_MODE=public`** (default) — the browser-SPA profile:
 
 - PKCE (S256) is **mandatory** at `/authorize` and verified at `/token`
 - `/token` accepts only `client_id` identification — public clients cannot
@@ -221,29 +226,58 @@ MINIDP_MODE=confidential IDP_CLIENT_SECRET="$(openssl rand -base64 32)" minidp
 Use a cryptographically random secret of at least 128 bits; shorter secrets
 trigger a startup warning.
 
-## Using minidp with rego-adventure
+## Connecting a client application
 
 minidp serves exactly **one registered client** (`IDP_CLIENT_ID`), and every
 token carries the configured audience (`IDP_AUDIENCE`). Nothing is reflected:
 a token minted for — or presented at — any other audience is rejected. Point
-the rego-adventure authentication environment variables at minidp:
+your OIDC client library (oidc-client-ts, AppAuth, Auth.js or any library that
+speaks the standard) at minidp:
 
-| rego-adventure variable | Value                                               |
-| ----------------------- | --------------------------------------------------- |
-| `AUTH_ENABLED`          | `true`                                              |
-| `AUTH_ISSUER`           | minidp's `IDP_ISSUER`                               |
-| `AUTH_DISCOVERY_URL`    | `<IDP_ISSUER>/.well-known/openid-configuration`     |
-| `AUTH_CLIENT_ID`        | `rego-adventure` (public client, = `IDP_CLIENT_ID`) |
-| `AUTH_AUDIENCE`         | `rego-adventure` (public client, = `IDP_AUDIENCE`)  |
+| Client setting      | Value                                            |
+| ------------------- | ------------------------------------------------ |
+| Issuer / authority  | minidp's `IDP_ISSUER`                            |
+| Discovery           | `<IDP_ISSUER>/.well-known/openid-configuration`  |
+| `client_id`         | `IDP_CLIENT_ID` (default `demo-app`)             |
+| Redirect URI        | one of `ALLOWED_REDIRECTS` (exact match)         |
+| Scopes              | `openid profile email`                           |
+| PKCE                | `S256` (mandatory in `public` mode)              |
 
-The frontend performs the PKCE code exchange directly against minidp (CORS is
-enabled for this); the backend validates the Bearer JWT against minidp's JWKS.
-The SPA should request `openid profile email` — claims are released strictly
-by scope: `profile` unlocks `preferred_username`/`name` (on both tokens and
-`/userinfo`), `email` unlocks the `email` claim, and a token without the
-`openid` scope cannot call `/userinfo`.
+The browser SPA performs the PKCE code exchange directly against minidp (CORS
+is enabled for this); a backend resource server validates the Bearer JWT
+against minidp's JWKS (`/jwks`) and rejects tokens whose `aud` does not equal
+`IDP_AUDIENCE`. The SPA should request `openid profile email` — claims are
+released strictly by scope: `profile` unlocks `preferred_username`/`name` (on
+both tokens and `/userinfo`), `email` unlocks the `email` claim, and a token
+without the `openid` scope cannot call `/userinfo`.
 Roles set on the users-file record are released as the `roles` array claim on
 both tokens independent of the scopes.
+
+## Login page branding
+
+The login page ships with the embedded **Deep Water** theme (light and dark
+mode, following the OS `prefers-color-scheme`) and an embedded logo. Both can
+be replaced without rebuilding: at startup minidp checks the fixed directory
+`assets/` relative to its working directory and overrides per file.
+
+| File               | Overrides                   |
+| ------------------ | --------------------------- |
+| `assets/login.css` | the `/login.css` stylesheet |
+| `assets/logo.svg`  | the `/logo.svg` logo, favicon |
+
+- **Per-file fallback**: a missing file keeps the embedded default, so
+  mounting only a logo is enough.
+- Files are read **once at startup** (2 MiB limit each) and cached in memory;
+  changes take effect on restart.
+- The location is a **compiled-in constant** — there is no environment
+  variable for paths. In the container the working directory is `/app`, so the
+  mount point is `/app/assets` (Docker: `-v ./assets:/app/assets:ro`;
+  Kubernetes: mount a ConfigMap there, see `deploy/k8s/minidp.yaml`).
+- The page title and subtitle come from `IDP_TITLE` / `IDP_SUBTITLE`.
+
+An override that exists but cannot be read (e.g. wrong permissions) aborts
+startup: a mount the operator meant to take effect must never degrade into
+silence.
 
 ## Accounts: the users file
 
@@ -299,21 +333,23 @@ Notes:
 
 ## Deployment
 
-**Docker Compose** — the quickest way to a complete demo: the stack pairs
-minidp with [rego-adventure](https://github.com/ghmer/rego-adventure)
-`v2.2.0`, pre-wired for the PKCE flow (`IDP_CLIENT_ID=rego-adventure`,
-audience enforced, discovery via the compose network, the app's redirect URI
-registered). The bundled `users.json` (rego / **adventure** — demo only, the
-container mounts it read-only) provides the account:
+**Docker** — build the image and run it with the mandatory files mounted:
 
 ```sh
-docker compose up -d --build
-# App:      http://localhost:3000  (sign in with rego / adventure)
-# IdP:      http://localhost:8080
+docker build -t minidp .
+docker run -d --name minidp -p 8080:8080 \
+  -e IDP_ISSUER=http://localhost:8080 \
+  -e IDP_USERS_FILE=/config/users.json \
+  -e ALLOWED_REDIRECTS=http://localhost:3000/callback \
+  -v "$PWD/users.json:/config/users.json:ro" \
+  -v minidp-data:/data \
+  minidp
+# IdP: http://localhost:8080
 ```
 
-For a non-localhost deployment override the public URLs:
-`IDP_ISSUER=https://idp.example.com APP_DOMAIN=https://adventure.example.com`.
+For a non-localhost deployment override the public URL:
+`IDP_ISSUER=https://idp.example.com`, and register the client's public
+redirect URI in `ALLOWED_REDIRECTS`.
 
 **Kubernetes**: `deploy/k8s/minidp.yaml` ships a hardened Deployment (non-root,
 read-only root filesystem, dropped capabilities, probes, resource limits) plus
@@ -386,6 +422,6 @@ mandatory — never run the suite without `-timeout`.
 
 ## Attribution
 
-The login page styling is derived from the Rego Adventure frontend theme and
-the logo is taken from the Rego Adventure project (© Mario Enrico Ragucci,
-Apache License 2.0).
+The embedded login page logo is taken from the Rego Adventure project
+(© Mario Enrico Ragucci, Apache License 2.0). The default login page styling
+is minidp's own "Deep Water" theme.

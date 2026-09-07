@@ -2,8 +2,12 @@ package idp
 
 import (
 	"embed"
+	"errors"
+	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
+	"os"
 )
 
 // The static assets of the login page are embedded into the binary so the IdP
@@ -11,6 +15,63 @@ import (
 //
 //go:embed web/login.html web/login.css web/logo.svg
 var webFS embed.FS
+
+// assetDir is the fixed location — relative to the process working directory —
+// where operators can place files that override the embedded login page
+// assets. It is a compiled-in constant, not an environment variable: there is
+// no configuration surface for file paths, and mounting is the operator's one
+// and only job (Docker volume, Kubernetes volume at <workdir>/assets, or a
+// plain directory when running the binary directly).
+const assetDir = "assets"
+
+// assetOverrideLimit caps the size of an operator-provided asset override so
+// an accidentally mounted huge file cannot exhaust memory at startup.
+const assetOverrideLimit = 2 << 20 // 2 MiB
+
+// loadAsset returns the operator-provided override for an embedded login page
+// asset, or the embedded default when no override exists. Each present file in
+// assetDir replaces exactly its own embedded default; everything else keeps
+// the shipped version. Semantics are strict about operator intent: a missing
+// asset directory or file silently falls back to the embedded default, but an
+// override that exists and cannot be read (e.g. permission denied) fails the
+// startup — a mount the operator meant to take effect must never degrade into
+// silence.
+func loadAsset(name, embedded string) ([]byte, error) {
+	data, err := readAssetOverride(name)
+	if err != nil {
+		return nil, err
+	}
+	if data != nil {
+		return data, nil
+	}
+	return webFS.ReadFile(embedded)
+}
+
+// readAssetOverride reads a single override file from assetDir through os.Root
+// so the lookup is confined to that directory. It returns (nil, nil) when
+// there is nothing to override.
+func readAssetOverride(name string) ([]byte, error) {
+	root, err := os.OpenRoot(assetDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open %s: %w", assetDir, err)
+	}
+	defer root.Close() //nolint:errcheck // read-only handle; close error is not actionable
+	data, err := root.ReadFile(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read asset override %s/%s: %w", assetDir, name, err)
+	}
+	if len(data) > assetOverrideLimit {
+		return nil, fmt.Errorf("asset override %s/%s is %d bytes, the limit is %d", assetDir, name, len(data), assetOverrideLimit)
+	}
+	slog.Info("using login page asset override", "path", assetDir+"/"+name, "bytes", len(data))
+	return data, nil
+}
 
 // loginTemplate wraps the parsed login page template together with its static
 // assets.
@@ -43,7 +104,7 @@ type loginData struct {
 	Hidden []loginField
 	// CSRFToken is the signed form token; rendered as a hidden input.
 	CSRFToken string
-	// Message, when set, replaces the form (e.g. "Signed in as rego").
+	// Message, when set, replaces the form (e.g. "Signed in as alice").
 	Message string
 }
 
@@ -52,11 +113,11 @@ func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
-	css, err := webFS.ReadFile("web/login.css")
+	css, err := loadAsset("login.css", "web/login.css")
 	if err != nil {
 		return nil, err
 	}
-	logo, err := webFS.ReadFile("web/logo.svg")
+	logo, err := loadAsset("logo.svg", "web/logo.svg")
 	if err != nil {
 		return nil, err
 	}

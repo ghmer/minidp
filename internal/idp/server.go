@@ -245,7 +245,7 @@ const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'se
 	"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 
 // withCORS wraps next with security headers and CORS handling. Browser-based
-// clients (e.g. oidc-client-ts in rego-adventure) exchange the code for tokens
+// clients (e.g. SPAs using oidc-client-ts) exchange the code for tokens
 // cross-origin with credentials, which disallows a wildcard — so the request
 // Origin is reflected ONLY when it is on the allowlist (hosts of the
 // ALLOWED_REDIRECTS entries plus IDP_ALLOWED_ORIGINS). Any other origin

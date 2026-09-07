@@ -67,7 +67,7 @@ func TestLoadUsersErrors(t *testing.T) {
 		"empty array":         `[]`,
 		"empty username":      `[{"username": "  ", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]`,
 		"whitespace username": `[{"username": " alice ", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]`,
-		"plaintext password":  `[{"username": "alice", "password_hash": "adventure"}]`,
+		"plaintext password":  `[{"username": "alice", "password_hash": "demo-password"}]`,
 		"truncated hash":      `[{"username": "alice", "password_hash": "$2a$10$short"}]`,
 		"duplicate users": `[{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"},` +
 			`{"username": "alice", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]`,

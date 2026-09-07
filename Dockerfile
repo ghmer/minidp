@@ -22,6 +22,10 @@ RUN addgroup -g 10001 minidp \
 
 COPY --from=build /minidp /usr/local/bin/minidp
 
+# Workdir anchors the fixed assets location: mounting login.css / logo.svg at
+# /app/assets overrides the embedded login page branding per file (see README).
+WORKDIR /app
+
 USER 10001:10001
 
 ENV IDP_KEY_DIR=/data

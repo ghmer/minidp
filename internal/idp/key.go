@@ -245,7 +245,7 @@ type jwk struct {
 }
 
 // JWKS returns the JSON Web Key Set containing the public half of the signing
-// key. This is what the rego-adventure back-end pulls from AUTH_DISCOVERY_URL's
+// key. This is what resource servers pull via the discovery document's
 // jwks_uri to verify token signatures.
 func (k *signingKey) JWKS() []byte {
 	pub := &k.key.PublicKey

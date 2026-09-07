@@ -2,10 +2,11 @@
 // Authorization Code flow with PKCE for public clients and, in
 // MINIDP_MODE=confidential, the confidential-client flow with client
 // authentication (client_secret_basic / client_secret_post) at the token
-// endpoint. It is designed to be
-// drop-in compatible with the OAuth2/OIDC client used by
-// github.com/ghmer/rego-adventure (oidc-client-ts on the front-end, JWKS-based
-// validation on the back-end).
+// endpoint. It implements the standard endpoints (discovery, JWKS, userinfo,
+// introspection, revocation) so any standards-compliant OAuth2/OIDC client
+// library works out of the box — browser SPAs using libraries such as
+// oidc-client-ts as well as backend resource servers that validate tokens
+// against the published JWKS.
 package idp
 
 import (
@@ -44,8 +45,9 @@ type Config struct {
 	// Port is the TCP port the HTTP server listens on.
 	Port string
 	// Issuer is the authoritative "iss" value written into every JWT and
-	// published in the discovery document. rego-adventure compares this against
-	// its AUTH_ISSUER, so it must line up with whatever the relying party expects.
+	// published in the discovery document. Relying parties compare it against
+	// the issuer they configured, so it must line up with whatever the client
+	// expects.
 	Issuer string
 	// ClientID is the one registered OAuth client (IDP_CLIENT_ID). minidp is a
 	// single-client provider for public PKCE clients: only this client_id is
@@ -75,7 +77,7 @@ type Config struct {
 	// Only allowlisted origins are reflected with credentials; any other
 	// Origin header receives no CORS grant at all.
 	AllowedOrigins []string
-	// Title / Subtitle are rendered on rego-adventure-styled login form.
+	// Title / Subtitle are rendered on the login form.
 	Title    string
 	Subtitle string
 	// RSAPeM, when set, is a path to a PKCS#1/PKCS#8 PEM private key. It takes
@@ -109,8 +111,8 @@ type Config struct {
 	LoginRateLimit int
 }
 
-// LoadConfig builds a Config from environment variables, applying the documented
-// rego-adventure-compatible defaults. It fails fast on misconfiguration that
+// LoadConfig builds a Config from environment variables, applying the
+// documented defaults. It fails fast on misconfiguration that
 // would silently weaken security (no redirect policy, no users file, removed
 // legacy variables, unreadable secret files, invalid proxy CIDRs).
 func LoadConfig() (Config, error) {
@@ -121,9 +123,9 @@ func LoadConfig() (Config, error) {
 	if err := cfg.validateMode(); err != nil {
 		return cfg, err
 	}
-	// The token audience defaults to the registered client id, matching what
-	// rego-adventure expects (AUTH_AUDIENCE = AUTH_CLIENT_ID). A distinct
-	// resource audience can be configured with IDP_AUDIENCE.
+	// The token audience defaults to the registered client id, matching the
+	// common client expectation audience = client_id. A distinct resource
+	// audience can be configured with IDP_AUDIENCE.
 	cfg.Audience = envOr("IDP_AUDIENCE", cfg.ClientID)
 	if err := cfg.loadRedirectPolicy(); err != nil {
 		return cfg, err
@@ -164,12 +166,12 @@ func baseConfig() (Config, error) {
 		Host:            envOr("IDP_HOST", "0.0.0.0"),
 		Port:            envOr("IDP_PORT", "8080"),
 		Issuer:          envOr("IDP_ISSUER", "http://localhost:8080"),
-		ClientID:        envOr("IDP_CLIENT_ID", "rego-adventure"),
+		ClientID:        envOr("IDP_CLIENT_ID", "demo-app"),
 		Mode:            ClientMode(os.Getenv("MINIDP_MODE")),
 		AccessTokenTTL:  accessTokenTTL,
 		RefreshTokenTTL: refreshTokenTTL,
-		Title:           envOr("IDP_TITLE", "Rego Adventure"),
-		Subtitle:        envOr("IDP_SUBTITLE", "Sign in to begin the adventure"),
+		Title:           envOr("IDP_TITLE", "minidp"),
+		Subtitle:        envOr("IDP_SUBTITLE", "Sign in to continue"),
 		RSAPeM:          os.Getenv("IDP_RSA_PEM"),
 		KeyDir:          os.Getenv("IDP_KEY_DIR"),
 		LoginRateLimit:  loginRateLimit,

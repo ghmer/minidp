@@ -1068,13 +1068,15 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStaticCSS serves the embedded rego-adventure themed stylesheet.
+// handleStaticCSS serves the active login stylesheet: the embedded default or
+// an operator-provided override from the assets directory.
 func (s *Server) handleStaticCSS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	_, _ = w.Write(s.template.css)
 }
 
-// handleStaticLogo serves the embedded Rego Adventure logo.
+// handleStaticLogo serves the active logo: the embedded default or an
+// operator-provided override from the assets directory.
 func (s *Server) handleStaticLogo(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
 	_, _ = w.Write(s.template.logo)

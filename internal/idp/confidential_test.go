@@ -104,7 +104,7 @@ func TestConfidentialDiscoveryAdvertisesClientAuth(t *testing.T) {
 func TestConfidentialFullFlowWithoutPKCE(t *testing.T) {
 	ts, _ := testConfidentialIDP(t, "a-confidential-secret")
 
-	location := loginNoPKCE(t, ts.URL, "rego", "adventure")
+	location := loginNoPKCE(t, ts.URL, "demo", "demo-password")
 	if !strings.HasPrefix(location, testRedirect+"?code=") {
 		t.Fatalf("redirect %q does not start with %s?code=", location, testRedirect)
 	}
@@ -123,8 +123,8 @@ func TestConfidentialFullFlowWithoutPKCE(t *testing.T) {
 		t.Fatalf("expected all three tokens, got %v", tokens)
 	}
 	claims := verifyTokenString(t, tokens["access_token"].(string), ts.URL)
-	if claims["sub"] != "rego" {
-		t.Errorf("access sub = %v, want rego", claims["sub"])
+	if claims["sub"] != "demo" {
+		t.Errorf("access sub = %v, want demo", claims["sub"])
 	}
 }
 
@@ -134,7 +134,7 @@ func TestConfidentialFullFlowWithoutPKCE(t *testing.T) {
 func TestConfidentialWithPKCEStillAccepted(t *testing.T) {
 	ts, _ := testConfidentialIDP(t, "a-confidential-secret")
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	resp := postTokenBasic(t, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},
@@ -184,7 +184,7 @@ func TestConfidentialTokenRequiresClientAuth(t *testing.T) {
 	// under test (failed client auth must not burn it, which is pinned
 	// separately in TestConfidentialFailedAuthDoesNotBurnCode).
 	freshCode := func() string {
-		return codeFrom(t, loginNoPKCE(t, ts.URL, "rego", "adventure"))
+		return codeFrom(t, loginNoPKCE(t, ts.URL, "demo", "demo-password"))
 	}
 	grant := func(code string) url.Values {
 		return url.Values{
@@ -249,7 +249,7 @@ func TestConfidentialTokenRequiresClientAuth(t *testing.T) {
 // §4.4.1).
 func TestConfidentialFailedAuthDoesNotBurnCode(t *testing.T) {
 	ts, _ := testConfidentialIDP(t, "a-confidential-secret")
-	code := codeFrom(t, loginNoPKCE(t, ts.URL, "rego", "adventure"))
+	code := codeFrom(t, loginNoPKCE(t, ts.URL, "demo", "demo-password"))
 	grant := url.Values{
 		"grant_type":   {"authorization_code"},
 		"code":         {code},
@@ -271,7 +271,7 @@ func TestConfidentialFailedAuthDoesNotBurnCode(t *testing.T) {
 // secret must not consume (and thereby destroy) a valid refresh token.
 func TestConfidentialRefreshRequiresAuth(t *testing.T) {
 	ts, _ := testConfidentialIDP(t, "a-confidential-secret")
-	code := codeFrom(t, loginNoPKCE(t, ts.URL, "rego", "adventure"))
+	code := codeFrom(t, loginNoPKCE(t, ts.URL, "demo", "demo-password"))
 
 	first := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
 		"grant_type":   {"authorization_code"},
@@ -323,7 +323,7 @@ func TestConfidentialRefreshRequiresAuth(t *testing.T) {
 func TestConfidentialBasicAuthDecodesURLEncodedCredentials(t *testing.T) {
 	const secret = "s3cret/+=&" // contains characters urlencoding must survive
 	ts, _ := testConfidentialIDP(t, secret)
-	code := codeFrom(t, loginNoPKCE(t, ts.URL, "rego", "adventure"))
+	code := codeFrom(t, loginNoPKCE(t, ts.URL, "demo", "demo-password"))
 
 	// Build the header exactly as RFC 6749 §2.3.1 prescribes:
 	// form-urlencoded credentials joined with ":" and base64-encoded.
@@ -358,7 +358,7 @@ func TestConfidentialBasicAuthDecodesURLEncodedCredentials(t *testing.T) {
 func TestPublicModeIgnoresClientSecretField(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()
-	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 
 	resp := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"authorization_code"},

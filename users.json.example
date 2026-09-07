@@ -1,0 +1,11 @@
+[
+  {
+    "username": "alice",
+    "password_hash": "$2a$10$0ecstAFvqx0L17k1.Z9xxekrZ9IUw1aCZq7TQ..WncFThzRIVQhOa",
+    "email": "alice@example.local",
+    "name": "Alice Wilkins",
+    "roles": [
+      "user"
+    ]
+  }
+]
