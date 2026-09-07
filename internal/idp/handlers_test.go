@@ -19,25 +19,62 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// testIDP spins up a real HTTP test server. The listener is created first so
-// the issuer URL is known before the Server (which signs tokens with it) is
-// constructed. The default client registration matches the authorize helpers
-// below; mutate the Config for other cases.
+// testPublicClient returns the default registered client of the test IdPs: a
+// public client with the shared redirect URI (also registered as its
+// post-logout target) and the demo account.
+func testPublicClient(t *testing.T) Client {
+	t.Helper()
+	return Client{
+		ClientID:               testClientID,
+		Type:                   TypePublic,
+		RedirectURIs:           []string{testRedirect},
+		PostLogoutRedirectURIs: []string{testRedirect},
+		Users: []User{
+			{Username: "demo", PasswordHash: testHash(t, "demo-password"), Email: "demo@example.com", Name: "Demo User"},
+		},
+	}
+}
+
+// testConfidentialClient returns the default client registration as a
+// confidential client with the given secret.
+func testConfidentialClient(t *testing.T, secret string) Client {
+	t.Helper()
+	c := testPublicClient(t)
+	c.Type = TypeConfidential
+	c.ClientSecret = secret
+	return c
+}
+
+// testIDP spins up a real HTTP test server with the default client
+// registration. The listener is created first so the issuer URL is known
+// before the Server (which signs tokens with it) is constructed. Use
+// testIDPClients for other client registrations.
 func testIDP(t *testing.T, mutate func(*Config)) (*httptest.Server, *Server) {
+	t.Helper()
+	return testIDPClients(t, nil, mutate)
+}
+
+// testIDPClients spins up a real HTTP test server with explicit client
+// registrations (the default single public client when nil).
+func testIDPClients(t *testing.T, clients []Client, mutate func(*Config)) (*httptest.Server, *Server) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	if clients == nil {
+		clients = []Client{testPublicClient(t)}
+	}
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	if err := SaveClients(clientsFile, clients); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
 	cfg := Config{
-		Host:             "127.0.0.1",
-		ClientID:         testClientID,
-		Audience:         testClientID,
-		UsersFile:        writeUsersFile(t),
-		AllowedRedirects: []string{testRedirect},
-		Issuer:           "http://" + ln.Addr().String(),
-		AccessTokenTTL:   time.Hour,
-		RefreshTokenTTL:  2 * time.Hour,
+		Host:           "127.0.0.1",
+		ClientsFile:    clientsFile,
+		Issuer:         "http://" + ln.Addr().String(),
+		AccessTokenTTL: time.Hour,
+		RefreshTokenTTL: 2 * time.Hour,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -1135,7 +1172,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 	expired := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
 		"sub": "demo",
-		"aud": srv.cfg.Audience,
+		"aud": testClientID,
 		"exp": time.Now().Add(-time.Minute).Unix(),
 		"iat": time.Now().Add(-time.Hour).Unix(),
 		"sid": realSID,
@@ -1152,15 +1189,12 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 	familyAlive(http.StatusUnauthorized)
 }
 
-// TestIntrospectRevokeClientAuth pins the review fix: in confidential mode
-// (MINIDP_MODE=confidential with IDP_CLIENT_SECRET), /introspect and /revoke
-// require client authentication. The token redemption inside also exercises
-// the client_secret_post method at /token.
+// TestIntrospectRevokeClientAuth pins the review fix: when the deployment
+// has a confidential client, /introspect and /revoke require client
+// authentication. The token redemption inside also exercises the
+// client_secret_post method at /token.
 func TestIntrospectRevokeClientAuth(t *testing.T) {
-	ts, _ := testIDP(t, func(c *Config) {
-		c.Mode = ModeConfidential
-		c.ClientSecret = "s3cret"
-	})
+	ts, _ := testIDPClients(t, []Client{testConfidentialClient(t, "s3cret")}, nil)
 	verifier, _ := pkcePair()
 	code := codeFrom(t, login(t, ts.URL, "demo", "demo-password", verifier))
 	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
@@ -1198,18 +1232,20 @@ func TestIntrospectRevokeClientAuth(t *testing.T) {
 		t.Errorf("introspect with basic auth: status = %d, want 200", resp.StatusCode)
 	}
 
-	// A client_secret form field is accepted as well.
+	// A client_id/client_secret form pair is accepted as well.
 	resp2 := postForm(t, http.DefaultClient, ts.URL+"/revoke", url.Values{
 		"token":         {access},
+		"client_id":     {testClientID},
 		"client_secret": {"s3cret"},
 	})
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("revoke with form secret: status = %d, want 200", resp2.StatusCode)
 	}
 
-	// A wrong secret is rejected.
+	// A wrong secret (with the correct client_id) is rejected.
 	resp3 := postForm(t, http.DefaultClient, ts.URL+"/introspect", url.Values{
 		"token":         {access},
+		"client_id":     {testClientID},
 		"client_secret": {"wrong"},
 	})
 	if resp3.StatusCode != http.StatusUnauthorized {
@@ -1219,8 +1255,11 @@ func TestIntrospectRevokeClientAuth(t *testing.T) {
 }
 
 func TestEndSessionRequiresAllowlist(t *testing.T) {
-	// Without an allowlist, no redirect may happen (open-redirect hardening).
-	ts, _ := testIDP(t, nil)
+	// Without a post-logout allowlist, no redirect may happen (open-redirect
+	// hardening): the page is rendered instead.
+	client := testPublicClient(t)
+	client.PostLogoutRedirectURIs = nil
+	ts, _ := testIDPClients(t, []Client{client}, nil)
 	resp, err := http.Get(ts.URL + "/end_session?post_logout_redirect_uri=" + url.QueryEscape("https://evil.example.com/"))
 	if err != nil {
 		t.Fatalf("GET /end_session: %v", err)
@@ -1230,11 +1269,12 @@ func TestEndSessionRequiresAllowlist(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (page, not redirect)", resp.StatusCode)
 	}
 
-	// With an allowlist, exact matches redirect to the allowlist entry.
-	ts2, _ := testIDP(t, func(c *Config) {
-		c.AllowedRedirects = []string{testRedirect}
-	})
-	req, err := http.NewRequest(http.MethodGet, ts2.URL+"/end_session?post_logout_redirect_uri="+url.QueryEscape(testRedirect), nil)
+	// With an allowlist, exact matches redirect to the allowlist entry. The
+	// client is resolved from the client_id parameter (an id_token_hint's
+	// audience is the other way to resolve it).
+	ts2, _ := testIDP(t, nil)
+	req, err := http.NewRequest(http.MethodGet,
+		ts2.URL+"/end_session?client_id="+url.QueryEscape(testClientID)+"&post_logout_redirect_uri="+url.QueryEscape(testRedirect), nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -1256,36 +1296,37 @@ func base64Decode(s string) ([]byte, error) {
 
 func TestRedirectURIAllowed(t *testing.T) {
 	// With a registered policy, only exactly listed URIs pass.
-	_, srv2 := testIDP(t, func(c *Config) {
-		c.AllowedRedirects = []string{testRedirect}
-	})
-	if !srv2.redirectURIAllowed(testRedirect) {
+	_, srv2 := testIDP(t, nil)
+	client := srv2.clients.lookup(testClientID)
+	if client == nil {
+		t.Fatal("the default client must be registered")
+	}
+	if !client.redirectURIAllowed(testRedirect) {
 		t.Error("registered URI must be allowed")
 	}
-	if srv2.redirectURIAllowed("https://other.example.com/cb") {
+	if client.redirectURIAllowed("https://other.example.com/cb") {
 		t.Error("non-registered URI must be rejected")
 	}
-	if srv2.redirectURIAllowed(testRedirect + "#frag") {
+	if client.redirectURIAllowed(testRedirect + "#frag") {
 		t.Error("a URI with a fragment must be rejected")
 	}
-	if srv2.redirectURIAllowed("javascript:alert(1)") {
+	if client.redirectURIAllowed("javascript:alert(1)") {
 		t.Error("non-http schemes must be rejected")
 	}
-	if srv2.redirectURIAllowed("not a url") {
+	if client.redirectURIAllowed("not a url") {
 		t.Error("garbage redirect URIs must be rejected")
 	}
 
-	// There is no open fallback: without a policy nothing is allowed (the
-	// server refuses to start this way; this only pins the check).
-	_, srv3 := testIDP(t, func(c *Config) { c.AllowedRedirects = nil })
-	if srv3.redirectURIAllowed(testRedirect) {
-		t.Error("an empty policy must allow nothing")
+	// An unregistered client has no redirect policy at all; the lookup
+	// itself is what rejects such requests at /authorize.
+	if srv2.clients.lookup("other-app") != nil {
+		t.Error("an unknown client_id must not resolve")
 	}
 }
 
 func TestCORS(t *testing.T) {
-	// With a redirect allowlist, its hosts are credited as CORS origins.
-	ts, _ := testIDP(t, func(c *Config) { c.AllowedRedirects = []string{testRedirect} })
+	// With a registered redirect, its host is credited as a CORS origin.
+	ts, _ := testIDP(t, nil)
 	allowedOrigin := "http://localhost:3000" // derived from testRedirect
 	req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/token", nil)
 	req.Header.Set("Origin", allowedOrigin)
@@ -1323,7 +1364,7 @@ func TestCORS(t *testing.T) {
 // on the allowlist (redirect hosts + IDP_ALLOWED_ORIGINS) must never be
 // reflected, let alone with credentials.
 func TestCORSRejectsArbitraryOrigins(t *testing.T) {
-	ts, _ := testIDP(t, func(c *Config) { c.AllowedRedirects = []string{testRedirect} })
+	ts, _ := testIDP(t, nil)
 	for _, origin := range []string{"https://evil.example.com", "http://localhost:3000.evil.com"} {
 		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/.well-known/openid-configuration", nil)
 		req.Header.Set("Origin", origin)
@@ -1355,10 +1396,12 @@ func TestCORSRejectsArbitraryOrigins(t *testing.T) {
 	}
 }
 
-// TestCORSExplicitOrigins covers the IDP_ALLOWED_ORIGINS escape hatch for
-// origins that have no corresponding redirect allowlist entry.
+// TestCORSExplicitOrigins covers the per-client allowed_origins escape hatch
+// for origins that have no corresponding redirect entry.
 func TestCORSExplicitOrigins(t *testing.T) {
-	ts, _ := testIDP(t, func(c *Config) { c.AllowedOrigins = []string{"https://spa.example.com"} })
+	client := testPublicClient(t)
+	client.AllowedOrigins = []string{"https://spa.example.com"}
+	ts, _ := testIDPClients(t, []Client{client}, nil)
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
 	req.Header.Set("Origin", "https://spa.example.com")
 	resp, err := http.DefaultClient.Do(req)
@@ -1371,9 +1414,11 @@ func TestCORSExplicitOrigins(t *testing.T) {
 	}
 }
 
-func TestLandingAndBareLogin(t *testing.T) {
+func TestLandingPage(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 
+	// The landing page is an info page: sign-in happens through a client's
+	// /authorize flow, so there is no standalone login form here.
 	resp, err := http.Get(ts.URL + "/")
 	if err != nil {
 		t.Fatalf("GET /: %v", err)
@@ -1382,24 +1427,22 @@ func TestLandingAndBareLogin(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /: status = %d", resp.StatusCode)
 	}
-
-	form := url.Values{"username": {"demo"}, "password": {"demo-password"}}
-	browser := newBrowser()
-	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/", url.Values{}))
-	ok := postForm(t, browser, ts.URL+"/login", form)
-	if ok.StatusCode != http.StatusOK {
-		t.Fatalf("POST /login: status = %d", ok.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "identity provider") || !strings.Contains(string(body), "/authorize") {
+		t.Errorf("landing page must explain where sign-in happens, got %q", body)
 	}
-	body, _ := io.ReadAll(ok.Body)
-	if !strings.Contains(string(body), "Signed in as demo") {
-		t.Errorf("expected a signed-in confirmation, got %q", body)
+	if strings.Contains(string(body), `type="password"`) {
+		t.Error("the landing page must not render a credential form")
 	}
 
-	form.Set("password", "nope")
-	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/", url.Values{}))
-	bad := postForm(t, browser, ts.URL+"/login", form)
-	if bad.StatusCode != http.StatusUnauthorized {
-		t.Errorf("POST /login with wrong password: status = %d, want 401", bad.StatusCode)
+	// POST /login is no longer a routed endpoint.
+	login, err := http.Post(ts.URL+"/login", "application/x-www-form-urlencoded", strings.NewReader("username=demo"))
+	if err != nil {
+		t.Fatalf("POST /login: %v", err)
+	}
+	defer func() { _ = login.Body.Close() }()
+	if login.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /login: status = %d, want 405", login.StatusCode)
 	}
 }
 
@@ -1797,19 +1840,22 @@ func TestClientIPResistsSpoofedXFF(t *testing.T) {
 	}
 }
 
-// TestMultiUserFlow drives the complete PKCE flow for two users from a users
-// file and asserts that each token carries the right subject and profile.
+// TestMultiUserFlow drives the complete PKCE flow for two users registered
+// for one client and asserts that each token carries the right subject and
+// profile.
 func TestMultiUserFlow(t *testing.T) {
-	usersFile := filepath.Join(t.TempDir(), "users.json")
-	if err := SaveUsers(usersFile, []User{
-		{Username: "alice", PasswordHash: testHash(t, "wonderland"), Email: "alice@wonderland.example", Name: "Alice"},
-		{Username: "bob", PasswordHash: testHash(t, "builder")},
-	}); err != nil {
-		t.Fatalf("SaveUsers: %v", err)
+	// A client with exactly two users: the demo account of the default test
+	// client registration must not exist here.
+	client := Client{
+		ClientID:     testClientID,
+		Type:         TypePublic,
+		RedirectURIs: []string{testRedirect},
+		Users: []User{
+			{Username: "alice", PasswordHash: testHash(t, "wonderland"), Email: "alice@wonderland.example", Name: "Alice"},
+			{Username: "bob", PasswordHash: testHash(t, "builder")},
+		},
 	}
-	ts, _ := testIDP(t, func(c *Config) {
-		c.UsersFile = usersFile
-	})
+	ts, _ := testIDPClients(t, []Client{client}, nil)
 
 	redeem := func(user, pass, verifier string) map[string]any {
 		code := codeFrom(t, login(t, ts.URL, user, pass, verifier))

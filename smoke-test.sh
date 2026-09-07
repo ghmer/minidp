@@ -1,12 +1,16 @@
 #!/bin/bash
-# End-to-end smoke test for minidp: full public-client PKCE flow.
-# Self-contained: builds the binaries, creates a users file and starts its own
-# IdP instance on port 8099.
+# End-to-end smoke test for minidp: multi-client OIDC/OAuth2 flows.
+# Self-contained: builds the binaries, creates a clients file (one public and
+# one confidential client, each with its own users) and starts its own IdP
+# instance on port 8099.
 set -euo pipefail
 
 BASE="http://localhost:8099"
-CLIENT="demo-app"
+CLIENT="demo-app"          # public client on instance 1
+CONF_CLIENT="conf-app"     # confidential client on instance 1
+CONF_SECRET="smoke-test-confidential-secret"
 REDIRECT="http://localhost:3000/callback"
+CONF_REDIRECT="https://conf.example.com/cb"
 VERIFIER=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
 CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
 STATE="st-123"
@@ -14,24 +18,20 @@ NONCE="n-abc"
 JAR=$(mktemp)
 
 # Fail fast when a previous (interrupted) run left an IdP bound to the smoke
-# ports: the health-check below would silently talk to that stale instance
-# (old code/users file) and every later assertion would mismatch.
-for port in 8099 8098; do
-  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "ERROR: port $port is already in use — a previous smoke-test run" >&2
-    echo "probably left a minidp instance behind. Kill it and retry:" >&2
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    exit 1
-  fi
-done
+# port: the health-check below would silently talk to that stale instance
+# (old code/clients file) and every later assertion would mismatch.
+if lsof -nP -iTCP:8099 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "ERROR: port 8099 is already in use — a previous smoke-test run" >&2
+  echo "probably left a minidp instance behind. Kill it and retry:" >&2
+  lsof -nP -iTCP:8099 -sTCP:LISTEN >&2
+  exit 1
+fi
 
-# Scratch files and both test instances are removed when the script exits
+# Scratch files and the test instance are removed when the script exits
 # (success or failure).
 cleanup() {
-  for pid in "${MINIDP_PID:-}" "${MINIDP2_PID:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
-  rm -rf "${JAR:-}" "${JAR2:-}" "${WORKDIR:-}"
+  [ -n "${MINIDP_PID:-}" ] && kill "$MINIDP_PID" 2>/dev/null || true
+  rm -rf "${JAR:-}" "${WORKDIR:-}"
   rm -f /tmp/login.html
 }
 trap cleanup EXIT
@@ -53,15 +53,25 @@ csrf_for() {
 
 AUTH_QUERY="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile%20email&state=$STATE&nonce=$NONCE&code_challenge=$CHALLENGE&code_challenge_method=S256"
 
-echo "== 0. build + boot a self-contained IdP instance =="
+echo "== 0. build + create the clients file + boot a self-contained IdP instance =="
 WORKDIR=$(mktemp -d)
 go build -o "$WORKDIR/minidp" .
-go build -o "$WORKDIR/minidp-users" ./cmd/minidp-users
-"$WORKDIR/minidp-users" add -file "$WORKDIR/users.json" -username demo \
+go build -o "$WORKDIR/clientctl" ./cmd/clientctl
+CTL="$WORKDIR/clientctl"
+CFILE="$WORKDIR/clients.json"
+"$CTL" client add -file "$CFILE" -client "$CLIENT" -type public \
+  -redirect "$REDIRECT" -post-logout "$REDIRECT" >/dev/null
+"$CTL" user add -file "$CFILE" -client "$CLIENT" -username demo \
   -password demo-password -email demo@example.com -roles user >/dev/null
+"$CTL" client add -file "$CFILE" -client "$CONF_CLIENT" -type confidential \
+  -secret "$CONF_SECRET" -redirect "$CONF_REDIRECT" \
+  -post-logout "https://conf.example.com/" >/dev/null
+"$CTL" user add -file "$CFILE" -client "$CONF_CLIENT" -username bob \
+  -password builder >/dev/null
+"$CTL" client list -file "$CFILE" >/dev/null && echo "clientctl: clients file created and listed"
 mkdir -p "$WORKDIR/keys"
-IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_USERS_FILE="$WORKDIR/users.json" \
-  ALLOWED_REDIRECTS="$REDIRECT" IDP_KEY_DIR="$WORKDIR/keys" \
+IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_CLIENTS_FILE="$CFILE" \
+  IDP_KEY_DIR="$WORKDIR/keys" \
   "$WORKDIR/minidp" >"$WORKDIR/minidp.log" 2>&1 &
 MINIDP_PID=$!
 for _ in $(seq 1 50); do
@@ -69,7 +79,7 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 curl -sf "$BASE/healthz" >/dev/null || { echo "IdP did not come up"; exit 1; }
-echo "IdP running on $BASE"
+echo "IdP running on $BASE (clients: $CLIENT public, $CONF_CLIENT confidential)"
 
 echo "== 1. discovery =="
 curl -s "$BASE/.well-known/openid-configuration" | python3 -c "
@@ -78,9 +88,12 @@ d=json.load(sys.stdin)
 assert d['issuer']=='$BASE', d['issuer']
 for k in ('authorization_endpoint','token_endpoint','jwks_uri','userinfo_endpoint'):
     assert k in d, k
+m=d['token_endpoint_auth_methods_supported']
+assert m==['none','client_secret_basic','client_secret_post'], m
 print('issuer:', d['issuer'])
 print('grant_types:', d['grant_types_supported'])
 print('pkce methods:', d['code_challenge_methods_supported'])
+print('client auth methods (union):', m)
 "
 
 echo "== 2. jwks =="
@@ -97,12 +110,16 @@ curl -s -c "$JAR" "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&resp
 grep -q 'name="code_challenge" value="'"$CHALLENGE"'"' /tmp/login.html && echo "PKCE challenge echoed into form"
 grep -q 'name="nonce" value="'"$NONCE"'"' /tmp/login.html && echo "nonce echoed into form"
 
-echo "== 3b. unknown client_id and unregistered redirect are rejected =="
-CSRF=$(csrf_for "$AUTH_QUERY")
+echo "== 3b. unknown client_id and unregistered redirects are rejected =="
 ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=other-app&redirect_uri=$REDIRECT&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
 [ "$ST" = "400" ] && echo "unknown client_id rejected (400) OK"
 ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=https://attacker.example/cb&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
 [ "$ST" = "400" ] && echo "unregistered redirect_uri rejected (400) OK"
+# Per-client redirect policies: neither client may use the other's URI.
+ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=$CONF_CLIENT&redirect_uri=$REDIRECT&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
+[ "$ST" = "400" ] && echo "conf-app with demo-app's redirect rejected (400) OK"
+ST=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$CONF_REDIRECT&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256")
+[ "$ST" = "400" ] && echo "demo-app with conf-app's redirect rejected (400) OK"
 # Unsupported scopes/params are answered with a redirect carrying the error.
 LOC=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/authorize?client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=user&code_challenge=$CHALLENGE&code_challenge_method=S256&state=$STATE")
 case "$LOC" in
@@ -130,6 +147,22 @@ LOC=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize"
   --data-urlencode "username=demo" \
   --data-urlencode "password=wrongpass")
 [ "$LOC" = "401" ] && echo "wrong password rejected (401) OK"
+
+echo "== 4b. per-client user isolation: demo-app's user cannot sign in to conf-app =="
+CSRF=$(csrf_for "client_id=$CONF_CLIENT&redirect_uri=$CONF_REDIRECT&response_type=code&scope=openid&state=si&nonce=ni&code_challenge=$CHALLENGE&code_challenge_method=S256")
+ST=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "client_id=$CONF_CLIENT" \
+  --data-urlencode "redirect_uri=$CONF_REDIRECT" \
+  --data-urlencode "response_type=code" \
+  --data-urlencode "scope=openid" \
+  --data-urlencode "state=si" \
+  --data-urlencode "nonce=ni" \
+  --data-urlencode "code_challenge=$CHALLENGE" \
+  --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=demo" \
+  --data-urlencode "password=demo-password")
+[ "$ST" = "401" ] && echo "user isolation across clients OK (401)"
 
 echo "== 5. POST /authorize with correct credentials =="
 CSRF=$(csrf_for "$AUTH_QUERY")
@@ -252,6 +285,38 @@ assert d['error']=='invalid_grant', d
 print('unknown client at /token rejected OK')
 "
 
+echo "== 10c. cross-client code redemption (theft signal) =="
+V4=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+C4=$(printf '%s' "$V4" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
+CSRF=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s5&nonce=n5&code_challenge=$C4&code_challenge_method=S256")
+LOC5=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRF" \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
+  --data-urlencode "response_type=code" --data-urlencode "scope=openid" \
+  --data-urlencode "state=s5" --data-urlencode "nonce=n5" \
+  --data-urlencode "code_challenge=$C4" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
+CODE5=$(printf '%s' "$LOC5" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
+# conf-app authenticates CORRECTLY but presents demo-app's code.
+RESP=$(curl -s -u "$CONF_CLIENT:$CONF_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=authorization_code&code=$CODE5&redirect_uri=$REDIRECT" \
+  --data-urlencode "code_verifier=$V4")
+echo "$RESP" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['error']=='invalid_grant', d
+print('cross-client code redemption rejected OK (invalid_grant)')
+"
+# The burned code cannot be replayed by anyone.
+RESP=$(curl -s -X POST "$BASE/token" -d "grant_type=authorization_code&code=$CODE5&client_id=$CLIENT&redirect_uri=$REDIRECT" \
+  --data-urlencode "code_verifier=$V4")
+echo "$RESP" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['error']=='invalid_grant', d
+print('code burned by the foreign redemption attempt OK')
+"
+
 echo "== 11. userinfo with a fresh token set =="
 # A fresh login: the replay above killed the previous family on purpose.
 V3=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
@@ -285,13 +350,17 @@ ST=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $IDTOK3" "
 echo "== 12. userinfo with garbage token (must 401) =="
 curl -s -o /dev/null -w 'userinfo bad token -> %{http_code}\n' -H "Authorization: Bearer garbage" "$BASE/userinfo"
 
-echo "== 13. introspect + revocation + logout =="
-curl -s -X POST "$BASE/introspect" -d "token=$AT" | python3 -c "
+echo "== 13. introspect + revocation require client auth (confidential client registered) =="
+ST=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/introspect" -d "token=$AT")
+[ "$ST" = "401" ] && echo "introspect without client auth rejected (401) OK"
+ST=$(curl -s -o /dev/null -w '%{http_code}' -u "$CONF_CLIENT:wrong-secret" -X POST "$BASE/introspect" -d "token=$AT")
+[ "$ST" = "401" ] && echo "introspect with wrong secret rejected (401) OK"
+curl -s -u "$CONF_CLIENT:$CONF_SECRET" -X POST "$BASE/introspect" -d "token=$AT" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert d['active'] is True and d['sub']=='demo', d
 assert d['aud']==['$CLIENT'], d
-print('introspect OK (active)')
+print('introspect with conf-app credentials OK (active)')
 "
 # Logout with the id_token_hint revokes the whole authorization: the access
 # token is denied by jti and the refresh token is deleted.
@@ -306,7 +375,7 @@ d=json.load(sys.stdin)
 assert d['error']=='invalid_grant', d
 print('refresh token revoked by logout OK')
 "
-# /revoke with an access token denies it immediately.
+# /revoke with an access token denies it immediately (client auth required).
 LOC4=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
   --data-urlencode "csrf_token=$(csrf_for "client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid&state=s4&nonce=n4&code_challenge=$C3&code_challenge_method=S256")" \
   --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$REDIRECT" \
@@ -318,7 +387,9 @@ CODE4=$(printf '%s' "$LOC4" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 AT4=$(curl -s -X POST "$BASE/token" \
   -d "grant_type=authorization_code&code=$CODE4&client_id=$CLIENT&redirect_uri=$REDIRECT" \
   --data-urlencode "code_verifier=$V3" | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
-curl -s -X POST "$BASE/revoke" -d "token=$AT4" -o /dev/null -w 'revoke access token -> %{http_code}\n'
+ST=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/revoke" -d "token=$AT4")
+[ "$ST" = "401" ] && echo "revoke without client auth rejected (401) OK"
+curl -s -u "$CONF_CLIENT:$CONF_SECRET" -X POST "$BASE/revoke" -d "token=$AT4" -o /dev/null -w 'revoke access token -> %{http_code}\n'
 curl -s -H "Authorization: Bearer $AT4" "$BASE/userinfo" -o /dev/null -w 'userinfo after revoke -> %{http_code}\n' | grep -q 401 \
   && echo "revoked access token rejected OK"
 
@@ -346,140 +417,100 @@ curl -s -b "$JAR" -o /dev/null -w 'POST /authorize without CSRF token -> %{http_
 curl -s -D - -o /dev/null -X POST "$BASE/token" -d "grant_type=refresh_token&refresh_token=x&client_id=$CLIENT" \
   | grep -qi "cache-control: no-store" && echo "token response Cache-Control: no-store OK"
 
-echo "== 18. minidp-users tool + a second users-file instance =="
-UFILE="$WORKDIR/users2.json"
-"$WORKDIR/minidp-users" add -file "$UFILE" -username alice -password wonderland -email alice@wonderland.example -name Alice -roles user,auditor >/dev/null
-"$WORKDIR/minidp-users" add -file "$UFILE" -username bob -password builder >/dev/null
-"$WORKDIR/minidp-users" list -file "$UFILE" | grep -q "^alice.*roles: user,auditor" && echo "tool: users added and listed"
-"$WORKDIR/minidp-users" update -file "$UFILE" -username alice -roles user >/dev/null && echo "tool: roles updated"
-"$WORKDIR/minidp-users" update -file "$UFILE" -username bob -password builder2 >/dev/null && echo "tool: password updated"
-"$WORKDIR/minidp-users" remove -file "$UFILE" -username bob >/dev/null && echo "tool: user removed"
-
-IDP_PORT=8098 IDP_ISSUER=http://localhost:8098 IDP_USERS_FILE="$UFILE" \
-  ALLOWED_REDIRECTS="$REDIRECT" "$WORKDIR/minidp" >"$WORKDIR/minidp2.log" 2>&1 &
-MINIDP2_PID=$!
-for _ in $(seq 1 50); do
-  curl -sf http://localhost:8098/healthz >/dev/null && break
-  sleep 0.2
-done
-
-BASE2="http://localhost:8098"
-V2=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
-C2=$(printf '%s' "$V2" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
-Q2="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile%20email&state=s9&nonce=n9&code_challenge=$C2&code_challenge_method=S256"
-JAR2=$(mktemp)
-CSRF2=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
-mark_jar_insecure "$JAR2"
-LOC9=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
-  --data-urlencode "csrf_token=$CSRF2" --data-urlencode "client_id=$CLIENT" \
-  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid profile email" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
-  --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=alice" --data-urlencode "password=wonderland")
-CODE9=$(printf '%s' "$LOC9" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
-TOK9=$(curl -s -X POST "$BASE2/token" \
-  -d "grant_type=authorization_code&code=$CODE9&client_id=$CLIENT&redirect_uri=$REDIRECT" \
-  --data-urlencode "code_verifier=$V2")
-printf '%s' "$TOK9" | python3 -c "
-import json,sys,base64
-d=json.load(sys.stdin)
-def claims(t):
-    p=t.split('.')[1]; p+='='*(-len(p)%4)
-    return json.loads(base64.urlsafe_b64decode(p))
-ac=claims(d['access_token']); ic=claims(d['id_token'])
-assert ac['sub']=='alice' and ic['sub']=='alice', (ac['sub'], ic['sub'])
-assert ic['email']=='alice@wonderland.example', ic['email']
-assert ic['name']=='Alice', ic.get('name')
-assert ac['roles']==['user'] and ic['roles']==['user'], ac.get('roles')
-print('multi-user: alice logged in, sub/email/name/roles claims correct')
-"
-
-# Credentials that are not in the users file must not authenticate.
-CSRF3=$(curl -s -c "$JAR2" "$BASE2/authorize?$Q2" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
-mark_jar_insecure "$JAR2"
-ST9=$(curl -s -b "$JAR2" -o /dev/null -w '%{http_code}' -X POST "$BASE2/authorize" \
-  --data-urlencode "csrf_token=$CSRF3" --data-urlencode "client_id=$CLIENT" \
-  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
-  --data-urlencode "scope=openid profile email" --data-urlencode "state=s9" --data-urlencode "nonce=n9" \
-  --data-urlencode "code_challenge=$C2" --data-urlencode "code_challenge_method=S256" \
-  --data-urlencode "username=demo" --data-urlencode "password=demo-password")
-if [ "$ST9" != "401" ]; then
-  echo "UNEXPECTED: unknown user in users-file mode -> $ST9 (want 401)"; exit 1
-fi
-echo "multi-user: unknown user rejected OK"
-kill "$MINIDP2_PID" 2>/dev/null || true
-
-echo
-echo "== 19. confidential mode (MINIDP_MODE=confidential): client auth at /token =="
-SECRET="smoke-test-confidential-secret"
-# The secret gates the token endpoint; the port is free again after instance 2.
-IDP_PORT=8098 IDP_ISSUER="$BASE2" IDP_USERS_FILE="$UFILE" \
-  ALLOWED_REDIRECTS="$REDIRECT" MINIDP_MODE=confidential IDP_CLIENT_SECRET="$SECRET" \
-  "$WORKDIR/minidp" >"$WORKDIR/minidp3.log" 2>&1 &
-MINIDP2_PID=$!
-for _ in $(seq 1 50); do
-  curl -sf "$BASE2/healthz" >/dev/null && break
-  sleep 0.2
-done
-curl -sf "$BASE2/healthz" >/dev/null || { echo "confidential IdP did not come up"; exit 1; }
-
-curl -s "$BASE2/.well-known/openid-configuration" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-m=d['token_endpoint_auth_methods_supported']
-assert m==['client_secret_basic','client_secret_post'], m
-print('discovery advertises client auth methods:', m)
-"
-
+echo "== 18. confidential client flow: no PKCE, client_secret_basic/post =="
 # Confidential clients may authorize WITHOUT PKCE.
-QC="client_id=$CLIENT&redirect_uri=$REDIRECT&response_type=code&scope=openid%20profile&state=sC&nonce=nC"
-CSRFC=$(curl -s -c "$JAR2" "$BASE2/authorize?$QC" | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
-mark_jar_insecure "$JAR2"
-LOCC=$(curl -s -b "$JAR2" -o /dev/null -w '%{redirect_url}' -X POST "$BASE2/authorize" \
-  --data-urlencode "csrf_token=$CSRFC" --data-urlencode "client_id=$CLIENT" \
-  --data-urlencode "redirect_uri=$REDIRECT" --data-urlencode "response_type=code" \
+QC="client_id=$CONF_CLIENT&redirect_uri=$CONF_REDIRECT&response_type=code&scope=openid%20profile&state=sC&nonce=nC"
+CSRFC=$(csrf_for "$QC")
+LOCC=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' -X POST "$BASE/authorize" \
+  --data-urlencode "csrf_token=$CSRFC" --data-urlencode "client_id=$CONF_CLIENT" \
+  --data-urlencode "redirect_uri=$CONF_REDIRECT" --data-urlencode "response_type=code" \
   --data-urlencode "scope=openid profile" --data-urlencode "state=sC" --data-urlencode "nonce=nC" \
-  --data-urlencode "username=alice" --data-urlencode "password=wonderland")
+  --data-urlencode "username=bob" --data-urlencode "password=builder")
 CODEC=$(printf '%s' "$LOCC" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')
 echo "authorize without PKCE OK (code issued)"
 
-# Without client credentials the token endpoint must reject with 401
-# invalid_client — and the code must survive the failed attempt.
-RESPC=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
-  -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$REDIRECT")
-[ "$RESPC" = "401" ] && echo "token without client auth rejected (401) OK"
-
+# Without client credentials (and without client_id) the request is missing a
+# required parameter — and the code must survive the failed attempt.
+RESPC=$(curl -s -X POST "$BASE/token" -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$CONF_REDIRECT")
+printf '%s' "$RESPC" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['error']=='invalid_request', d
+print('missing client_id answered invalid_request:', d['error'])
+"
 # With HTTP Basic credentials the code redeems, without any code_verifier.
-TOKC=$(curl -s -u "$CLIENT:$SECRET" -X POST "$BASE2/token" \
-  -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$REDIRECT")
-REFRESHC=$(printf '%s' "$TOKC" | python3 -c "
+TOKC=$(curl -s -u "$CONF_CLIENT:$CONF_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=authorization_code&code=$CODEC&redirect_uri=$CONF_REDIRECT")
+printf '%s' "$TOKC" | python3 -c "
 import json,sys,base64
 d=json.load(sys.stdin)
 def claims(t):
     p=t.split('.')[1]; p+='='*(-len(p)%4)
     return json.loads(base64.urlsafe_b64decode(p))
-ac=claims(d['access_token'])
-assert ac['sub']=='alice', ac
+def typ(t):
+    h=t.split('.')[0]; h+='='*(-len(h)%4)
+    return json.loads(base64.urlsafe_b64decode(h))['typ']
+ac=claims(d['access_token']); ic=claims(d['id_token'])
+assert ac['sub']=='bob', ac
+assert ac['aud']==['conf-app'] and ic['aud']==['conf-app'], 'conf-app audience by default'
+assert typ(d['access_token'])=='at+jwt', typ
 print('confidential code grant with client_secret_basic OK (no PKCE needed)')
-print(json.dumps(d))
-" | tail -1 | python3 -c "import sys,json;print(json.load(sys.stdin)['refresh_token'])")
+"
+REFRESHC=$(printf '%s' "$TOKC" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
 
 # RFC 6749 §6: refreshing also requires client authentication.
-RC1=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
+RC1=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \
   -d "grant_type=refresh_token&refresh_token=$REFRESHC")
-[ "$RC1" = "401" ] && echo "refresh without client auth rejected (401) OK"
-RC2=$(curl -s -u "$CLIENT:wrong-secret" -o /dev/null -w '%{http_code}' -X POST "$BASE2/token" \
+[ "$RC1" = "400" ] && echo "refresh without client_id rejected (400) OK"
+RC2=$(curl -s -u "$CONF_CLIENT:wrong-secret" -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \
   -d "grant_type=refresh_token&refresh_token=$REFRESHC")
 [ "$RC2" = "401" ] && echo "refresh with wrong secret rejected (401) OK"
 # The failed attempts must not have consumed the token.
-curl -s -u "$CLIENT:$SECRET" -X POST "$BASE2/token" \
+curl -s -u "$CONF_CLIENT:$CONF_SECRET" -X POST "$BASE/token" \
   -d "grant_type=refresh_token&refresh_token=$REFRESHC" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 assert 'access_token' in d and 'refresh_token' in d, d
 print('refresh with correct secret OK (rotation, family intact)')
 "
-kill "$MINIDP2_PID" 2>/dev/null || true
+
+echo "== 19. clientctl round trip =="
+CFILE2="$WORKDIR/clients2.json"
+"$CTL" client add -file "$CFILE2" -client spa -type public -redirect https://spa.example.com/cb >/dev/null
+"$CTL" user add -file "$CFILE2" -client spa -username alice -password wonderland -email alice@wonderland.example -roles user,auditor >/dev/null
+"$CTL" client list -file "$CFILE2" | grep -q "^spa" && echo "tool: client added and listed"
+"$CTL" user list -file "$CFILE2" -client spa | grep -q "^alice.*roles: user,auditor" && echo "tool: users added and listed"
+"$CTL" client update -file "$CFILE2" -client spa -audience spa-aud >/dev/null && echo "tool: audience updated"
+"$CTL" user update -file "$CFILE2" -client spa -username alice -roles user >/dev/null && echo "tool: roles updated"
+"$CTL" user update -file "$CFILE2" -client spa -username alice -password - <<< "builder2" >/dev/null && echo "tool: password updated via stdin"
+"$CTL" user remove -file "$CFILE2" -client spa -username alice >/dev/null && echo "tool: user removed"
+"$CTL" client remove -file "$CFILE2" -client spa >/dev/null && echo "tool: client removed"
+# The tool must not print secrets or hashes.
+if "$CTL" client show -file "$CFILE" -client "$CONF_CLIENT" | grep -q "$CONF_SECRET"; then
+  echo "UNEXPECTED: client show leaked the client secret"; exit 1
+fi
+echo "tool: secrets never printed OK"
+
+echo "== 20. fail-fast startup checks =="
+# A removed single-client variable must abort startup loudly.
+if IDP_CLIENT_ID=demo-app IDP_CLIENTS_FILE="$CFILE" "$WORKDIR/minidp" >"$WORKDIR/reject.log" 2>&1; then
+  echo "UNEXPECTED: startup succeeded with IDP_CLIENT_ID set"; exit 1
+fi
+grep -q "no longer supported" "$WORKDIR/reject.log" && echo "removed env var rejected OK"
+# A missing or empty clients file must abort startup.
+if IDP_CLIENTS_FILE="$WORKDIR/missing.json" "$WORKDIR/minidp" >"$WORKDIR/missing.log" 2>&1; then
+  echo "UNEXPECTED: startup succeeded without a clients file"; exit 1
+fi
+if grep -q "read clients file" "$WORKDIR/missing.log"; then
+  echo "missing clients file rejected OK"
+else
+  echo "UNEXPECTED: missing-file error not reported"; exit 1
+fi
+echo "[]" > "$WORKDIR/empty.json"
+if IDP_CLIENTS_FILE="$WORKDIR/empty.json" "$WORKDIR/minidp" >"$WORKDIR/empty.log" 2>&1; then
+  echo "UNEXPECTED: startup succeeded with an empty clients file"; exit 1
+fi
+grep -q "contains no clients" "$WORKDIR/empty.log" && echo "empty clients file rejected OK"
 
 echo
 echo "ALL CHECKS PASSED"

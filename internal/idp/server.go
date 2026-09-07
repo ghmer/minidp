@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -15,16 +14,15 @@ import (
 // authorization endpoint through to token issuance. Family identifies the
 // refresh-token chain started by one authorization (empty for a new chain).
 type authContext struct {
-	Sub         string
-	ClientID    string
-	RedirectURI string
-	Scopes      []string
-	Nonce       string
-	Family      string
+	Sub      string
+	ClientID string
+	Scopes   []string
+	Nonce    string
+	Family   string
 }
 
 // subject identifies the authenticated user carried through to token
-// issuance. Email and Name come from the users file.
+// issuance. Email and Name come from the client's users in the clients file.
 type subject struct {
 	Sub   string
 	Email string
@@ -39,12 +37,12 @@ type Server struct {
 	template       *loginTemplate
 	csrf           *csrfManager
 	limiter        *loginLimiter
-	users          UserStore
+	clients        *clientRegistry
 	allowedOrigins map[string]bool
 }
 
-// New constructs a Server, resolving the signing key, the users-file accounts,
-// and compiling the login template.
+// New constructs a Server, resolving the signing key, the registered clients
+// (each with its own accounts), and compiling the login template.
 func New(cfg Config) (*Server, error) {
 	key, err := NewSigningKey(cfg.RSAPeM, cfg.KeyDir)
 	if err != nil {
@@ -54,7 +52,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	users, err := LoadUsers(cfg.UsersFile)
+	clients, err := LoadClients(cfg.ClientsFile)
 	if err != nil {
 		return nil, err
 	}
@@ -69,15 +67,13 @@ func New(cfg Config) (*Server, error) {
 		template:       tmpl,
 		csrf:           newCSRFManager(csrfSecret, 15*time.Minute),
 		limiter:        newLimiter(cfg.LoginRateLimit),
-		users:          users,
-		allowedOrigins: allowedOrigins(cfg),
+		clients:        clients,
+		allowedOrigins: clients.allowedOrigins(),
 	}
 	slog.Info("minidp starting",
 		"issuer", cfg.Issuer,
-		"client", cfg.ClientID,
-		"mode", string(cfg.Mode),
-		"audience", cfg.Audience,
-		"users", userCount(users),
+		"clients", strings.Join(clients.clientIDs(), ", "),
+		"users", clients.userCount(),
 		"accessTTL", cfg.AccessTokenTTL,
 		"refreshTTL", cfg.RefreshTokenTTL,
 		"loginRateLimit", cfg.LoginRateLimit,
@@ -94,22 +90,6 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// allowedOrigins builds the CORS origin allowlist: every host of an
-// ALLOWED_REDIRECTS entry plus the explicit IDP_ALLOWED_ORIGINS list. Only
-// these origins are reflected with credentials (see withCORS).
-func allowedOrigins(cfg Config) map[string]bool {
-	origins := make(map[string]bool)
-	for _, r := range cfg.AllowedRedirects {
-		if u, err := url.Parse(r); err == nil && u.Host != "" {
-			origins[u.Scheme+"://"+u.Host] = true
-		}
-	}
-	for _, o := range cfg.AllowedOrigins {
-		origins[strings.TrimSuffix(o, "/")] = true
-	}
-	return origins
-}
-
 // Handler returns the fully wired HTTP handler with CORS middleware applied.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -124,10 +104,11 @@ func (s *Server) Handler() http.Handler {
 	// credential check and redirects the browser to the client with a code.
 	mux.HandleFunc("GET /authorize", s.handleAuthorizeGet)
 	mux.HandleFunc("POST /authorize", s.handleAuthorizePost)
-	// A bare landing / login page for when someone just hits the IdP root.
+	// A bare landing page for when someone just hits the IdP root. Sign-in
+	// happens exclusively through a client's /authorize flow; there is no
+	// standalone credential check (users belong to clients).
 	mux.HandleFunc("GET /", s.handleLanding)
 	mux.HandleFunc("GET /login", s.handleLanding)
-	mux.HandleFunc("POST /login", s.handleBareLogin)
 
 	// RFC 6749 token endpoint.
 	mux.HandleFunc("POST /token", s.handleToken)
@@ -150,23 +131,19 @@ func (s *Server) Handler() http.Handler {
 	return s.withCORS(mux)
 }
 
-// authenticate verifies the credentials against the users-file store.
+// authenticate verifies the credentials against a client's user store.
 // Unknown users are checked against a dummy bcrypt hash so that response
 // timing does not reveal which usernames exist.
-func (s *Server) authenticate(username, password string) (subject, bool) {
-	u, ok := s.users.Lookup(username)
+func (s *Server) authenticate(client *registeredClient, username, password string) (subject, bool) {
+	u, ok := client.users.Lookup(username)
 	if !ok {
-		_ = verifyHash(s.users.DummyHash(), password)
+		_ = verifyHash(client.users.DummyHash(), password)
 		return subject{}, false
 	}
 	if !verifyHash(u.PasswordHash, password) {
 		return subject{}, false
 	}
 	return subject{Sub: u.Username, Email: u.Email, Name: u.Name}, true
-}
-
-func userCount(users UserStore) int {
-	return users.Count()
 }
 
 // clientIP resolves the client IP for rate limiting and audit logs. When the
@@ -226,19 +203,6 @@ func (s *Server) ipTrusted(ip net.IP) bool {
 	return false
 }
 
-// redirectURIAllowed reports whether raw may be used as redirect_uri. It is
-// an exact string comparison against the registered client's redirect policy
-// (validated as absolute http(s) URLs without fragments at load time); there
-// is deliberately no open fallback.
-func (s *Server) redirectURIAllowed(raw string) bool {
-	for _, allowed := range s.cfg.AllowedRedirects {
-		if allowed == raw {
-			return true
-		}
-	}
-	return false
-}
-
 // contentSecurityPolicy for the login HTML. The page uses no inline scripts
 // or styles, so a strict policy without 'unsafe-inline' is possible.
 const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'self'; " +
@@ -247,9 +211,9 @@ const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'se
 // withCORS wraps next with security headers and CORS handling. Browser-based
 // clients (e.g. SPAs using oidc-client-ts) exchange the code for tokens
 // cross-origin with credentials, which disallows a wildcard — so the request
-// Origin is reflected ONLY when it is on the allowlist (hosts of the
-// ALLOWED_REDIRECTS entries plus IDP_ALLOWED_ORIGINS). Any other origin
-// receives no CORS grant and the browser blocks the response.
+// Origin is reflected ONLY when it is on the allowlist (hosts of every
+// client's redirect URIs plus the clients' explicit allowed_origins). Any
+// other origin receives no CORS grant and the browser blocks the response.
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)

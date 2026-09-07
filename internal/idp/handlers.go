@@ -81,36 +81,38 @@ func oauthParamsOf(r *http.Request) url.Values {
 // instead of copying unvalidated scopes into tokens (review finding M1).
 var supportedScopes = map[string]bool{"openid": true, "profile": true, "email": true}
 
-// validateClientBinding checks the parameters that decide whether an error may
-// be delivered via redirect: an unknown client_id or an unregistered
+// clientForAuthorize resolves the registered client behind an authorization
+// request and checks the parameters that decide whether an error may be
+// delivered via redirect: an unknown client_id or an unregistered
 // redirect_uri must be reported on an HTML page — redirecting to an
-// unvalidated URI would be an open redirect (RFC 6749 §4.1.2.1). minidp is a
-// single-client provider: only the registered client may start a flow, and
-// only against its registered redirect URIs (review findings H1/H2).
-func (s *Server) validateClientBinding(q url.Values) string {
+// unvalidated URI would be an open redirect (RFC 6749 §4.1.2.1). Only
+// registered clients may start a flow, and only against their own registered
+// redirect URIs (review findings H1/H2).
+func (s *Server) clientForAuthorize(q url.Values) (*registeredClient, string) {
 	if q.Get("client_id") == "" {
-		return "Missing client_id."
+		return nil, "Missing client_id."
 	}
-	if q.Get("client_id") != s.cfg.ClientID {
-		return "Unknown client_id: this provider serves a single registered client."
+	client := s.clients.lookup(q.Get("client_id"))
+	if client == nil {
+		return nil, "Unknown client_id."
 	}
 	if q.Get("redirect_uri") == "" {
-		return "Missing redirect_uri."
+		return client, "Missing redirect_uri."
 	}
-	if !s.redirectURIAllowed(q.Get("redirect_uri")) {
-		return "The redirect_uri is not registered for this client."
+	if !client.redirectURIAllowed(q.Get("redirect_uri")) {
+		return client, "The redirect_uri is not registered for this client."
 	}
-	return ""
+	return client, ""
 }
 
 // validateAuthorizeRequest checks everything that can be reported to the
 // client's redirect_uri and returns an OAuth error code with a
 // human-readable description, or "" when the request is acceptable.
-func (s *Server) validateAuthorizeRequest(q url.Values) (code, description string) {
+func (s *Server) validateAuthorizeRequest(client *registeredClient, q url.Values) (code, description string) {
 	if q.Get("response_type") != "code" {
 		return "unsupported_response_type", `Unsupported response_type; only "code" (authorization code flow) is supported.`
 	}
-	if code, description := s.validatePKCEParams(q); code != "" {
+	if code, description := s.validatePKCEParams(client, q); code != "" {
 		return code, description
 	}
 	if code, description := validatePrompt(q); code != "" {
@@ -131,10 +133,10 @@ func (s *Server) validateAuthorizeRequest(q url.Values) (code, description strin
 // mandatory for public clients (RFC 9700); optional but validated when a
 // confidential client chooses to use it. The token endpoint re-verifies
 // whatever challenge was stored with the code.
-func (s *Server) validatePKCEParams(q url.Values) (code, description string) {
+func (s *Server) validatePKCEParams(client *registeredClient, q url.Values) (code, description string) {
 	challenge := q.Get("code_challenge")
 	if challenge == "" {
-		if !s.cfg.Confidential() {
+		if !client.Confidential() {
 			return "invalid_request", "Missing code_challenge: PKCE is required for public clients."
 		}
 		// Confidential client without PKCE: accepted, the secret is the
@@ -180,12 +182,25 @@ func validateScopes(raw string) (code, description string) {
 	return "", ""
 }
 
-// registeredRedirect returns the registered redirect policy entry equal to
-// raw (constant-time comparison), or "". Callers redirect to the returned
-// entry itself — never to the user-supplied string (gosec G710).
-func (s *Server) registeredRedirect(raw string) string {
-	for _, allowed := range s.cfg.AllowedRedirects {
-		if subtle.ConstantTimeCompare([]byte(allowed), []byte(raw)) == 1 {
+// registeredRedirect returns the registered redirect_uri of the named client
+// equal to raw (constant-time comparison), or "". Callers redirect to the
+// returned entry itself — never to the user-supplied string (gosec G710);
+// the allowlist is resolved through the server's registry, so it always
+// traces back to the loaded clients file.
+func (s *Server) registeredRedirect(clientID, raw string) string {
+	for _, allowed := range s.clients.redirects[clientID] {
+		if constantTimeEqual(allowed, raw) {
+			return allowed
+		}
+	}
+	return ""
+}
+
+// registeredLogoutRedirect returns the registered post_logout_redirect_uri of
+// the named client equal to raw (constant-time comparison), or "".
+func (s *Server) registeredLogoutRedirect(clientID, raw string) string {
+	for _, allowed := range s.clients.logoutRedirects[clientID] {
+		if constantTimeEqual(allowed, raw) {
 			return allowed
 		}
 	}
@@ -194,16 +209,16 @@ func (s *Server) registeredRedirect(raw string) string {
 
 // authorizeErrorRedirect delivers a redirectable OAuth error to the client's
 // registered redirect_uri (RFC 6749 §4.1.2.1), echoing the state parameter.
-func (s *Server) authorizeErrorRedirect(w http.ResponseWriter, r *http.Request, q url.Values, code, description string) {
-	s.redirectToClient(w, r, q, map[string]string{"error": code, "error_description": description})
+func (s *Server) authorizeErrorRedirect(w http.ResponseWriter, r *http.Request, client *registeredClient, q url.Values, code, description string) {
+	s.redirectToClient(w, r, client, q, map[string]string{"error": code, "error_description": description})
 }
 
-// redirectToClient sends the browser back to the registered redirect_uri with
-// extra query parameters (an error pair or the issued code) and the echoed
-// state. It targets the registered entry itself, never the user-supplied
-// string (gosec G710).
-func (s *Server) redirectToClient(w http.ResponseWriter, r *http.Request, q url.Values, extra map[string]string) {
-	target, err := url.Parse(s.registeredRedirect(q.Get("redirect_uri")))
+// redirectToClient sends the browser back to the client's registered
+// redirect_uri with extra query parameters (an error pair or the issued code)
+// and the echoed state. It targets the registered entry itself, never the
+// user-supplied string (gosec G710).
+func (s *Server) redirectToClient(w http.ResponseWriter, r *http.Request, client *registeredClient, q url.Values, extra map[string]string) {
+	target, err := url.Parse(s.registeredRedirect(client.ID(), q.Get("redirect_uri")))
 	if err != nil || target.String() == "" {
 		// Unreachable: the redirect_uri passed validateClientBinding, but the
 		// error page is the safe fallback either way.
@@ -310,12 +325,13 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 // handleAuthorizeGet renders the login form for an authorization request.
 func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	if problem := s.validateClientBinding(q); problem != "" {
+	client, problem := s.clientForAuthorize(q)
+	if problem != "" {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
 		return
 	}
-	if code, description := s.validateAuthorizeRequest(q); code != "" {
-		s.authorizeErrorRedirect(w, r, q, code, description)
+	if code, description := s.validateAuthorizeRequest(client, q); code != "" {
+		s.authorizeErrorRedirect(w, r, client, q, code, description)
 		return
 	}
 	s.renderLoginPage(w, r, http.StatusOK, loginData{
@@ -378,47 +394,49 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	who, q, ok := s.authorizeContext(w, r, form, ip)
+	who, client, q, ok := s.authorizeContext(w, r, form, ip)
 	if !ok {
 		return
 	}
-	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
-	s.completeAuthorize(w, r, form, q, who.Sub)
+	slog.Info("login succeeded", "ip", ip, "user", who.Sub, "client", client.ID())
+	s.completeAuthorize(w, r, client, form, q, who.Sub)
 }
 
 // authorizeContext re-validates the OAuth2 context echoed through the form
-// and authenticates the submitted credentials. On any failure it renders the
-// appropriate error (page or redirect) and reports ok=false. The client
-// binding decides whether a failure is shown on the page or redirected; all
-// remaining errors go to the registered redirect_uri.
-func (s *Server) authorizeContext(w http.ResponseWriter, r *http.Request, form url.Values, ip string) (who subject, q url.Values, ok bool) {
+// and authenticates the submitted credentials against the client's own user
+// store. On any failure it renders the appropriate error (page or redirect)
+// and reports ok=false. The client binding decides whether a failure is shown
+// on the page or redirected; all remaining errors go to the client's
+// registered redirect_uri.
+func (s *Server) authorizeContext(w http.ResponseWriter, r *http.Request, form url.Values, ip string) (who subject, client *registeredClient, q url.Values, ok bool) {
 	q = oauthContextOf(form)
-	if problem := s.validateClientBinding(q); problem != "" {
+	client, problem := s.clientForAuthorize(q)
+	if problem != "" {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
-		return subject{}, nil, false
+		return subject{}, nil, nil, false
 	}
-	if code, description := s.validateAuthorizeRequest(q); code != "" {
-		s.authorizeErrorRedirect(w, r, q, code, description)
-		return subject{}, nil, false
+	if code, description := s.validateAuthorizeRequest(client, q); code != "" {
+		s.authorizeErrorRedirect(w, r, client, q, code, description)
+		return subject{}, nil, nil, false
 	}
-	who, ok = s.authenticate(form.Get("username"), form.Get("password"))
+	who, ok = s.authenticate(client, form.Get("username"), form.Get("password"))
 	if !ok {
-		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
+		slog.Warn("login failed", "ip", ip, "user", form.Get("username"), "client", client.ID())
 		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
 			Action:   "/authorize",
 			Error:    "Invalid username or password.",
 			Username: form.Get("username"),
 			Hidden:   oauthHiddenFields(form),
 		})
-		return subject{}, nil, false
+		return subject{}, nil, nil, false
 	}
-	return who, q, true
+	return who, client, q, true
 }
 
 // completeAuthorize issues a single-use authorization code for the
 // authenticated user and redirects the browser back to the client. Failures
 // re-render the login form.
-func (s *Server) completeAuthorize(w http.ResponseWriter, r *http.Request, form, q url.Values, sub string) {
+func (s *Server) completeAuthorize(w http.ResponseWriter, r *http.Request, client *registeredClient, form, q url.Values, sub string) {
 	code, err := s.store.addCode(&authCode{
 		Sub:                 sub,
 		ClientID:            q.Get("client_id"),
@@ -434,133 +452,107 @@ func (s *Server) completeAuthorize(w http.ResponseWriter, r *http.Request, form,
 		return
 	}
 	slog.Info("authorization code issued", "client", q.Get("client_id"), "redirect", q.Get("redirect_uri"))
-	s.redirectToClient(w, r, q, map[string]string{"code": code})
+	s.redirectToClient(w, r, client, q, map[string]string{"code": code})
 }
 
-// handleLanding renders the bare login page for direct visits to the IdP root.
+// handleLanding renders the landing page for direct visits to the IdP root.
+// Sign-in happens exclusively through a registered client's /authorize flow:
+// users belong to clients, so there is no standalone login form here.
 func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
-	s.renderLoginPage(w, r, http.StatusOK, loginData{Action: "/login"})
-}
-
-// handleBareLogin authenticates a direct (non-OAuth2) login from the landing
-// page. It issues no tokens; tokens always require a real authorize request.
-func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
-	ip := s.clientIP(r)
-	if err := r.ParseForm(); err != nil {
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
-		return
-	}
-	form := r.PostForm
-	if !s.csrf.verify("/login", oauthParamsOf(r), csrfNonce(r), form.Get("csrf_token")) {
-		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
-			Action: "/login",
-			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
-		})
-		return
-	}
-	// Rate limited only after CSRF validation (review finding F5): junk
-	// requests must not exhaust the IP budget of a legitimate user.
-	if !s.limiter.allow(ip) {
-		slog.Warn("login rate limited", "ip", ip)
-		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
-			Action: "/login",
-			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
-		})
-		return
-	}
-	who, ok := s.authenticate(form.Get("username"), form.Get("password"))
-	if !ok {
-		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
-		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
-			Action:   "/login",
-			Error:    "Invalid username or password.",
-			Username: form.Get("username"),
-		})
-		return
-	}
-	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
 	s.renderLoginPage(w, r, http.StatusOK, loginData{
-		Action:  "/login",
-		Message: "Signed in as " + who.Sub + ". This page issues tokens only via the /authorize endpoint.",
+		Message: "This is the identity provider of a registered OAuth2/OIDC client. " +
+			"Sign in happens through your application's authorization request to /authorize.",
 	})
 }
 
-// authenticateClient authenticates the client presenting a request to the
-// token endpoint (RFC 6749 §2.3, RFC 9700 §2.3).
+// authenticateClient authenticates or identifies the client presenting a
+// request to the token endpoint (RFC 6749 §2.3, RFC 9700 §2.3).
 //
-//   - Confidential client (MINIDP_MODE=confidential): client_secret_basic —
-//     HTTP Basic with form-urlencoded credentials per RFC 6749 §2.3.1 — or
-//     client_secret_post (client_id + client_secret form fields). Both the
-//     client id and the secret are compared in constant time. If the request
-//     also carries a form client_id that differs from the authenticated one,
-//     it is rejected (RFC 9700 §2.3.2).
+//   - Confidential client: client_secret_basic — HTTP Basic with
+//     form-urlencoded credentials per RFC 6749 §2.3.1 — or
+//     client_secret_post (client_id + client_secret form fields). The secret
+//     is looked up by the presented client_id and compared in constant time;
+//     credentials are only ever checked against the one client they name. If
+//     a Basic-authenticated request also carries a form client_id that
+//     differs from the authenticated one, it is rejected (RFC 9700 §2.3.2).
 //   - Public client: no authentication is possible; the client_id form field
-//     is mere identification and is returned unverified (the caller binds it
-//     against the authorization context).
+//     is mere identification (a Basic header for a public client carries no
+//     credential and is ignored, matching RFC 6749 §2.3 for clients without
+//     a secret).
 //
-// On failure the RFC 6749 §5.2 invalid_client response (401 with a
-// WWW-Authenticate: Basic header when Basic auth was attempted) has already
-// been written. Failures are logged for audit/IDS purposes but deliberately
-// NOT rate limited — see the handleToken rationale.
-func (s *Server) authenticateClient(w http.ResponseWriter, r *http.Request) (clientID string, ok bool) {
-	if !s.cfg.Confidential() {
-		return s.identifyPublicClient(w, r)
+// An authentication ATTEMPT for an unknown client_id answers RFC 6749 §5.2
+// invalid_client; a bare identification with an unknown client_id answers
+// invalid_grant (the grant cannot be bound). On failure the response has
+// already been written. Failures are logged for audit/IDS purposes but
+// deliberately NOT rate limited — see the handleToken rationale.
+func (s *Server) authenticateClient(w http.ResponseWriter, r *http.Request) (*registeredClient, bool) {
+	if rawID, rawPW, basic := r.BasicAuth(); basic {
+		return s.authClientBasic(w, r, rawID, rawPW)
 	}
-	if id, pw, basic := r.BasicAuth(); basic {
-		return s.authClientBasic(w, r, id, pw)
-	}
-	return s.authClientPost(w, r)
+	return s.identifyFormClient(w, r)
 }
 
-// identifyPublicClient handles the public-client profile: no authentication
-// is possible; the client_id form field is mere identification and is
-// returned unverified (the caller binds it against the authorization
-// context).
-func (s *Server) identifyPublicClient(w http.ResponseWriter, r *http.Request) (string, bool) {
+// identifyFormClient handles the form-based profile: the client_id form
+// field either identifies a public client (no credentials possible) or names
+// the confidential client whose client_secret form credential is verified.
+func (s *Server) identifyFormClient(w http.ResponseWriter, r *http.Request) (*registeredClient, bool) {
 	id := r.PostForm.Get("client_id")
 	if id == "" {
 		writeAuthError(w, "invalid_request", "Missing client_id.")
-		return "", false
+		return nil, false
 	}
-	return id, true
+	client := s.clients.lookup(id)
+	if client == nil {
+		if r.PostForm.Get("client_secret") != "" {
+			// An authentication attempt for an unregistered client.
+			s.rejectClient(w, r, "client_secret_post")
+			return nil, false
+		}
+		writeAuthError(w, "invalid_grant", "Unknown client_id.")
+		return nil, false
+	}
+	if client.Confidential() && !constantTimeEqual(r.PostForm.Get("client_secret"), client.secret()) {
+		s.rejectClient(w, r, "client_secret_post")
+		return nil, false
+	}
+	return client, true
 }
 
 // authClientBasic implements client_secret_basic: HTTP Basic with
-// form-urlencoded credentials (RFC 6749 §2.3.1). Both the client id and the
-// secret are compared in constant time.
-func (s *Server) authClientBasic(w http.ResponseWriter, r *http.Request, rawID, rawPW string) (string, bool) {
+// form-urlencoded credentials (RFC 6749 §2.3.1). The client named by the
+// Basic username is resolved first; only its own secret is compared, in
+// constant time. A Basic header naming a public client carries no credential:
+// identification then happens via the form body, exactly as without the
+// header.
+func (s *Server) authClientBasic(w http.ResponseWriter, r *http.Request, rawID, rawPW string) (*registeredClient, bool) {
 	// RFC 6749 §2.3.1: client_id and secret are
 	// application/x-www-form-urlencoded before being placed in the Basic
 	// credentials, so they are decoded first.
 	id, idErr := url.QueryUnescape(rawID)
 	pw, pwErr := url.QueryUnescape(rawPW)
-	if idErr != nil || pwErr != nil ||
-		subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
+	if idErr != nil || pwErr != nil {
 		s.rejectClient(w, r, "client_secret_basic")
-		return "", false
+		return nil, false
+	}
+	client := s.clients.lookup(id)
+	if client == nil {
+		s.rejectClient(w, r, "client_secret_basic")
+		return nil, false
+	}
+	if !client.Confidential() {
+		return s.identifyFormClient(w, r)
+	}
+	if !constantTimeEqual(pw, client.secret()) {
+		s.rejectClient(w, r, "client_secret_basic")
+		return nil, false
 	}
 	// A Basic-authenticated request must not smuggle a different
 	// identification through the form body (RFC 9700 §2.3.2).
-	if formID := r.PostForm.Get("client_id"); formID != "" && formID != s.cfg.ClientID {
+	if formID := r.PostForm.Get("client_id"); formID != "" && formID != client.ID() {
 		s.rejectClient(w, r, "client_secret_basic")
-		return "", false
+		return nil, false
 	}
-	return s.cfg.ClientID, true
-}
-
-// authClientPost implements client_secret_post (client_id + client_secret
-// form fields). Both values are compared in constant time.
-func (s *Server) authClientPost(w http.ResponseWriter, r *http.Request) (string, bool) {
-	id := r.PostForm.Get("client_id")
-	pw := r.PostForm.Get("client_secret")
-	if subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
-		s.rejectClient(w, r, "client_secret_post")
-		return "", false
-	}
-	return s.cfg.ClientID, true
+	return client, true
 }
 
 // rejectClient logs a failed token-endpoint client authentication and writes
@@ -646,14 +638,9 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 	//
 	// RFC 6749 §4.1.3: the token request must repeat client_id (public
 	// clients cannot authenticate; confidential clients present Basic or
-	// client_secret_post credentials). The presenting client must also be
-	// the one registered client.
-	clientID, ok := s.authenticateClient(w, r)
+	// client_secret_post credentials).
+	client, ok := s.authenticateClient(w, r)
 	if !ok {
-		return
-	}
-	if clientID != s.cfg.ClientID {
-		writeAuthError(w, "invalid_grant", "Unknown client_id.")
 		return
 	}
 	ac := s.store.takeCode(code)
@@ -662,7 +649,7 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
 		return
 	}
-	if !s.validateCodeGrant(w, r, form, ac, clientID) {
+	if !s.validateCodeGrant(w, r, form, ac, client) {
 		return
 	}
 
@@ -687,8 +674,8 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 // and that redirect_uri and the PKCE verifier match the authorization
 // request. It writes the OAuth error itself and reports ok=false on any
 // mismatch.
-func (s *Server) validateCodeGrant(w http.ResponseWriter, r *http.Request, form url.Values, ac *authCode, clientID string) bool {
-	if clientID != ac.ClientID {
+func (s *Server) validateCodeGrant(w http.ResponseWriter, r *http.Request, form url.Values, ac *authCode, client *registeredClient) bool {
+	if client.ID() != ac.ClientID {
 		writeAuthError(w, "invalid_grant", "client_id does not match the authorization request.")
 		return false
 	}
@@ -733,15 +720,10 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	// RFC 6749 §6: a public client must identify itself with client_id; a
 	// confidential client MUST authenticate (Basic or client_secret_post).
-	// Only the registered client is accepted — checked before the token is
-	// consumed so a foreign client cannot burn a stolen refresh token.
-	clientID, ok := s.authenticateClient(w, r)
+	// Authentication happens before the token is consumed so a foreign
+	// client cannot burn a stolen refresh token.
+	client, ok := s.authenticateClient(w, r)
 	if !ok {
-		return
-	}
-	if clientID != s.cfg.ClientID {
-		slog.Warn("refresh rejected: unknown client_id", "ip", s.clientIP(r), "client", clientID)
-		writeAuthError(w, "invalid_grant", "Unknown client_id.")
 		return
 	}
 	// Consume the token first (single lookup, no validity oracle), then check
@@ -760,8 +742,8 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already used refresh token.")
 		return
 	}
-	if clientID != entry.ClientID {
-		slog.Warn("refresh rejected: client_id mismatch", "ip", s.clientIP(r), "client", clientID)
+	if client.ID() != entry.ClientID {
+		slog.Warn("refresh rejected: client_id mismatch", "ip", s.clientIP(r), "client", client.ID())
 		s.store.revokeFamilyTokens(entry.Family)
 		writeAuthError(w, "invalid_grant", "client_id does not match the refresh token.")
 		return
@@ -781,8 +763,8 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 // 9068 "at+jwt" typ header — an id_token (typ JWT) is never accepted as a
 // bearer access token (review finding H3). The jti revocation denylist is
 // always honoured. When requireAudience is true the token must carry the
-// configured audience, so tokens minted for any other audience are rejected
-// at the resource endpoints (review finding H4).
+// audience of one of the registered clients, so tokens minted for any other
+// audience are rejected at the resource endpoints (review finding H4).
 func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
 		return &s.key.key.PublicKey, nil
@@ -805,7 +787,7 @@ func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt
 	if len(aud) == 0 {
 		return nil, fmt.Errorf("invalid token: missing audience")
 	}
-	if requireAudience && !audContains(aud, s.cfg.Audience) {
+	if requireAudience && !s.clients.audienceAllowed(aud) {
 		return nil, fmt.Errorf("invalid token: audience not accepted here")
 	}
 	if jti, _ := claims["jti"].(string); jti != "" && s.store.isDeniedJTI(jti) {
@@ -814,30 +796,21 @@ func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt
 	return claims, nil
 }
 
-func audContains(aud []string, want string) bool {
-	for _, a := range aud {
-		if a == want {
-			return true
-		}
-	}
-	return false
-}
-
 // verifyAccessToken is the resource-endpoint check: signature, access-token
-// profile, issuer, expiry and the configured audience must all hold.
+// profile, issuer, expiry and a registered client's audience must all hold.
 func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 	return s.parseAccessToken(tokenString, true)
 }
 
-// parseIDTokenHint validates an id_token_hint for /end_session. Per OIDC
-// RP-Initiated Logout the hint's signature and issuer are verified, and an
-// EXPIRED hint still identifies the token family to revoke — so expiry is
-// deliberately not enforced here (review finding M6). The audience is,
-// however, checked: a signed id_token minted for a different audience is not
-// a logout hint this provider has to honour (review finding F4). The
-// registered-claims validation is disabled and issuer/audience are checked
-// manually instead.
-func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, error) {
+// parseIDTokenHint validates an id_token_hint for /end_session and returns
+// the registered client the hint belongs to. Per OIDC RP-Initiated Logout
+// the hint's signature and issuer are verified, and an EXPIRED hint still
+// identifies the token family to revoke — so expiry is deliberately not
+// enforced here (review finding M6). The audience is, however, checked: a
+// signed id_token minted for a different audience is not a logout hint this
+// provider has to honour (review finding F4). The registered-claims
+// validation is disabled and issuer/audience are checked manually instead.
+func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient, error) {
 	token, err := jwt.Parse(hint, func(t *jwt.Token) (any, error) {
 		return &s.key.key.PublicKey, nil
 	},
@@ -845,23 +818,29 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, error) {
 		jwt.WithoutClaimsValidation(), // expiry is intentionally not enforced
 	)
 	if err != nil || !token.Valid {
-		return nil, fmt.Errorf("invalid token")
+		return nil, nil, fmt.Errorf("invalid token")
 	}
 	if typ, _ := token.Header["typ"].(string); typ != typIDToken {
-		return nil, fmt.Errorf("invalid token: not an id token")
+		return nil, nil, fmt.Errorf("invalid token: not an id token")
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, fmt.Errorf("invalid claims")
+		return nil, nil, fmt.Errorf("invalid claims")
 	}
 	if iss, _ := claims["iss"].(string); iss != s.cfg.Issuer {
-		return nil, fmt.Errorf("invalid token: foreign issuer")
+		return nil, nil, fmt.Errorf("invalid token: foreign issuer")
 	}
 	aud, _ := claims.GetAudience()
-	if len(aud) == 0 || !audContains(aud, s.cfg.Audience) {
-		return nil, fmt.Errorf("invalid token: audience not accepted here")
+	if len(aud) == 0 {
+		return nil, nil, fmt.Errorf("invalid token: missing audience")
 	}
-	return claims, nil
+	// The audience identifies the registered client the hint belongs to; the
+	// post-logout redirect policy of THAT client governs the logout redirect.
+	client := s.clients.clientForAudience(aud[0])
+	if client == nil {
+		return nil, nil, fmt.Errorf("invalid token: audience not accepted here")
+	}
+	return claims, client, nil
 }
 
 // bearerToken extracts the Bearer token from the Authorization header.
@@ -874,29 +853,38 @@ func bearerToken(r *http.Request) string {
 }
 
 // requireClientAuth enforces client authentication on the introspection and
-// revocation endpoints in confidential mode (RFC 7662 strongly recommends
-// authenticating introspection; an open /revoke is a free probe endpoint).
-// Accepted: HTTP Basic auth (any username, the configured secret as password)
-// or a client_secret form field. In public mode (no secret configured) both
-// endpoints are open — there is no client secret to check.
+// revocation endpoints whenever the deployment has at least one confidential
+// client (RFC 7662 strongly recommends authenticating introspection; an open
+// /revoke is a free probe endpoint). Accepted: HTTP Basic auth
+// (client_id as username, the client's secret as password) or a
+// client_id/client_secret form pair — always checked against the named
+// client's own secret, in constant time. When every registered client is
+// public there is no secret to check and both endpoints are open.
 //
-// Documented trade-off (review finding F1): in public mode /revoke is an
-// unauthenticated write operation, so anyone who merely OBSERVES a bearer
-// token can revoke that session (denial of service for the victim: refresh
-// family revoked, live access tokens denied via jti). The public profile has
-// no secret to authenticate with and sender-constraining (DPoP) is out of
-// scope for minidp; see the README section "Security trade-offs".
+// Documented trade-off (review finding F1): in an all-public deployment
+// /revoke is an unauthenticated write operation, so anyone who merely
+// OBSERVES a bearer token can revoke that session (denial of service for the
+// victim: refresh family revoked, live access tokens denied via jti). Public
+// clients have no secret to authenticate with and sender-constraining (DPoP)
+// is out of scope for minidp; see the README section "Security trade-offs".
 func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool {
-	if !s.cfg.Confidential() {
+	if !s.clients.anyConfidential() {
 		return true
 	}
-	secret := []byte(s.cfg.ClientSecret)
-	if _, pw, ok := r.BasicAuth(); ok && subtle.ConstantTimeCompare([]byte(pw), secret) == 1 {
-		return true
+	if id, pw, ok := r.BasicAuth(); ok {
+		if id, err := url.QueryUnescape(id); err == nil {
+			if client := s.clients.lookup(id); client != nil && client.Confidential() &&
+				constantTimeEqual(pw, client.secret()) {
+				return true
+			}
+		}
 	}
 	_ = r.ParseForm()
-	if pw := r.PostForm.Get("client_secret"); pw != "" && subtle.ConstantTimeCompare([]byte(pw), secret) == 1 {
-		return true
+	if id := r.PostForm.Get("client_id"); id != "" {
+		if client := s.clients.lookup(id); client != nil && client.Confidential() &&
+			constantTimeEqual(r.PostForm.Get("client_secret"), client.secret()) {
+			return true
+		}
 	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="minidp"`)
 	writeError(w, http.StatusUnauthorized, "invalid_client", "Client authentication required.")
@@ -939,9 +927,10 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.userinfoClaims(claims, scopes))
 }
 
-// userinfoClaims assembles the UserInfo response for the token's subject:
-// the authoritative users-file record first; the scope-gated token claims
-// are the fallback for subjects that have since been removed from the file.
+// userinfoClaims assembles the UserInfo response for the token's subject.
+// The token's audience identifies the registered client whose user store
+// holds the authoritative record; the scope-gated token claims are the
+// fallback for subjects that have since been removed from the clients file.
 // The access token carries no name claim, so for such subjects the name is
 // simply omitted (an absent claim is never fabricated).
 func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[string]any {
@@ -949,13 +938,21 @@ func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[strin
 	wantProfile := hasScope(scopes, "profile")
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
-	if u, ok := s.users.Lookup(sub); ok {
-		addScopeClaims(out, wantProfile, wantEmail, u.Username, u.Name, u.Email)
-	} else {
-		username, _ := claims["preferred_username"].(string)
-		email, _ := claims["email"].(string)
-		addScopeClaims(out, wantProfile, wantEmail, username, "", email)
+	var store UserStore
+	if aud, _ := claims.GetAudience(); len(aud) > 0 {
+		if client := s.clients.clientForAudience(aud[0]); client != nil {
+			store = client.users
+		}
 	}
+	if store != nil {
+		if u, ok := store.Lookup(sub); ok {
+			addScopeClaims(out, wantProfile, wantEmail, u.Username, u.Name, u.Email)
+			return out
+		}
+	}
+	username, _ := claims["preferred_username"].(string)
+	email, _ := claims["email"].(string)
+	addScopeClaims(out, wantProfile, wantEmail, username, "", email)
 	return out
 }
 
@@ -1032,10 +1029,12 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleEndSession implements a minimal logout. A post_logout_redirect_uri is
-// honoured only when it exactly matches an entry of the configured redirect
-// allowlist, and the redirect always targets the allowlist entry itself — never
-// the user-supplied string — so the endpoint cannot be abused for open
-// redirects (gosec G710).
+// honoured only when it exactly matches an entry of the redirecting client's
+// post_logout_redirect_uris allowlist, and the redirect always targets the
+// allowlist entry itself — never the user-supplied string — so the endpoint
+// cannot be abused for open redirects (gosec G710). The client is resolved
+// from the id_token_hint's audience (preferred) or the client_id parameter;
+// without a resolvable client there is no redirect.
 //
 // Logout is only as real as the tokens it kills: when the caller passes an
 // id_token_hint (the OIDC end-session parameter), the hint's sid claim
@@ -1044,26 +1043,32 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // Without a hint there is no session cookie to identify a caller, so no
 // server-side state is dropped.
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
+	var client *registeredClient
 	if hint := r.URL.Query().Get("id_token_hint"); hint != "" {
 		// The hint is verified for signature, issuer and audience; expiry is
 		// deliberately not enforced: an expired id_token_hint still identifies
 		// the session to terminate (review findings M6/F4).
-		if claims, err := s.parseIDTokenHint(hint); err == nil {
+		if claims, hintClient, err := s.parseIDTokenHint(hint); err == nil {
+			client = hintClient
 			if sid, _ := claims["sid"].(string); sid != "" {
 				s.store.revokeFamilyTokens(sid)
-				slog.Info("logout: token family revoked", "sub", claims["sub"])
+				slog.Info("logout: token family revoked", "sub", claims["sub"], "client", client.ID())
 			}
 		}
 	}
+	if client == nil {
+		if id := r.URL.Query().Get("client_id"); id != "" {
+			client = s.clients.lookup(id)
+		}
+	}
 	target := r.URL.Query().Get("post_logout_redirect_uri")
-	if target != "" {
-		if allowed := s.registeredRedirect(target); allowed != "" {
+	if target != "" && client != nil {
+		if allowed := s.registeredLogoutRedirect(client.ID(), target); allowed != "" {
 			http.Redirect(w, r, allowed, http.StatusFound)
 			return
 		}
 	}
 	s.renderLoginPage(w, r, http.StatusOK, loginData{
-		Action:  "/login",
 		Message: "You have been signed out.",
 	})
 }

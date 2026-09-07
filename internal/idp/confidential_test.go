@@ -10,13 +10,10 @@ import (
 )
 
 // testConfidentialIDP returns an IdP whose single client is confidential
-// (MINIDP_MODE=confidential) with the given client secret.
+// with the given client secret.
 func testConfidentialIDP(t *testing.T, secret string) (*httptest.Server, *Server) {
 	t.Helper()
-	return testIDP(t, func(c *Config) {
-		c.Mode = ModeConfidential
-		c.ClientSecret = secret
-	})
+	return testIDPClients(t, []Client{testConfidentialClient(t, secret)}, nil)
 }
 
 // authorizeFormNoPKCE builds a valid authorization request without PKCE, as a
@@ -68,33 +65,37 @@ func postTokenBasic(t *testing.T, target string, form url.Values, id, secret str
 }
 
 // TestConfidentialDiscoveryAdvertisesClientAuth pins the discovery metadata
-// for both modes: the token/revocation/introspection endpoint auth methods
-// must reflect the configured client mode.
+// for both profiles: the token/revocation/introspection endpoint auth
+// methods must reflect the registered client types (and "none" is always
+// advertised, because public clients identify without credentials).
 func TestConfidentialDiscoveryAdvertisesClientAuth(t *testing.T) {
 	for _, tc := range []struct {
-		mode   ClientMode
-		secret string
-		want   []string
+		name string
+		ids  func(t *testing.T) (*httptest.Server, *Server)
+		want []string
 	}{
-		{ModePublic, "", []string{"none"}},
-		{ModeConfidential, "a-confidential-secret", []string{"client_secret_basic", "client_secret_post"}},
+		{"all clients public", func(t *testing.T) (*httptest.Server, *Server) { return testIDP(t, nil) }, []string{"none"}},
+		{"confidential client", func(t *testing.T) (*httptest.Server, *Server) { return testConfidentialIDP(t, "a-confidential-secret") },
+			[]string{"none", "client_secret_basic", "client_secret_post"}},
 	} {
-		ts, _ := testIDP(t, func(c *Config) { c.Mode = tc.mode; c.ClientSecret = tc.secret })
-		resp, err := http.Get(ts.URL + "/.well-known/openid-configuration")
-		if err != nil {
-			t.Fatalf("GET discovery: %v", err)
-		}
-		d := decodeJSON(t, resp)
-		_ = resp.Body.Close()
-		got, _ := d["token_endpoint_auth_methods_supported"].([]any)
-		if len(got) != len(tc.want) {
-			t.Fatalf("mode %q: token_endpoint_auth_methods_supported = %v, want %v", tc.mode, got, tc.want)
-		}
-		for i, want := range tc.want {
-			if got[i] != want {
-				t.Errorf("mode %q: auth methods = %v, want %v", tc.mode, got, tc.want)
+		t.Run(tc.name, func(t *testing.T) {
+			ts, _ := tc.ids(t)
+			resp, err := http.Get(ts.URL + "/.well-known/openid-configuration")
+			if err != nil {
+				t.Fatalf("GET discovery: %v", err)
 			}
-		}
+			d := decodeJSON(t, resp)
+			_ = resp.Body.Close()
+			got, _ := d["token_endpoint_auth_methods_supported"].([]any)
+			if len(got) != len(tc.want) {
+				t.Fatalf("token_endpoint_auth_methods_supported = %v, want %v", got, tc.want)
+			}
+			for i, want := range tc.want {
+				if got[i] != want {
+					t.Errorf("auth methods = %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 
@@ -194,16 +195,15 @@ func TestConfidentialTokenRequiresClientAuth(t *testing.T) {
 		}
 	}
 
-	// No credentials at all -> 401 invalid_client with WWW-Authenticate.
+	// No client identification at all -> 400 invalid_request: the token
+	// request is missing the required client_id parameter (RFC 6749 §4.1.3,
+	// §5.2 "missing a required parameter").
 	resp := postForm(t, http.DefaultClient, ts.URL+"/token", grant(freshCode()))
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("no credentials: status = %d, want 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("no credentials: status = %d, want 400", resp.StatusCode)
 	}
-	if got := decodeJSON(t, resp)["error"]; got != "invalid_client" {
-		t.Errorf("no credentials: error = %v, want invalid_client", got)
-	}
-	if resp.Header.Get("WWW-Authenticate") == "" {
-		t.Error("no credentials: WWW-Authenticate header missing")
+	if got := decodeJSON(t, resp)["error"]; got != "invalid_request" {
+		t.Errorf("no credentials: error = %v, want invalid_request", got)
 	}
 
 	// Basic with a wrong secret -> 401.
@@ -280,25 +280,32 @@ func TestConfidentialRefreshRequiresAuth(t *testing.T) {
 	}, testClientID, "a-confidential-secret"))
 	refresh := first["refresh_token"].(string)
 
-	// Refresh without credentials -> 401.
+	// Refresh without credentials (no client_id, no auth) -> 400: the
+	// request is missing the required client_id parameter (RFC 6749 §5.2).
 	r1 := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refresh},
 	})
-	if r1.StatusCode != http.StatusUnauthorized {
-		t.Errorf("refresh without auth: status = %d, want 401", r1.StatusCode)
+	if r1.StatusCode != http.StatusBadRequest {
+		t.Errorf("refresh without auth: status = %d, want 400", r1.StatusCode)
 	}
-	if got := decodeJSON(t, r1)["error"]; got != "invalid_client" {
-		t.Errorf("refresh without auth: error = %v, want invalid_client", got)
+	if got := decodeJSON(t, r1)["error"]; got != "invalid_request" {
+		t.Errorf("refresh without auth: error = %v, want invalid_request", got)
 	}
 
-	// Refresh with a wrong secret -> 401.
-	r2 := postTokenBasic(t, ts.URL+"/token", url.Values{
+	// Refresh identified as the confidential client but with a wrong secret
+	// -> 401 invalid_client.
+	r2 := postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refresh},
-	}, testClientID, "wrong")
+		"client_id":     {testClientID},
+		"client_secret": {"wrong"},
+	})
 	if r2.StatusCode != http.StatusUnauthorized {
 		t.Errorf("refresh with wrong secret: status = %d, want 401", r2.StatusCode)
+	}
+	if got := decodeJSON(t, r2)["error"]; got != "invalid_client" {
+		t.Errorf("refresh with wrong secret: error = %v, want invalid_client", got)
 	}
 
 	// The failed attempts must NOT have consumed the token: the legitimate

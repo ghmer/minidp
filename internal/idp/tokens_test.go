@@ -12,17 +12,13 @@ import (
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	usersFile := filepath.Join(t.TempDir(), "users.json")
-	if err := SaveUsers(usersFile, []User{
-		{Username: "demo", PasswordHash: testHash(t, "demo-password"), Email: "demo@example.com", Name: "Demo User"},
-	}); err != nil {
-		t.Fatalf("SaveUsers: %v", err)
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	if err := SaveClients(clientsFile, []Client{testPublicClient(t)}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
 	}
 	srv, err := New(Config{
 		Issuer:          "https://idp.test",
-		ClientID:        "demo-app",
-		Audience:        "demo-app",
-		UsersFile:       usersFile,
+		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 2 * time.Hour,
 	})
@@ -51,7 +47,7 @@ func TestIssueTokensAccessAndIDClaims(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
 		Sub:      "demo",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid", "profile", "email"},
 		Nonce:    "n-abc",
 	})
@@ -117,7 +113,7 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 	// openid only: no profile claims.
 	resp, err := srv.issueTokens(&authContext{
 		Sub:      "demo",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid"},
 	})
 	if err != nil {
@@ -135,7 +131,7 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 	// nothing is fabricated.
 	resp2, err := srv.issueTokens(&authContext{
 		Sub:      "ghost",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid", "profile", "email"},
 	})
 	if err != nil {
@@ -152,18 +148,18 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 // independent of the granted scopes, while a user without roles gets no roles
 // claim at all.
 func TestIssueTokensReleasesRoles(t *testing.T) {
-	usersFile := filepath.Join(t.TempDir(), "users.json")
-	if err := SaveUsers(usersFile, []User{
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	client := testPublicClient(t)
+	client.Users = []User{
 		{Username: "alice", PasswordHash: testHash(t, "wonderland"), Roles: []string{"admin", "auditor"}},
 		{Username: "bob", PasswordHash: testHash(t, "builder")},
-	}); err != nil {
-		t.Fatalf("SaveUsers: %v", err)
+	}
+	if err := SaveClients(clientsFile, []Client{client}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
 	}
 	srv, err := New(Config{
 		Issuer:          "https://idp.test",
-		ClientID:        "demo-app",
-		Audience:        "demo-app",
-		UsersFile:       usersFile,
+		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 2 * time.Hour,
 	})
@@ -174,7 +170,7 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 	// Roles are released regardless of the granted scopes.
 	resp, err := srv.issueTokens(&authContext{
 		Sub:      "alice",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid"},
 	})
 	if err != nil {
@@ -193,7 +189,7 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 	// A user without roles gets no roles claim.
 	resp2, err := srv.issueTokens(&authContext{
 		Sub:      "bob",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid", "profile", "email"},
 	})
 	if err != nil {
@@ -213,7 +209,7 @@ func TestIssueTokensWithoutOpenIDScopeOmitsIDToken(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
 		Sub:      "demo",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"profile"},
 	})
 	if err != nil {
@@ -228,7 +224,7 @@ func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := srv.issueTokens(&authContext{
 		Sub:      "demo",
-		ClientID: srv.cfg.ClientID,
+		ClientID: testClientID,
 		Scopes:   []string{"openid"},
 		Nonce:    "keep-me",
 	})
@@ -239,7 +235,7 @@ func TestIssueTokensStoresRedeemableRefreshToken(t *testing.T) {
 	if entry == nil || reused {
 		t.Fatal("issued refresh token is not redeemable")
 	}
-	if entry.Sub != "demo" || entry.ClientID != srv.cfg.ClientID {
+	if entry.Sub != "demo" || entry.ClientID != testClientID {
 		t.Errorf("unexpected refresh entry: %+v", entry)
 	}
 	if entry.Nonce != "keep-me" {
@@ -265,9 +261,9 @@ func signedTestToken(t *testing.T, srv *Server, claims jwt.MapClaims, access boo
 }
 
 // TestVerifyAccessTokenRequiresAudience pins the H4 fix: a correctly signed,
-// unexpired access token whose audience does not match the configured one
-// must be rejected by userinfo/introspect instead of being accepted for any
-// audience.
+// unexpired access token whose audience does not belong to a registered
+// client must be rejected by userinfo/introspect instead of being accepted
+// for any audience.
 func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
 	srv := newTestServer(t)
 	base := jwt.MapClaims{
@@ -297,7 +293,7 @@ func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
 	for k, v := range base {
 		right[k] = v
 	}
-	right["aud"] = srv.cfg.Audience
+	right["aud"] = testClientID
 	if _, err := srv.verifyAccessToken(signedTestToken(t, srv, right, true)); err != nil {
 		t.Errorf("a token for the configured audience must be accepted: %v", err)
 	}
@@ -310,7 +306,7 @@ func TestIDTokenRejectedAsAccessToken(t *testing.T) {
 	claims := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
 		"sub": "demo",
-		"aud": srv.cfg.Audience,
+		"aud": testClientID,
 		"exp": time.Now().Add(time.Hour).Unix(),
 		"iat": time.Now().Unix(),
 	}
@@ -331,22 +327,25 @@ func TestParseIDTokenHintAcceptsExpired(t *testing.T) {
 	claims := jwt.MapClaims{
 		"iss": srv.cfg.Issuer,
 		"sub": "demo",
-		"aud": srv.cfg.Audience,
+		"aud": testClientID,
 		"exp": time.Now().Add(-time.Hour).Unix(),
 		"iat": time.Now().Add(-2 * time.Hour).Unix(),
 		"sid": "family-1",
 	}
 	hint := signedTestToken(t, srv, claims, false)
-	parsed, err := srv.parseIDTokenHint(hint)
+	parsed, client, err := srv.parseIDTokenHint(hint)
 	if err != nil {
 		t.Fatalf("expired id_token_hint rejected: %v", err)
+	}
+	if client == nil || client.ID() != testClientID {
+		t.Errorf("hint client = %v, want %q", client, testClientID)
 	}
 	if parsed["sid"] != "family-1" {
 		t.Errorf("sid = %v, want family-1", parsed["sid"])
 	}
 
 	// Access tokens and foreign issuers stay rejected.
-	if _, err := srv.parseIDTokenHint(signedTestToken(t, srv, claims, true)); err == nil {
+	if _, _, err := srv.parseIDTokenHint(signedTestToken(t, srv, claims, true)); err == nil {
 		t.Error("an access token must be rejected as id_token_hint")
 	}
 	foreign := jwt.MapClaims{}
@@ -354,7 +353,7 @@ func TestParseIDTokenHintAcceptsExpired(t *testing.T) {
 		foreign[k] = v
 	}
 	foreign["iss"] = "https://evil.example"
-	if _, err := srv.parseIDTokenHint(signedTestToken(t, srv, foreign, false)); err == nil {
+	if _, _, err := srv.parseIDTokenHint(signedTestToken(t, srv, foreign, false)); err == nil {
 		t.Error("a hint from another issuer must be rejected")
 	}
 }

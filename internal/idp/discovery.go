@@ -6,12 +6,13 @@ import "net/http"
 // <issuer>/.well-known/openid-configuration to learn the
 // endpoint URLs and the jwks_uri used for JWT validation.
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
-	// Client authentication methods depend on the configured client mode: a
-	// confidential client (MINIDP_MODE=confidential) authenticates with its
-	// secret, a public client with none.
+	// Client authentication methods are provider-wide metadata: "none" is
+	// always available (public clients identify themselves with client_id
+	// only); the secret-based methods are advertised when at least one
+	// registered client is confidential.
 	clientAuthMethods := []string{"none"}
-	if s.cfg.Confidential() {
-		clientAuthMethods = []string{"client_secret_basic", "client_secret_post"}
+	if s.clients.anyConfidential() {
+		clientAuthMethods = append(clientAuthMethods, "client_secret_basic", "client_secret_post")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                        s.cfg.Issuer,

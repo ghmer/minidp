@@ -1,0 +1,30 @@
+[
+  {
+    "client_id": "spa-app",
+    "type": "public",
+    "redirect_uris": ["http://localhost:3000/callback"],
+    "post_logout_redirect_uris": ["http://localhost:3000/callback"],
+    "users": [
+      {
+        "username": "alice",
+        "password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+        "email": "alice@example.com",
+        "name": "Alice Example",
+        "roles": ["user"]
+      }
+    ]
+  },
+  {
+    "client_id": "backend",
+    "type": "confidential",
+    "client_secret": "REPLACE-WITH-openssl-rand-base64-32",
+    "audience": "backend-api",
+    "redirect_uris": ["https://backend.example.com/callback"],
+    "users": [
+      {
+        "username": "bob",
+        "password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+      }
+    ]
+  }
+]

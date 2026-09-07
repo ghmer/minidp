@@ -50,15 +50,15 @@ type profileData struct {
 	roles []string
 }
 
-// profileFor loads the users-file record and releases its claims strictly
+// profileFor loads the client's user record and releases its claims strictly
 // according to the granted scopes (OIDC Core §5.4): profile unlocks name,
 // email unlocks the email claim. Roles are authorization data, not profile
 // claims: they are released whenever the record defines them, regardless of
-// the scopes. The values come from the users-file record; nothing is
+// the scopes. The values come from the clients-file record; nothing is
 // fabricated, so an absent claim is simply omitted.
-func (s *Server) profileFor(sub string, wantProfile, wantEmail bool) profileData {
+func profileFor(store UserStore, sub string, wantProfile, wantEmail bool) profileData {
 	var p profileData
-	u, ok := s.users.Lookup(sub)
+	u, ok := store.Lookup(sub)
 	if !ok {
 		return p
 	}
@@ -73,13 +73,14 @@ func (s *Server) profileFor(sub string, wantProfile, wantEmail bool) profileData
 }
 
 // registeredClaims builds the registered claims shared by every issued
-// token: the configured issuer and audience (never a caller-chosen one), the
-// subject and the standard timestamps.
-func (s *Server) registeredClaims(sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
+// token: the configured issuer and the audience of the client the token is
+// minted for (never a caller-chosen one), the subject and the standard
+// timestamps.
+func (s *Server) registeredClaims(audience, sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
 	return jwt.RegisteredClaims{
 		Issuer:    s.cfg.Issuer,
 		Subject:   sub,
-		Audience:  jwt.ClaimStrings{s.cfg.Audience},
+		Audience:  jwt.ClaimStrings{audience},
 		ExpiresAt: jwt.NewNumericDate(expires),
 		IssuedAt:  jwt.NewNumericDate(now),
 		ID:        jti,
@@ -129,6 +130,12 @@ func newIDClaims(rc jwt.RegisteredClaims, nonce, family string, wantProfile bool
 // caller-chosen one — and profile claims are released strictly according to
 // the granted scopes from the authoritative users-file record.
 func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
+	// The context's client must be registered: the audience of its tokens is
+	// the client's own, and its profile claims come from its own users.
+	client := s.clients.lookup(ctx.ClientID)
+	if client == nil {
+		return nil, fmt.Errorf("issue tokens for unregistered client %q", ctx.ClientID)
+	}
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
 
@@ -140,10 +147,10 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	}
 	wantProfile := hasScope(ctx.Scopes, "profile")
 	wantEmail := hasScope(ctx.Scopes, "email")
-	profile := s.profileFor(ctx.Sub, wantProfile, wantEmail)
+	profile := profileFor(client.users, ctx.Sub, wantProfile, wantEmail)
 
 	access := newAccessClaims(
-		s.registeredClaims(ctx.Sub, accessJTI, now, accessExpires),
+		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
 		joinScopes(ctx.Scopes), wantProfile, profile)
 	accessTokenString, err := s.key.signAccess(access)
 	if err != nil {
@@ -160,7 +167,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 		Scope:       joinScopes(ctx.Scopes),
 	}
 	if hasScope(ctx.Scopes, "openid") {
-		if resp.IDToken, err = s.issueIDToken(ctx, now, accessExpires, wantProfile, profile); err != nil {
+		if resp.IDToken, err = s.issueIDToken(ctx, client.Audience(), now, accessExpires, wantProfile, profile); err != nil {
 			return nil, err
 		}
 	}
@@ -185,15 +192,16 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 }
 
 // issueIDToken mints and signs the id_token for the token set. The caller
-// checks the openid scope.
-func (s *Server) issueIDToken(ctx *authContext, now, expires time.Time, wantProfile bool, profile profileData) (string, error) {
+// checks the openid scope and passes the audience of the client the token is
+// minted for.
+func (s *Server) issueIDToken(ctx *authContext, audience string, now, expires time.Time, wantProfile bool, profile profileData) (string, error) {
 	// A crypto/rand failure must not panic here (review finding F6).
 	idJTI, err := randomJTI()
 	if err != nil {
 		return "", fmt.Errorf("generate id token jti: %w", err)
 	}
 	id := newIDClaims(
-		s.registeredClaims(ctx.Sub, idJTI, now, expires),
+		s.registeredClaims(audience, ctx.Sub, idJTI, now, expires),
 		ctx.Nonce, ctx.Family, wantProfile, profile)
 	idTokenString, err := s.key.sign(id)
 	if err != nil {

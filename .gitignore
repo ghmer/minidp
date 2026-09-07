@@ -1,5 +1,6 @@
 # Compiled binary
 /minidp
+/clientctl
 /dist/
 
 # Test and coverage artefacts
@@ -9,8 +10,11 @@ coverage.txt
 
 # OS noise
 .DS_Store
-users.json
 
 # Local-only files: personal demo stack and archived design drafts
 docker-compose.yml
 legacy-design/
+
+# The clients file holds client secrets and password hashes: never commit it.
+# Start from clients.json.example and manage it with the clientctl tool.
+clients.json
