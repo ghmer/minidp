@@ -70,6 +70,20 @@ IDP_CLIENTS_FILE=$PWD/clients.json \
 ./minidp
 ```
 
+No Go toolchain? The container image ships `clientctl` — manage the
+clients file from the host with docker, nothing runs inside a deployed
+IdP container (details in [docs/clients.md](docs/clients.md)):
+
+```sh
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/app" \
+  --entrypoint clientctl ghcr.io/ghmer/minidp:latest \
+  client add -file clients.json -client demo-app -type public \
+  -redirect http://localhost:3000/callback
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/app" \
+  --entrypoint clientctl ghcr.io/ghmer/minidp:latest \
+  user add   -file clients.json -client demo-app -username alice -email alice@example.com    # prompts for the password
+```
+
 Then open
 `http://localhost:8080/authorize?client_id=demo-app&redirect_uri=http://localhost:3000/callback&response_type=code&scope=openid&code_challenge=<challenge>&code_challenge_method=S256&state=x&nonce=y`
 and sign in with the account you created.
@@ -124,9 +138,3 @@ go test -race -timeout 120s ./...    # unit + HTTP flow tests
 
 CI (`.github/workflows/ci.yml`) runs all three on every push. Test timeouts
 are mandatory — never run the suite without `-timeout`.
-
-## Attribution
-
-The embedded login page logo is taken from the Rego Adventure project
-(© Mario Enrico Ragucci, Apache License 2.0). The default login page
-styling is minidp's own "Deep Water" theme.

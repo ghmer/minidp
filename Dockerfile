@@ -11,6 +11,7 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /minidp .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /clientctl ./cmd/clientctl
 
 # ---- runtime stage ----------------------------------------------------------
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
@@ -20,7 +21,10 @@ RUN addgroup -g 10001 minidp \
  && adduser -D -H -u 10001 -G minidp minidp \
  && mkdir /data && chown minidp:minidp /data
 
+# clientctl (clients-file manager) ships alongside the server; run it
+# host-side with docker — see docs/clients.md
 COPY --from=build /minidp /usr/local/bin/minidp
+COPY --from=build /clientctl /usr/local/bin/clientctl
 
 # Workdir anchors the fixed assets location: mounting login.css / logo.svg at
 # /app/assets overrides the embedded login page branding per file (see README).

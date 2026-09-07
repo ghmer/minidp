@@ -13,6 +13,16 @@ docker run -d --name minidp -p 8080:8080 \
 # IdP: http://localhost:8080
 ```
 
+The image also ships the `clientctl` clients-file manager, so the clients
+file is maintained from the host with plain docker — no Go toolchain, and
+nothing runs inside the deployed IdP container (details in
+[docs/clients.md](clients.md); `minidp` here is the locally built image):
+
+```sh
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/app" \
+  --entrypoint clientctl minidp client list
+```
+
 For a non-localhost deployment, override the public URL
 (`IDP_ISSUER=https://idp.example.com`) and register the client's public
 redirect URI in its clients-file entry.

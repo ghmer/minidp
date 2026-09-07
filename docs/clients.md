@@ -119,6 +119,24 @@ clientctl user remove  -file clients.json -client demo-app -username bob
 clientctl hash         -password '...'                                 # print a hash for manual editing
 ```
 
+**Without a Go toolchain**, run the `clientctl` bundled in the container
+image via docker — same commands, executed against the clients file in the
+current directory. The working directory is mounted at `/app` (the tool's
+working directory, so the relative `-file` paths above work unchanged),
+and the container runs as your own user so the rewritten file stays yours
+(the tool rewrites the clients file atomically — temp file plus rename in
+the same directory — which is why the directory is mounted, not the file):
+
+```sh
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/app" \
+  --entrypoint clientctl ghcr.io/ghmer/minidp:latest \
+  client add -file clients.json -client demo-app -type public \
+  -redirect http://localhost:3000/callback
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/app" \
+  --entrypoint clientctl ghcr.io/ghmer/minidp:latest \
+  user add   -file clients.json -client demo-app -username alice   # prompts for the password
+```
+
 File format (see `clients.json.example`):
 
 ```json
