@@ -55,6 +55,13 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
 
+	// A crypto/rand failure must not panic here (review finding F6): this
+	// runs inside request handlers, so the error degrades to a 500.
+	accessJTI, err := randomJTI()
+	if err != nil {
+		return nil, fmt.Errorf("generate access token jti: %w", err)
+	}
+
 	// Scope-based claim release (OIDC Core §5.4): profile unlocks
 	// preferred_username and name, email unlocks the email claim. The values
 	// come from the users-file record; nothing is fabricated (no
@@ -82,7 +89,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 			Audience:  jwt.ClaimStrings{s.cfg.Audience},
 			ExpiresAt: jwt.NewNumericDate(accessExpires),
 			IssuedAt:  jwt.NewNumericDate(now),
-			ID:        randomJTI(),
+			ID:        accessJTI,
 		},
 		Scope: joinScopes(ctx.Scopes),
 	}
@@ -107,6 +114,10 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	}
 
 	if hasScope(ctx.Scopes, "openid") {
+		idJTI, err := randomJTI()
+		if err != nil {
+			return nil, fmt.Errorf("generate id token jti: %w", err)
+		}
 		id := &idClaims{
 			RegisteredClaims: jwt.RegisteredClaims{
 				Issuer:    s.cfg.Issuer,
@@ -114,7 +125,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 				Audience:  jwt.ClaimStrings{s.cfg.Audience},
 				ExpiresAt: jwt.NewNumericDate(accessExpires),
 				IssuedAt:  jwt.NewNumericDate(now),
-				ID:        randomJTI(),
+				ID:        idJTI,
 			},
 			Nonce:     ctx.Nonce,
 			SessionID: ctx.Family,
@@ -136,23 +147,30 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	// client, scopes and nonce so it can mint the next token set. Every token
 	// of a chain shares the Family id of the originating authorization so reuse
 	// detection can revoke the whole chain.
-	resp.RefreshToken = s.store.addRefresh(&refreshEntry{
+	refresh, err := s.store.addRefresh(&refreshEntry{
 		Sub:      ctx.Sub,
 		ClientID: ctx.ClientID,
 		Scopes:   ctx.Scopes,
 		Nonce:    ctx.Nonce,
 		Family:   ctx.Family,
 	}, s.cfg.RefreshTokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("persist refresh token: %w", err)
+	}
+	resp.RefreshToken = refresh
 
 	return resp, nil
 }
 
-func randomJTI() string {
+// randomJTI returns a 128-bit random claim id. crypto/rand failures are
+// propagated as an error instead of panicking (review finding F6): callers
+// run inside request handlers, where a panic would kill the whole process.
+func randomJTI() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		panic(err)
+		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(b)
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func joinScopes(scopes []string) string {

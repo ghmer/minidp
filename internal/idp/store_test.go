@@ -5,9 +5,30 @@ import (
 	"time"
 )
 
+// mustAddCode/mustAddRefresh wrap the store constructors for tests: a
+// crypto/rand failure cannot be simulated here and would fail the test run
+// loudly (review finding F6: production propagates it as an error).
+func mustAddCode(t *testing.T, s *store, c *authCode, ttl time.Duration) string {
+	t.Helper()
+	id, err := s.addCode(c, ttl)
+	if err != nil {
+		t.Fatalf("addCode: %v", err)
+	}
+	return id
+}
+
+func mustAddRefresh(t *testing.T, s *store, f *refreshEntry, ttl time.Duration) string {
+	t.Helper()
+	id, err := s.addRefresh(f, ttl)
+	if err != nil {
+		t.Fatalf("addRefresh: %v", err)
+	}
+	return id
+}
+
 func TestAddTakeCodeIsSingleUse(t *testing.T) {
 	s := newStore()
-	id := s.addCode(&authCode{Sub: "rego", ClientID: "c1"}, time.Minute)
+	id := mustAddCode(t, s, &authCode{Sub: "rego", ClientID: "c1"}, time.Minute)
 
 	got := s.takeCode(id)
 	if got == nil {
@@ -30,7 +51,7 @@ func TestTakeCodeUnknown(t *testing.T) {
 
 func TestTakeCodeExpired(t *testing.T) {
 	s := newStore()
-	id := s.addCode(&authCode{Sub: "rego"}, -time.Minute) // already expired
+	id := mustAddCode(t, s, &authCode{Sub: "rego"}, -time.Minute) // already expired
 	if got := s.takeCode(id); got != nil {
 		t.Fatalf("expected expired code to be rejected, got %+v", got)
 	}
@@ -38,10 +59,10 @@ func TestTakeCodeExpired(t *testing.T) {
 
 func TestDropExpiredSweepsBothMaps(t *testing.T) {
 	s := newStore()
-	s.addCode(&authCode{Sub: "rego"}, -time.Minute)
-	s.addRefresh(&refreshEntry{Sub: "rego"}, -time.Minute)
-	s.addCode(&authCode{Sub: "rego"}, time.Minute)        // stays
-	s.addRefresh(&refreshEntry{Sub: "rego"}, time.Minute) // stays
+	mustAddCode(t, s, &authCode{Sub: "rego"}, -time.Minute)
+	mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, -time.Minute)
+	mustAddCode(t, s, &authCode{Sub: "rego"}, time.Minute)        // stays
+	mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, time.Minute) // stays
 
 	s.mu.Lock()
 	s.dropExpired()
@@ -58,7 +79,7 @@ func TestDropExpiredSweepsBothMaps(t *testing.T) {
 
 func TestRefreshTokenRotation(t *testing.T) {
 	s := newStore()
-	first := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	first := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
 	entry, reused := s.takeRefresh(first)
 	if entry == nil || reused {
@@ -76,7 +97,7 @@ func TestRefreshTokenRotation(t *testing.T) {
 	}
 
 	// A newly issued refresh token is independent of the old one.
-	second := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	second := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 	if second == first {
 		t.Fatal("expected new refresh token id to differ from the old one")
 	}
@@ -87,7 +108,7 @@ func TestRefreshTokenRotation(t *testing.T) {
 
 func TestTakeRefreshExpired(t *testing.T) {
 	s := newStore()
-	id := s.addRefresh(&refreshEntry{Sub: "rego"}, -time.Minute)
+	id := mustAddRefresh(t, s, &refreshEntry{Sub: "rego"}, -time.Minute)
 	if got, reused := s.takeRefresh(id); got != nil || reused {
 		t.Fatalf("expected expired refresh token to be rejected, got %+v (reused=%v)", got, reused)
 	}
@@ -98,10 +119,10 @@ func TestTakeRefreshExpired(t *testing.T) {
 // entire family derived from the same authorization.
 func TestRefreshFamilyReuseRevokesFamily(t *testing.T) {
 	s := newStore()
-	other := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-other"}, time.Minute)
+	other := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-other"}, time.Minute)
 
-	stolen := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
-	rotated := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	stolen := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	rotated := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
 	// Legitimate rotation consumes the stolen token...
 	if entry, reused := s.takeRefresh(stolen); entry == nil || reused {
@@ -125,16 +146,16 @@ func TestRefreshFamilyReuseRevokesFamily(t *testing.T) {
 // already-consumed one: either way the whole family goes.
 func TestRevokeTokenRevokesFamily(t *testing.T) {
 	s := newStore()
-	sibling := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	sibling := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 
-	live := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
+	live := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-1"}, time.Minute)
 	s.revokeToken(live)
 	if entry, _ := s.takeRefresh(sibling); entry != nil {
 		t.Error("revoking a live token must drop its whole family")
 	}
 
-	sibling2 := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
-	consumed := s.addRefresh(&refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	sibling2 := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
+	consumed := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", ClientID: "c1", Family: "fam-2"}, time.Minute)
 	if _, reused := s.takeRefresh(consumed); reused {
 		t.Fatal("expected first use of the token to succeed")
 	}
@@ -146,8 +167,8 @@ func TestRevokeTokenRevokesFamily(t *testing.T) {
 
 func TestRevokeToken(t *testing.T) {
 	s := newStore()
-	codeID := s.addCode(&authCode{Sub: "rego"}, time.Minute)
-	refreshID := s.addRefresh(&refreshEntry{Sub: "rego", Family: "fam-1"}, time.Minute)
+	codeID := mustAddCode(t, s, &authCode{Sub: "rego"}, time.Minute)
+	refreshID := mustAddRefresh(t, s, &refreshEntry{Sub: "rego", Family: "fam-1"}, time.Minute)
 
 	s.revokeToken(refreshID)
 	if got, _ := s.takeRefresh(refreshID); got != nil {
@@ -161,7 +182,10 @@ func TestRevokeToken(t *testing.T) {
 func TestRandomTokenUnique(t *testing.T) {
 	seen := make(map[string]bool, 100)
 	for i := 0; i < 100; i++ {
-		id := randomToken()
+		id, err := randomToken()
+		if err != nil {
+			t.Fatalf("randomToken: %v", err)
+		}
 		if seen[id] {
 			t.Fatalf("duplicate random token %q", id)
 		}

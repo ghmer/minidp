@@ -202,7 +202,11 @@ func SaveUsers(path string, users []User) error {
 	// Unique temp name inside the same directory (instead of a fixed
 	// <name>.tmp), so concurrent tool invocations cannot clobber each other's
 	// temp file. O_EXCL makes the create exclusive.
-	tmpName := name + ".tmp-" + randomToken()
+	suffix, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate temp file name: %w", err)
+	}
+	tmpName := name + ".tmp-" + suffix
 	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temp file in %q: %w", dir, err)

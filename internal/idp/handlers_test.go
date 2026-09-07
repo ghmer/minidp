@@ -89,7 +89,12 @@ func decodeJSON(t *testing.T, resp *http.Response) map[string]any {
 
 // pkcePair returns a fresh verifier/challenge pair (S256).
 func pkcePair() (verifier, challenge string) {
-	verifier = randomToken()
+	verifier, err := randomToken()
+	if err != nil {
+		// crypto/rand failure is unrecoverable for a test process; production
+		// code propagates it as an error (review finding F6).
+		panic("pkcePair: " + err.Error())
+	}
 	return verifier, pkceS256(verifier)
 }
 
@@ -596,7 +601,11 @@ func TestTokenGrantRejectsWrongVerifier(t *testing.T) {
 	form.Set("code", code)
 	form.Set("client_id", testClientID)
 	form.Set("redirect_uri", testRedirect)
-	form.Set("code_verifier", randomToken()) // wrong verifier
+	wrongVerifier, err := randomToken()
+	if err != nil {
+		t.Fatalf("randomToken: %v", err)
+	}
+	form.Set("code_verifier", wrongVerifier) // wrong verifier
 	resp := postForm(t, http.DefaultClient, ts.URL+"/token", form)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -836,6 +845,11 @@ func TestUserinfo(t *testing.T) {
 	if info["email"] != "rego@example.com" {
 		t.Errorf("userinfo email = %v, want the users-file value", info["email"])
 	}
+	// F3: discovery advertises `name` in claims_supported, so UserInfo must
+	// emit it too when the profile scope was granted.
+	if info["name"] != "Rego" {
+		t.Errorf("userinfo name = %v, want the users-file value", info["name"])
+	}
 
 	// A garbage token must be rejected with 401.
 	bad, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
@@ -897,6 +911,9 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 	}
 	if _, has := info["preferred_username"]; has {
 		t.Error("preferred_username must not be released without the profile scope")
+	}
+	if _, has := info["name"]; has {
+		t.Error("name must not be released without the profile scope")
 	}
 	if _, has := info["email"]; has {
 		t.Error("email must not be released without the email scope")
@@ -1053,6 +1070,81 @@ func TestEndSessionRevokesTokenFamily(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("/end_session without hint: status = %d, want 200", resp2.StatusCode)
 	}
+}
+
+// TestEndSessionHintValidatesAudience pins the F4 fix: an id_token_hint whose
+// audience does not match this provider is rejected, so a signed token minted
+// for a DIFFERENT client cannot revoke a session here — even when it names a
+// live family via sid. A hint with the right audience but a stale exp is still
+// honoured (M6): expiry does not disqualify a logout hint.
+func TestEndSessionHintValidatesAudience(t *testing.T) {
+	ts, srv := testIDP(t, nil)
+	verifier, _ := pkcePair()
+	code := codeFrom(t, login(t, ts.URL, "rego", "adventure", verifier))
+	tokens := decodeJSON(t, postForm(t, http.DefaultClient, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {testClientID},
+		"redirect_uri":  {testRedirect},
+		"code_verifier": {verifier},
+	}))
+	access := tokens["access_token"].(string)
+	realSID := verifyTokenString(t, tokens["id_token"].(string), ts.URL)["sid"].(string)
+
+	familyAlive := func(want int) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+access)
+		ui, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /userinfo: %v", err)
+		}
+		_ = ui.Body.Close()
+		if ui.StatusCode != want {
+			t.Errorf("userinfo after logout attempt: status = %d, want %d", ui.StatusCode, want)
+		}
+	}
+
+	// A validly signed id_token for a foreign audience must be rejected as a
+	// logout hint: the family stays alive.
+	foreign := jwt.MapClaims{
+		"iss": srv.cfg.Issuer,
+		"sub": "rego",
+		"aud": "some-other-client",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+		"sid": realSID,
+	}
+	hint, err := srv.key.sign(foreign)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	resp, err := http.Get(ts.URL + "/end_session?id_token_hint=" + url.QueryEscape(hint))
+	if err != nil {
+		t.Fatalf("GET /end_session: %v", err)
+	}
+	_ = resp.Body.Close()
+	familyAlive(http.StatusOK)
+
+	// A matching-audience hint with an EXPIRED token still revokes the family.
+	expired := jwt.MapClaims{
+		"iss": srv.cfg.Issuer,
+		"sub": "rego",
+		"aud": srv.cfg.Audience,
+		"exp": time.Now().Add(-time.Minute).Unix(),
+		"iat": time.Now().Add(-time.Hour).Unix(),
+		"sid": realSID,
+	}
+	hint2, err := srv.key.sign(expired)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	resp2, err := http.Get(ts.URL + "/end_session?id_token_hint=" + url.QueryEscape(hint2))
+	if err != nil {
+		t.Fatalf("GET /end_session: %v", err)
+	}
+	_ = resp2.Body.Close()
+	familyAlive(http.StatusUnauthorized)
 }
 
 // TestIntrospectRevokeClientAuth pins the review fix: in confidential mode
@@ -1530,6 +1622,37 @@ func TestLoginRateLimiting(t *testing.T) {
 		if !strings.Contains(string(body), `name="`+key+`" value="`+form.Get(key)+`"`) {
 			t.Errorf("429 page is missing the hidden field %q", key)
 		}
+	}
+}
+
+// TestRateLimitIgnoresCSRFJunk pins the F5 fix: POSTs without a valid CSRF
+// token are rejected before the limiter runs, so junk traffic cannot burn the
+// per-IP budget and lock a legitimate user out (shared NAT). Attempts that DO
+// carry a browser-issued CSRF token are still throttled (TestLoginRateLimiting).
+func TestRateLimitIgnoresCSRFJunk(t *testing.T) {
+	ts, _ := testIDP(t, func(c *Config) { c.LoginRateLimit = 2 })
+	verifier, _ := pkcePair()
+
+	for i := 0; i < 5; i++ {
+		form := authorizeForm(verifier)
+		form.Set("username", "rego")
+		form.Set("password", "adventure")
+		form.Set("csrf_token", "forged")
+		resp := postForm(t, http.DefaultClient, ts.URL+"/authorize", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("junk attempt %d: status = %d, want 400 (CSRF rejection, not 429)", i+1, resp.StatusCode)
+		}
+	}
+
+	// The legitimate user on the same IP is unaffected.
+	browser := newBrowser()
+	form := authorizeForm(verifier)
+	form.Set("username", "rego")
+	form.Set("password", "adventure")
+	form.Set("csrf_token", fetchCSRF(t, browser, ts.URL+"/authorize", authorizeForm(verifier)))
+	resp := postForm(t, browser, ts.URL+"/authorize", form)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("login after junk: status = %d, want 302", resp.StatusCode)
 	}
 }
 

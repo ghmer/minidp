@@ -292,17 +292,6 @@ func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 // browser back to the client with a single-use authorization code.
 func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.limiter.allow(ip) {
-		slog.Warn("login rate limited", "ip", ip)
-		// Carry the OAuth2 context through the re-render (like every other
-		// error branch) so a retry after the cooldown submits a complete form.
-		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
-			Action: "/authorize",
-			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
-			Hidden: oauthHiddenFields(oauthParamsOf(r)),
-		})
-		return
-	}
 	if err := r.ParseForm(); err != nil {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
 		return
@@ -319,6 +308,22 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
 			Action: "/authorize",
 			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
+			Hidden: oauthHiddenFields(form),
+		})
+		return
+	}
+
+	// Rate limiting happens only AFTER CSRF validation (review finding F5):
+	// junk POSTs without a valid CSRF token cannot burn the IP budget of a
+	// legitimate user sharing the same NAT. Brute-force attempts still carry
+	// a browser-issued CSRF token and are throttled below.
+	if !s.limiter.allow(ip) {
+		slog.Warn("login rate limited", "ip", ip)
+		// Carry the OAuth2 context through the re-render (like every other
+		// error branch) so a retry after the cooldown submits a complete form.
+		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
+			Action: "/authorize",
+			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
 			Hidden: oauthHiddenFields(form),
 		})
 		return
@@ -353,7 +358,7 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
 
-	code := s.store.addCode(&authCode{
+	code, err := s.store.addCode(&authCode{
 		Sub:                 who.Sub,
 		ClientID:            q.Get("client_id"),
 		RedirectURI:         q.Get("redirect_uri"),
@@ -362,6 +367,15 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		Nonce:               q.Get("nonce"),
 		Scopes:              parseScopes(q.Get("scope")),
 	}, authCodeTTL)
+	if err != nil {
+		slog.Error("authorization code generation failed", "error", err)
+		s.renderLoginPage(w, r, http.StatusInternalServerError, loginData{
+			Action: "/authorize",
+			Error:  "Internal error. Please start again.",
+			Hidden: oauthHiddenFields(form),
+		})
+		return
+	}
 	slog.Info("authorization code issued", "client", q.Get("client_id"), "redirect", q.Get("redirect_uri"))
 
 	// Redirect to the registered entry itself, never the user-supplied
@@ -390,14 +404,6 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 // page. It issues no tokens; tokens always require a real authorize request.
 func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.limiter.allow(ip) {
-		slog.Warn("login rate limited", "ip", ip)
-		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
-			Action: "/login",
-			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
-		})
-		return
-	}
 	if err := r.ParseForm(); err != nil {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
 		return
@@ -408,6 +414,16 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
 			Action: "/login",
 			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
+		})
+		return
+	}
+	// Rate limited only after CSRF validation (review finding F5): junk
+	// requests must not exhaust the IP budget of a legitimate user.
+	if !s.limiter.allow(ip) {
+		slog.Warn("login rate limited", "ip", ip)
+		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
+			Action: "/login",
+			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
 		})
 		return
 	}
@@ -598,12 +614,20 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A fresh authorization starts a new refresh chain. A crypto/rand failure
+	// here degrades to a 500 instead of panicking the process (finding F6).
+	family, err := randomToken()
+	if err != nil {
+		slog.Error("token issuance failed", "grant", "authorization_code", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
+		return
+	}
 	resp, err := s.issueTokens(&authContext{
 		Sub:      ac.Sub,
 		ClientID: ac.ClientID,
 		Scopes:   ac.Scopes,
 		Nonce:    ac.Nonce,
-		Family:   randomToken(), // a fresh authorization starts a new refresh chain
+		Family:   family,
 	})
 	if err != nil {
 		slog.Error("token issuance failed", "grant", "authorization_code", "error", err)
@@ -728,10 +752,12 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 }
 
 // parseIDTokenHint validates an id_token_hint for /end_session. Per OIDC
-// RP-Initiated Logout the hint's signature and issuer are verified, but an
-// EXPIRED hint still identifies the token family to revoke — so expiry and
-// audience are deliberately not enforced here (review finding M6). The
-// registered-claims validation is disabled and the issuer is checked
+// RP-Initiated Logout the hint's signature and issuer are verified, and an
+// EXPIRED hint still identifies the token family to revoke — so expiry is
+// deliberately not enforced here (review finding M6). The audience is,
+// however, checked: a signed id_token minted for a different audience is not
+// a logout hint this provider has to honour (review finding F4). The
+// registered-claims validation is disabled and issuer/audience are checked
 // manually instead.
 func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(hint, func(t *jwt.Token) (any, error) {
@@ -753,6 +779,10 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, error) {
 	if iss, _ := claims["iss"].(string); iss != s.cfg.Issuer {
 		return nil, fmt.Errorf("invalid token: foreign issuer")
 	}
+	aud, _ := claims.GetAudience()
+	if len(aud) == 0 || !audContains(aud, s.cfg.Audience) {
+		return nil, fmt.Errorf("invalid token: audience not accepted here")
+	}
 	return claims, nil
 }
 
@@ -770,7 +800,14 @@ func bearerToken(r *http.Request) string {
 // authenticating introspection; an open /revoke is a free probe endpoint).
 // Accepted: HTTP Basic auth (any username, the configured secret as password)
 // or a client_secret form field. In public mode (no secret configured) both
-// endpoints are open.
+// endpoints are open — there is no client secret to check.
+//
+// Documented trade-off (review finding F1): in public mode /revoke is an
+// unauthenticated write operation, so anyone who merely OBSERVES a bearer
+// token can revoke that session (denial of service for the victim: refresh
+// family revoked, live access tokens denied via jti). The public profile has
+// no secret to authenticate with and sender-constraining (DPoP) is out of
+// scope for minidp; see the README section "Security trade-offs".
 func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool {
 	if !s.cfg.Confidential() {
 		return true
@@ -792,7 +829,9 @@ func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool 
 // access token. The token must carry the configured audience, the access
 // token profile (typ at+jwt) and the openid scope; profile claims are
 // released according to the granted scopes and resolved from the users-file
-// record — never synthesised (review findings H3/H4/M2/L2).
+// record — never synthesised (review findings H3/H4/M2/L2). `name` is
+// emitted alongside preferred_username so the response matches the
+// claims_supported advertised by discovery (review finding F3).
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	claims, err := s.verifyAccessToken(bearerToken(r))
 	if err != nil {
@@ -818,11 +857,14 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
 	// Authoritative record first; the scope-gated token claims are the
-	// fallback for subjects that have since been removed from the file.
-	var username, email string
+	// fallback for subjects that have since been removed from the file. The
+	// access token carries no name claim, so for such subjects the name is
+	// simply omitted (an absent claim is never fabricated).
+	var username, email, name string
 	if u, ok := s.users.Lookup(sub); ok {
 		if wantProfile {
 			username = u.Username
+			name = u.Name
 		}
 		if wantEmail {
 			email = u.Email
@@ -837,6 +879,9 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if wantProfile && username != "" {
 		out["preferred_username"] = username
+	}
+	if wantProfile && name != "" {
+		out["name"] = name
 	}
 	if wantEmail && email != "" {
 		out["email"] = email
@@ -915,8 +960,9 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // server-side state is dropped.
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	if hint := r.URL.Query().Get("id_token_hint"); hint != "" {
-		// The hint is verified laxly (signature + issuer, no expiry): an
-		// expired id_token_hint still identifies the session to terminate.
+		// The hint is verified for signature, issuer and audience; expiry is
+		// deliberately not enforced: an expired id_token_hint still identifies
+		// the session to terminate (review findings M6/F4).
 		if claims, err := s.parseIDTokenHint(hint); err == nil {
 			if sid, _ := claims["sid"].(string); sid != "" {
 				s.store.revokeFamilyTokens(sid)

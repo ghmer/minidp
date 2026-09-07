@@ -64,7 +64,9 @@ designed to work out of the box as the IdP for
   secure-context exception (Chrome, Firefox — Safari does not implement it,
   use Chrome/Firefox or TLS there).
 - **Rate limiting**: per-client-IP token bucket on the login endpoints
-  (`IDP_LOGIN_RATE_LIMIT`, default 20/min). Behind a reverse proxy, set
+  (`IDP_LOGIN_RATE_LIMIT`, default 20/min). The limiter runs **after** CSRF
+  validation, so junk form posts cannot exhaust the IP budget of a legitimate
+  user sharing the same NAT. Behind a reverse proxy, set
   `TRUSTED_PROXIES` so the real client IP is used (spoofing
   `X-Forwarded-For` from an untrusted peer is ignored).
 - **Constant-time credential check** against bcrypt hashes; unknown usernames
@@ -93,6 +95,30 @@ designed to work out of the box as the IdP for
   username), code issuance, token grants and rejections via slog.
 - **Graceful shutdown** on SIGTERM/SIGINT for k8s/compose rolling updates.
 - Golang-ci-lint and gosec clean (enforced in CI); no `#nosec` directives.
+
+### Security trade-offs (accepted by design)
+
+These limitations are inherent to the public-client profile (no secret, no
+sender-constrained tokens). They are recorded here so they remain **conscious
+decisions** rather than surprises; revisit them if the deployment profile ever
+changes:
+
+- **`/revoke` and `/introspect` are unauthenticated in public mode** — and
+  `/revoke` is a *write* operation: anyone who merely **observes** a bearer
+  token (a proxy or browser log, a `Referer`, mixed-content capture) can use
+  it to revoke that session (refresh family revoked, live access tokens
+  denied by `jti`) — a targeted denial of service for the victim. The public
+  profile has no client secret to authenticate the call, and
+  sender-constraining the tokens (e.g. DPoP) is out of scope for minidp;
+  token confidentiality in transit is the mitigation. `confidential` mode
+  requires client authentication on both endpoints.
+- **Refresh tokens are unconstrained bearer tokens.** In public mode they are
+  redeemable with only the `client_id` — a leaked refresh token is fully
+  replayable by anyone until its TTL. Single-use rotation and family-wide
+  revocation on reuse (RFC 9700 §4.14.2) contain the blast radius but do not
+  eliminate the exposure; this is the standard public-client trade-off,
+  accepted here deliberately. Use `confidential` mode when the client can
+  keep a secret.
 
 ## Quick start
 
@@ -164,7 +190,8 @@ at startup.
 - PKCE (S256) is **mandatory** at `/authorize` and verified at `/token`
 - `/token` accepts only `client_id` identification — public clients cannot
   keep secrets, so none is configured (`IDP_CLIENT_SECRET` must be unset)
-- `/introspect` and `/revoke` are open (tokens are 256-bit random)
+- `/introspect` and `/revoke` are open (documented trade-off, see
+  [Security trade-offs](#security-trade-offs-accepted-by-design))
 
 **`MINIDP_MODE=confidential`** — the backend/profile for a client that can
 hold a secret (requires `IDP_CLIENT_SECRET`):
@@ -212,8 +239,9 @@ the rego-adventure authentication environment variables at minidp:
 The frontend performs the PKCE code exchange directly against minidp (CORS is
 enabled for this); the backend validates the Bearer JWT against minidp's JWKS.
 The SPA should request `openid profile email` — claims are released strictly
-by scope: `profile` unlocks `preferred_username`/`name`, `email` unlocks the
-`email` claim, and a token without the `openid` scope cannot call `/userinfo`.
+by scope: `profile` unlocks `preferred_username`/`name` (on both tokens and
+`/userinfo`), `email` unlocks the `email` claim, and a token without the
+`openid` scope cannot call `/userinfo`.
 Roles set on the users-file record are released as the `roles` array claim on
 both tokens independent of the scopes.
 
@@ -306,8 +334,9 @@ proxy's network in `TRUSTED_PROXIES`.
   and revocation state, and multiple replicas would diverge. This is a
   deliberate trade-off of the 10 MB container scope.
 - **Logout is minimal, not full OIDC RP-Initiated Logout.** `/end_session`
-  accepts an `id_token_hint` (verified laxly: an expired hint still identifies
-  the token family) and revokes that authorization's tokens;
+  accepts an `id_token_hint` (verified for signature, issuer and audience; an
+  expired hint still identifies the token family) and revokes that
+  authorization's tokens;
   `post_logout_redirect_uri` must exactly match a registered redirect. There
   is no browser session cookie to terminate without a hint, `client_id`,
   `logout_hint` and an independent `sid` parameter are not handled, and

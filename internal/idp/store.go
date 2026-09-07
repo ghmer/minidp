@@ -3,6 +3,7 @@ package idp
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -73,14 +74,17 @@ func newStore() *store {
 	}
 }
 
-func (s *store) addCode(c *authCode, ttl time.Duration) string {
+func (s *store) addCode(c *authCode, ttl time.Duration) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropExpired()
-	id := randomToken()
+	id, err := randomToken()
+	if err != nil {
+		return "", err
+	}
 	c.ExpiresAt = time.Now().Add(ttl)
 	s.codes[id] = c
-	return id
+	return id, nil
 }
 
 // takeCode removes and returns a code by id, or nil if it is unknown, expired,
@@ -101,14 +105,17 @@ func (s *store) takeCode(id string) *authCode {
 	return c
 }
 
-func (s *store) addRefresh(f *refreshEntry, ttl time.Duration) string {
+func (s *store) addRefresh(f *refreshEntry, ttl time.Duration) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropExpired()
-	id := randomToken()
+	id, err := randomToken()
+	if err != nil {
+		return "", err
+	}
 	f.ExpiresAt = time.Now().Add(ttl)
 	s.refresh[id] = f
-	return id
+	return id, nil
 }
 
 // takeRefresh consumes a refresh token (single-use). reused is true when the
@@ -241,10 +248,14 @@ func (s *store) dropExpired() {
 	}
 }
 
-func randomToken() string {
+// randomToken returns a 256-bit random URL-safe token id. crypto/rand
+// failures are propagated as an error instead of panicking (review finding
+// F6): callers run inside request handlers, where a panic would kill the
+// whole process rather than fail the single request.
+func randomToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		panic(err)
+		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(b)
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
