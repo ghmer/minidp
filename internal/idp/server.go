@@ -187,24 +187,31 @@ func (s *Server) clientIP(r *http.Request) string {
 		return host
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			candidate := strings.TrimSpace(parts[i])
-			cIP := net.ParseIP(candidate)
-			if cIP == nil {
-				continue // malformed entry: cannot be the real client, keep walking
-			}
-			if !s.ipTrusted(cIP) {
-				return candidate
-			}
-		}
-		// The whole chain consists of trusted proxies; the most specific
-		// address we can vouch for is the socket peer itself.
-		return host
+		return s.forwardedClientIP(xff, host)
 	}
 	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
 		if realIP := net.ParseIP(real); realIP != nil && !s.ipTrusted(realIP) {
 			return real
+		}
+	}
+	return host
+}
+
+// forwardedClientIP walks the X-Forwarded-For chain from right to left and
+// returns the rightmost entry that is not itself a trusted proxy. Malformed
+// entries are skipped: they cannot be the real client address. When the whole
+// chain consists of trusted proxies, the most specific address we can vouch
+// for is the socket peer itself (host).
+func (s *Server) forwardedClientIP(xff, host string) string {
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := strings.TrimSpace(parts[i])
+		cIP := net.ParseIP(candidate)
+		if cIP == nil {
+			continue // malformed entry: cannot be the real client, keep walking
+		}
+		if !s.ipTrusted(cIP) {
+			return candidate
 		}
 	}
 	return host

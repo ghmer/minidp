@@ -173,6 +173,19 @@ func (s *fileUserStore) DummyHash() string { return s.dummyHash }
 // SaveUsers validates and writes the users file atomically (temp file + rename,
 // mode 0600). Used by the minidp-users tool.
 func SaveUsers(path string, users []User) error {
+	if err := validateUsers(users); err != nil {
+		return err
+	}
+	data, err := marshalUsers(users)
+	if err != nil {
+		return err
+	}
+	return saveUsersFile(path, data)
+}
+
+// validateUsers rejects duplicate usernames and entries that fail the
+// users-file validation.
+func validateUsers(users []User) error {
 	seen := make(map[string]bool, len(users))
 	for i, u := range users {
 		if err := u.validate(); err != nil {
@@ -183,12 +196,24 @@ func SaveUsers(path string, users []User) error {
 		}
 		seen[u.Username] = true
 	}
+	return nil
+}
+
+// marshalUsers renders the users file: indented JSON with a trailing newline.
+func marshalUsers(users []User) ([]byte, error) {
 	data, err := json.MarshalIndent(users, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	data = append(data, '\n')
+	return append(data, '\n'), nil
+}
 
+// saveUsersFile atomically writes data to path: a uniquely named temp file in
+// the same directory (instead of a fixed <name>.tmp, so concurrent tool
+// invocations cannot clobber each other's temp file), created exclusively
+// (O_EXCL) with mode 0600, then renamed over the final path — so a crash
+// mid-write can never corrupt the existing file.
+func saveUsersFile(path string, data []byte) error {
 	dir, name := filepath.Split(filepath.Clean(path))
 	if dir == "" {
 		dir = "."
@@ -199,9 +224,6 @@ func SaveUsers(path string, users []User) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	// Unique temp name inside the same directory (instead of a fixed
-	// <name>.tmp), so concurrent tool invocations cannot clobber each other's
-	// temp file. O_EXCL makes the create exclusive.
 	suffix, err := randomToken()
 	if err != nil {
 		return fmt.Errorf("generate temp file name: %w", err)

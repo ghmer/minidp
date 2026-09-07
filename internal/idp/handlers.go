@@ -110,9 +110,28 @@ func (s *Server) validateAuthorizeRequest(q url.Values) (code, description strin
 	if q.Get("response_type") != "code" {
 		return "unsupported_response_type", `Unsupported response_type; only "code" (authorization code flow) is supported.`
 	}
-	// PKCE: mandatory for public clients (RFC 9700); optional but validated
-	// when a confidential client chooses to use it. The token endpoint
-	// re-verifies whatever challenge was stored with the code.
+	if code, description := s.validatePKCEParams(q); code != "" {
+		return code, description
+	}
+	if code, description := validatePrompt(q); code != "" {
+		return code, description
+	}
+	if v := q.Get("response_mode"); v != "" && v != "query" {
+		return "invalid_request", "Unsupported response_mode; only the default query mode is supported."
+	}
+	for _, p := range []string{"max_age", "acr_values", "display", "ui_locales"} {
+		if q.Get(p) != "" {
+			return "invalid_request", fmt.Sprintf("Unsupported parameter %q.", p)
+		}
+	}
+	return validateScopes(q.Get("scope"))
+}
+
+// validatePKCEParams checks the PKCE parameters of an authorize request:
+// mandatory for public clients (RFC 9700); optional but validated when a
+// confidential client chooses to use it. The token endpoint re-verifies
+// whatever challenge was stored with the code.
+func (s *Server) validatePKCEParams(q url.Values) (code, description string) {
 	challenge := q.Get("code_challenge")
 	if challenge == "" {
 		if !s.cfg.Confidential() {
@@ -120,18 +139,22 @@ func (s *Server) validateAuthorizeRequest(q url.Values) (code, description strin
 		}
 		// Confidential client without PKCE: accepted, the secret is the
 		// client's proof of identity at the token endpoint.
-	} else {
-		// RFC 9700 (OAuth 2.0 Security BCP) mandates S256; plain offers no
-		// protection over the wire and a browser SPA can always do S256.
-		if m := q.Get("code_challenge_method"); m != "S256" {
-			return "invalid_request", "Unsupported code_challenge_method; only S256 is supported."
-		}
-		if !validPKCEChallenge(challenge) {
-			return "invalid_request", "Malformed code_challenge: expected 43-128 base64url characters (S256 digest)."
-		}
+		return "", ""
 	}
-	// Unsupported OIDC parameters are rejected explicitly instead of being
-	// accepted and ignored (review finding M3).
+	// RFC 9700 (OAuth 2.0 Security BCP) mandates S256; plain offers no
+	// protection over the wire and a browser SPA can always do S256.
+	if m := q.Get("code_challenge_method"); m != "S256" {
+		return "invalid_request", "Unsupported code_challenge_method; only S256 is supported."
+	}
+	if !validPKCEChallenge(challenge) {
+		return "invalid_request", "Malformed code_challenge: expected 43-128 base64url characters (S256 digest)."
+	}
+	return "", ""
+}
+
+// validatePrompt rejects unsupported OIDC prompt values explicitly instead of
+// accepting and ignoring them (review finding M3).
+func validatePrompt(q url.Values) (code, description string) {
 	switch p := q.Get("prompt"); p {
 	case "":
 	case "login":
@@ -143,15 +166,13 @@ func (s *Server) validateAuthorizeRequest(q url.Values) (code, description strin
 	default:
 		return "invalid_request", "Unsupported prompt value; only \"login\" and \"none\" are supported."
 	}
-	if v := q.Get("response_mode"); v != "" && v != "query" {
-		return "invalid_request", "Unsupported response_mode; only the default query mode is supported."
-	}
-	for _, p := range []string{"max_age", "acr_values", "display", "ui_locales"} {
-		if q.Get(p) != "" {
-			return "invalid_request", fmt.Sprintf("Unsupported parameter %q.", p)
-		}
-	}
-	for _, sc := range parseScopes(q.Get("scope")) {
+	return "", ""
+}
+
+// validateScopes checks the requested scopes against the IdP policy
+// (review finding M1).
+func validateScopes(raw string) (code, description string) {
+	for _, sc := range parseScopes(raw) {
 		if !supportedScopes[sc] {
 			return "invalid_scope", fmt.Sprintf("Unsupported scope %q; supported scopes: openid profile email.", sc)
 		}
@@ -174,6 +195,14 @@ func (s *Server) registeredRedirect(raw string) string {
 // authorizeErrorRedirect delivers a redirectable OAuth error to the client's
 // registered redirect_uri (RFC 6749 §4.1.2.1), echoing the state parameter.
 func (s *Server) authorizeErrorRedirect(w http.ResponseWriter, r *http.Request, q url.Values, code, description string) {
+	s.redirectToClient(w, r, q, map[string]string{"error": code, "error_description": description})
+}
+
+// redirectToClient sends the browser back to the registered redirect_uri with
+// extra query parameters (an error pair or the issued code) and the echoed
+// state. It targets the registered entry itself, never the user-supplied
+// string (gosec G710).
+func (s *Server) redirectToClient(w http.ResponseWriter, r *http.Request, q url.Values, extra map[string]string) {
 	target, err := url.Parse(s.registeredRedirect(q.Get("redirect_uri")))
 	if err != nil || target.String() == "" {
 		// Unreachable: the redirect_uri passed validateClientBinding, but the
@@ -182,8 +211,9 @@ func (s *Server) authorizeErrorRedirect(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	params := target.Query()
-	params.Set("error", code)
-	params.Set("error_description", description)
+	for key, value := range extra {
+		params.Set(key, value)
+	}
 	if state := q.Get("state"); state != "" {
 		params.Set("state", state)
 	}
@@ -198,15 +228,23 @@ func validPKCEVerifier(v string) bool {
 		return false
 	}
 	for i := 0; i < len(v); i++ {
-		c := v[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-		case c == '-' || c == '.' || c == '_' || c == '~':
-		default:
+		if !pkceVerifierChar(v[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// pkceVerifierChar reports whether c is in the RFC 7636 §4.1 unreserved set
+// [A-Za-z0-9-._~].
+func pkceVerifierChar(c byte) bool {
+	switch {
+	case 'A' <= c && c <= 'Z', 'a' <= c && c <= 'z', '0' <= c && c <= '9':
+		return true
+	case c == '-', c == '.', c == '_', c == '~':
+		return true
+	}
+	return false
 }
 
 // validPKCEChallenge enforces the RFC 7636 §4.2 shape: 43-128 base64url
@@ -288,6 +326,27 @@ func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// renderAuthorizeError re-renders the login form with an error message,
+// carrying the OAuth2 context through the hidden fields so a retry submits a
+// complete form.
+func (s *Server) renderAuthorizeError(w http.ResponseWriter, r *http.Request, form url.Values, status int, message string) {
+	s.renderLoginPage(w, r, status, loginData{
+		Action: "/authorize",
+		Error:  message,
+		Hidden: oauthHiddenFields(form),
+	})
+}
+
+// oauthContextOf rebuilds the OAuth2 context (client_id, redirect_uri, state,
+// PKCE challenge, ...) from the hidden fields echoed through the login form.
+func oauthContextOf(form url.Values) url.Values {
+	q := url.Values{}
+	for _, f := range oauthHiddenFields(form) {
+		q.Set(f.Name, f.Value)
+	}
+	return q
+}
+
 // handleAuthorizePost authenticates the user and, on success, redirects the
 // browser back to the client with a single-use authorization code.
 func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
@@ -305,11 +364,7 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	// attacker does not match the victim's cookie.
 	if !s.csrf.verify("/authorize", oauthParamsOf(r), csrfNonce(r), form.Get("csrf_token")) {
 		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{
-			Action: "/authorize",
-			Error:  "Your sign-in session expired or the request was tampered with. Please start again.",
-			Hidden: oauthHiddenFields(form),
-		})
+		s.renderAuthorizeError(w, r, form, http.StatusBadRequest, "Your sign-in session expired or the request was tampered with. Please start again.")
 		return
 	}
 
@@ -319,33 +374,34 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	// a browser-issued CSRF token and are throttled below.
 	if !s.limiter.allow(ip) {
 		slog.Warn("login rate limited", "ip", ip)
-		// Carry the OAuth2 context through the re-render (like every other
-		// error branch) so a retry after the cooldown submits a complete form.
-		s.renderLoginPage(w, r, http.StatusTooManyRequests, loginData{
-			Action: "/authorize",
-			Error:  "Too many sign-in attempts. Please wait a minute and try again.",
-			Hidden: oauthHiddenFields(form),
-		})
+		s.renderAuthorizeError(w, r, form, http.StatusTooManyRequests, "Too many sign-in attempts. Please wait a minute and try again.")
 		return
 	}
 
-	// Re-validate the OAuth2 context that was echoed through the form. The
-	// client binding decides whether a failure is shown on the page or
-	// redirected; all remaining errors go to the registered redirect_uri.
-	q := url.Values{}
-	for _, f := range oauthHiddenFields(form) {
-		q.Set(f.Name, f.Value)
+	who, q, ok := s.authorizeContext(w, r, form, ip)
+	if !ok {
+		return
 	}
+	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
+	s.completeAuthorize(w, r, form, q, who.Sub)
+}
+
+// authorizeContext re-validates the OAuth2 context echoed through the form
+// and authenticates the submitted credentials. On any failure it renders the
+// appropriate error (page or redirect) and reports ok=false. The client
+// binding decides whether a failure is shown on the page or redirected; all
+// remaining errors go to the registered redirect_uri.
+func (s *Server) authorizeContext(w http.ResponseWriter, r *http.Request, form url.Values, ip string) (who subject, q url.Values, ok bool) {
+	q = oauthContextOf(form)
 	if problem := s.validateClientBinding(q); problem != "" {
 		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
-		return
+		return subject{}, nil, false
 	}
 	if code, description := s.validateAuthorizeRequest(q); code != "" {
 		s.authorizeErrorRedirect(w, r, q, code, description)
-		return
+		return subject{}, nil, false
 	}
-
-	who, ok := s.authenticate(form.Get("username"), form.Get("password"))
+	who, ok = s.authenticate(form.Get("username"), form.Get("password"))
 	if !ok {
 		slog.Warn("login failed", "ip", ip, "user", form.Get("username"))
 		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
@@ -354,12 +410,17 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 			Username: form.Get("username"),
 			Hidden:   oauthHiddenFields(form),
 		})
-		return
+		return subject{}, nil, false
 	}
-	slog.Info("login succeeded", "ip", ip, "user", who.Sub)
+	return who, q, true
+}
 
+// completeAuthorize issues a single-use authorization code for the
+// authenticated user and redirects the browser back to the client. Failures
+// re-render the login form.
+func (s *Server) completeAuthorize(w http.ResponseWriter, r *http.Request, form, q url.Values, sub string) {
 	code, err := s.store.addCode(&authCode{
-		Sub:                 who.Sub,
+		Sub:                 sub,
 		ClientID:            q.Get("client_id"),
 		RedirectURI:         q.Get("redirect_uri"),
 		CodeChallenge:       q.Get("code_challenge"),
@@ -369,30 +430,11 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	}, authCodeTTL)
 	if err != nil {
 		slog.Error("authorization code generation failed", "error", err)
-		s.renderLoginPage(w, r, http.StatusInternalServerError, loginData{
-			Action: "/authorize",
-			Error:  "Internal error. Please start again.",
-			Hidden: oauthHiddenFields(form),
-		})
+		s.renderAuthorizeError(w, r, form, http.StatusInternalServerError, "Internal error. Please start again.")
 		return
 	}
 	slog.Info("authorization code issued", "client", q.Get("client_id"), "redirect", q.Get("redirect_uri"))
-
-	// Redirect to the registered entry itself, never the user-supplied
-	// string (gosec G710).
-	target, err := url.Parse(s.registeredRedirect(q.Get("redirect_uri")))
-	if err != nil || target.String() == "" {
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Invalid redirect_uri."})
-		return
-	}
-	params := target.Query()
-	params.Set("code", code)
-	if state := q.Get("state"); state != "" {
-		params.Set("state", state)
-	}
-	target.RawQuery = params.Encode()
-
-	http.Redirect(w, r, target.String(), http.StatusFound)
+	s.redirectToClient(w, r, q, map[string]string{"code": code})
 }
 
 // handleLanding renders the bare login page for direct visits to the IdP root.
@@ -463,44 +505,69 @@ func (s *Server) handleBareLogin(w http.ResponseWriter, r *http.Request) {
 // NOT rate limited — see the handleToken rationale.
 func (s *Server) authenticateClient(w http.ResponseWriter, r *http.Request) (clientID string, ok bool) {
 	if !s.cfg.Confidential() {
-		id := r.PostForm.Get("client_id")
-		if id == "" {
-			writeAuthError(w, "invalid_request", "Missing client_id.")
-			return "", false
-		}
-		return id, true
+		return s.identifyPublicClient(w, r)
 	}
 	if id, pw, basic := r.BasicAuth(); basic {
-		// RFC 6749 §2.3.1: client_id and secret are
-		// application/x-www-form-urlencoded before being placed in the Basic
-		// credentials, so they are decoded first.
-		id, idErr := url.QueryUnescape(id)
-		pw, pwErr := url.QueryUnescape(pw)
-		if idErr != nil || pwErr != nil ||
-			subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
-			subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
-			s.tokenClientAuthFailed(r, "client_secret_basic")
-			s.invalidClient(w)
-			return "", false
-		}
-		// A Basic-authenticated request must not smuggle a different
-		// identification through the form body.
-		if formID := r.PostForm.Get("client_id"); formID != "" && formID != s.cfg.ClientID {
-			s.tokenClientAuthFailed(r, "client_secret_basic")
-			s.invalidClient(w)
-			return "", false
-		}
-		return s.cfg.ClientID, true
+		return s.authClientBasic(w, r, id, pw)
 	}
+	return s.authClientPost(w, r)
+}
+
+// identifyPublicClient handles the public-client profile: no authentication
+// is possible; the client_id form field is mere identification and is
+// returned unverified (the caller binds it against the authorization
+// context).
+func (s *Server) identifyPublicClient(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PostForm.Get("client_id")
+	if id == "" {
+		writeAuthError(w, "invalid_request", "Missing client_id.")
+		return "", false
+	}
+	return id, true
+}
+
+// authClientBasic implements client_secret_basic: HTTP Basic with
+// form-urlencoded credentials (RFC 6749 §2.3.1). Both the client id and the
+// secret are compared in constant time.
+func (s *Server) authClientBasic(w http.ResponseWriter, r *http.Request, rawID, rawPW string) (string, bool) {
+	// RFC 6749 §2.3.1: client_id and secret are
+	// application/x-www-form-urlencoded before being placed in the Basic
+	// credentials, so they are decoded first.
+	id, idErr := url.QueryUnescape(rawID)
+	pw, pwErr := url.QueryUnescape(rawPW)
+	if idErr != nil || pwErr != nil ||
+		subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
+		s.rejectClient(w, r, "client_secret_basic")
+		return "", false
+	}
+	// A Basic-authenticated request must not smuggle a different
+	// identification through the form body (RFC 9700 §2.3.2).
+	if formID := r.PostForm.Get("client_id"); formID != "" && formID != s.cfg.ClientID {
+		s.rejectClient(w, r, "client_secret_basic")
+		return "", false
+	}
+	return s.cfg.ClientID, true
+}
+
+// authClientPost implements client_secret_post (client_id + client_secret
+// form fields). Both values are compared in constant time.
+func (s *Server) authClientPost(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := r.PostForm.Get("client_id")
 	pw := r.PostForm.Get("client_secret")
 	if subtle.ConstantTimeCompare([]byte(id), []byte(s.cfg.ClientID)) != 1 ||
 		subtle.ConstantTimeCompare([]byte(pw), []byte(s.cfg.ClientSecret)) != 1 {
-		s.tokenClientAuthFailed(r, "client_secret_post")
-		s.invalidClient(w)
+		s.rejectClient(w, r, "client_secret_post")
 		return "", false
 	}
 	return s.cfg.ClientID, true
+}
+
+// rejectClient logs a failed token-endpoint client authentication and writes
+// the RFC 6749 §5.2 invalid_client response.
+func (s *Server) rejectClient(w http.ResponseWriter, r *http.Request, method string) {
+	s.tokenClientAuthFailed(r, method)
+	s.invalidClient(w)
 }
 
 // tokenClientAuthFailed logs a failed token-endpoint client authentication.
@@ -595,22 +662,7 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, "invalid_grant", "Unknown, expired or already redeemed authorization code.")
 		return
 	}
-	if clientID != ac.ClientID {
-		writeAuthError(w, "invalid_grant", "client_id does not match the authorization request.")
-		return
-	}
-	redirectURI := form.Get("redirect_uri")
-	if redirectURI == "" {
-		writeAuthError(w, "invalid_request", "Missing redirect_uri.")
-		return
-	}
-	if redirectURI != ac.RedirectURI {
-		writeAuthError(w, "invalid_grant", "redirect_uri does not match the authorization request.")
-		return
-	}
-	if !verifyPKCE(ac.CodeChallenge, ac.CodeChallengeMethod, form.Get("code_verifier")) {
-		slog.Warn("code rejected: PKCE verification failed", "ip", s.clientIP(r), "client", ac.ClientID)
-		writeAuthError(w, "invalid_grant", "PKCE verification failed.")
+	if !s.validateCodeGrant(w, r, form, ac, clientID) {
 		return
 	}
 
@@ -622,19 +674,52 @@ func (s *Server) handleCodeGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
 		return
 	}
-	resp, err := s.issueTokens(&authContext{
+	s.issueAndWriteTokens(w, "authorization_code", &authContext{
 		Sub:      ac.Sub,
 		ClientID: ac.ClientID,
 		Scopes:   ac.Scopes,
 		Nonce:    ac.Nonce,
 		Family:   family,
 	})
+}
+
+// validateCodeGrant checks that the presenting client owns the redeemed code
+// and that redirect_uri and the PKCE verifier match the authorization
+// request. It writes the OAuth error itself and reports ok=false on any
+// mismatch.
+func (s *Server) validateCodeGrant(w http.ResponseWriter, r *http.Request, form url.Values, ac *authCode, clientID string) bool {
+	if clientID != ac.ClientID {
+		writeAuthError(w, "invalid_grant", "client_id does not match the authorization request.")
+		return false
+	}
+	redirectURI := form.Get("redirect_uri")
+	switch {
+	case redirectURI == "":
+		writeAuthError(w, "invalid_request", "Missing redirect_uri.")
+		return false
+	case redirectURI != ac.RedirectURI:
+		writeAuthError(w, "invalid_grant", "redirect_uri does not match the authorization request.")
+		return false
+	}
+	if !verifyPKCE(ac.CodeChallenge, ac.CodeChallengeMethod, form.Get("code_verifier")) {
+		slog.Warn("code rejected: PKCE verification failed", "ip", s.clientIP(r), "client", ac.ClientID)
+		writeAuthError(w, "invalid_grant", "PKCE verification failed.")
+		return false
+	}
+	return true
+}
+
+// issueAndWriteTokens mints a fresh token set for ctx and writes the JSON
+// response; a failure degrades to a 500 instead of panicking the process
+// (finding F6).
+func (s *Server) issueAndWriteTokens(w http.ResponseWriter, grant string, ctx *authContext) {
+	resp, err := s.issueTokens(ctx)
 	if err != nil {
-		slog.Error("token issuance failed", "grant", "authorization_code", "error", err)
+		slog.Error("token issuance failed", "grant", grant, "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
 		return
 	}
-	slog.Info("tokens issued", "grant", "authorization_code", "client", ac.ClientID, "sub", ac.Sub)
+	slog.Info("tokens issued", "grant", grant, "client", ctx.ClientID, "sub", ctx.Sub)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -682,20 +767,13 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.issueTokens(&authContext{
+	s.issueAndWriteTokens(w, "refresh_token", &authContext{
 		Sub:      entry.Sub,
 		ClientID: entry.ClientID,
 		Scopes:   entry.Scopes,
 		Nonce:    entry.Nonce,
 		Family:   entry.Family,
 	})
-	if err != nil {
-		slog.Error("token issuance failed", "grant", "refresh_token", "error", err)
-		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
-		return
-	}
-	slog.Info("tokens issued", "grant", "refresh_token", "client", entry.ClientID, "sub", entry.Sub)
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // parseAccessToken parses and validates a signed JWT access token issued by
@@ -825,6 +903,19 @@ func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool 
 	return false
 }
 
+// invalidTokenResponse writes the RFC 6750 invalid_token bearer error.
+func invalidTokenResponse(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+	writeError(w, http.StatusUnauthorized, "invalid_token", "Invalid or missing access token.")
+}
+
+// insufficientScope writes the RFC 6750 insufficient_scope bearer error for
+// a token without the openid scope.
+func insufficientScope(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="openid"`)
+	writeError(w, http.StatusForbidden, "insufficient_scope", "The openid scope is required for UserInfo.")
+}
+
 // handleUserinfo returns the claims of the authenticated user for a valid
 // access token. The token must carry the configured audience, the access
 // token profile (typ at+jwt) and the openid scope; profile claims are
@@ -835,48 +926,43 @@ func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool 
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	claims, err := s.verifyAccessToken(bearerToken(r))
 	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-		writeError(w, http.StatusUnauthorized, "invalid_token", "Invalid or missing access token.")
+		invalidTokenResponse(w)
 		return
 	}
 	// A token without a scope claim grants nothing: fail closed.
 	scopeRaw, _ := claims["scope"].(string)
-	if scopeRaw == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="openid"`)
-		writeError(w, http.StatusForbidden, "insufficient_scope", "The openid scope is required for UserInfo.")
-		return
-	}
 	scopes := parseScopes(scopeRaw)
 	if !hasScope(scopes, "openid") {
-		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="openid"`)
-		writeError(w, http.StatusForbidden, "insufficient_scope", "The openid scope is required for UserInfo.")
+		insufficientScope(w)
 		return
 	}
+	writeJSON(w, http.StatusOK, s.userinfoClaims(claims, scopes))
+}
+
+// userinfoClaims assembles the UserInfo response for the token's subject:
+// the authoritative users-file record first; the scope-gated token claims
+// are the fallback for subjects that have since been removed from the file.
+// The access token carries no name claim, so for such subjects the name is
+// simply omitted (an absent claim is never fabricated).
+func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[string]any {
 	sub, _ := claims["sub"].(string)
 	wantProfile := hasScope(scopes, "profile")
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
-	// Authoritative record first; the scope-gated token claims are the
-	// fallback for subjects that have since been removed from the file. The
-	// access token carries no name claim, so for such subjects the name is
-	// simply omitted (an absent claim is never fabricated).
-	var username, email, name string
 	if u, ok := s.users.Lookup(sub); ok {
-		if wantProfile {
-			username = u.Username
-			name = u.Name
-		}
-		if wantEmail {
-			email = u.Email
-		}
+		addScopeClaims(out, wantProfile, wantEmail, u.Username, u.Name, u.Email)
 	} else {
-		if wantProfile {
-			username, _ = claims["preferred_username"].(string)
-		}
-		if wantEmail {
-			email, _ = claims["email"].(string)
-		}
+		username, _ := claims["preferred_username"].(string)
+		email, _ := claims["email"].(string)
+		addScopeClaims(out, wantProfile, wantEmail, username, "", email)
 	}
+	return out
+}
+
+// addScopeClaims copies profile/email claims into out according to the
+// granted scopes, omitting empty values (an absent claim is never
+// fabricated).
+func addScopeClaims(out map[string]any, wantProfile, wantEmail bool, username, name, email string) {
 	if wantProfile && username != "" {
 		out["preferred_username"] = username
 	}
@@ -886,7 +972,6 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 	if wantEmail && email != "" {
 		out["email"] = email
 	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 // handleIntrospect reports whether a token is currently valid (RFC 7662).

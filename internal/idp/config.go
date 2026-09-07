@@ -114,6 +114,37 @@ type Config struct {
 // would silently weaken security (no redirect policy, no users file, removed
 // legacy variables, unreadable secret files, invalid proxy CIDRs).
 func LoadConfig() (Config, error) {
+	cfg, err := baseConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	if err := cfg.validateMode(); err != nil {
+		return cfg, err
+	}
+	// The token audience defaults to the registered client id, matching what
+	// rego-adventure expects (AUTH_AUDIENCE = AUTH_CLIENT_ID). A distinct
+	// resource audience can be configured with IDP_AUDIENCE.
+	cfg.Audience = envOr("IDP_AUDIENCE", cfg.ClientID)
+	if err := cfg.loadRedirectPolicy(); err != nil {
+		return cfg, err
+	}
+	cfg.loadAllowedOrigins()
+	if err := cfg.loadUsersFile(); err != nil {
+		return cfg, err
+	}
+	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		return cfg, err
+	}
+	cfg.TrustedProxies = proxies
+	return cfg, nil
+}
+
+// baseConfig reads the environment into the scalar Config fields. It rejects
+// the removed single-user credential variables loudly instead of ignoring
+// them: a silently ignored credential would let an operator believe their
+// configuration still governs who can sign in.
+func baseConfig() (Config, error) {
 	accessTokenTTL, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
 	if err != nil {
 		return Config{}, err
@@ -126,16 +157,10 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	// The single-user credential variables were removed when the users file
-	// became the only account source. Reject them loudly instead of ignoring
-	// them: a silently ignored credential would let an operator believe their
-	// configuration still governs who can sign in.
-	for _, removed := range []string{"IDP_USERNAME", "IDP_PASSWORD", "IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE"} {
-		if os.Getenv(removed) != "" {
-			return Config{}, fmt.Errorf("%s is no longer supported: manage accounts in the IDP_USERS_FILE users file (see minidp-users)", removed)
-		}
+	if err := rejectRemovedCredentials(); err != nil {
+		return Config{}, err
 	}
-	cfg := Config{
+	return Config{
 		Host:            envOr("IDP_HOST", "0.0.0.0"),
 		Port:            envOr("IDP_PORT", "8080"),
 		Issuer:          envOr("IDP_ISSUER", "http://localhost:8080"),
@@ -149,79 +174,111 @@ func LoadConfig() (Config, error) {
 		KeyDir:          os.Getenv("IDP_KEY_DIR"),
 		LoginRateLimit:  loginRateLimit,
 		ClientSecret:    os.Getenv("IDP_CLIENT_SECRET"),
+	}, nil
+}
+
+// removedCredentials are the single-user credential variables that were
+// removed when the users file became the only account source.
+var removedCredentials = []string{"IDP_USERNAME", "IDP_PASSWORD", "IDP_PASSWORD_BCRYPT", "IDP_PASSWORD_FILE"}
+
+func rejectRemovedCredentials() error {
+	for _, removed := range removedCredentials {
+		if os.Getenv(removed) != "" {
+			return fmt.Errorf("%s is no longer supported: manage accounts in the IDP_USERS_FILE users file (see minidp-users)", removed)
+		}
 	}
-	// The mode decides the client profile. It is validated together with the
-	// client secret because the two are two halves of one registration: a
-	// secret without the confidential mode would be silently dead config, a
-	// confidential mode without a secret would authenticate every caller.
-	switch cfg.Mode {
+	return nil
+}
+
+// validateMode enforces the MINIDP_MODE contract. The mode decides the client
+// profile and is validated together with the client secret because the two
+// are two halves of one registration: a secret without the confidential mode
+// would be silently dead config, a confidential mode without a secret would
+// authenticate every caller.
+func (c *Config) validateMode() error {
+	switch c.Mode {
 	case "", ModePublic:
-		cfg.Mode = ModePublic
-		if cfg.ClientSecret != "" {
-			return cfg, fmt.Errorf("IDP_CLIENT_SECRET is set but MINIDP_MODE is %q: a public client must not have a secret; set MINIDP_MODE=confidential or unset IDP_CLIENT_SECRET", cfg.Mode)
+		c.Mode = ModePublic
+		if c.ClientSecret != "" {
+			return fmt.Errorf("IDP_CLIENT_SECRET is set but MINIDP_MODE is %q: a public client must not have a secret; set MINIDP_MODE=confidential or unset IDP_CLIENT_SECRET", c.Mode)
 		}
 	case ModeConfidential:
-		if cfg.ClientSecret == "" {
-			return cfg, fmt.Errorf("MINIDP_MODE=%s requires IDP_CLIENT_SECRET to be set: the client must have a credential to authenticate with", ModeConfidential)
+		if c.ClientSecret == "" {
+			return fmt.Errorf("MINIDP_MODE=%s requires IDP_CLIENT_SECRET to be set: the client must have a credential to authenticate with", ModeConfidential)
 		}
-		if len(cfg.ClientSecret) < 16 {
+		if len(c.ClientSecret) < 16 {
 			// Loud warning, not an error: the operator may accept the risk,
 			// but a secret governing the token endpoint should be
 			// cryptographically random (RFC 9700 §2.4 wants ≥128 bits).
 			slog.Warn("IDP_CLIENT_SECRET is shorter than 16 characters: use a cryptographically random secret of at least 128 bits for a confidential client")
 		}
 	default:
-		return cfg, fmt.Errorf("invalid MINIDP_MODE %q: must be %q or %q", string(cfg.Mode), ModePublic, ModeConfidential)
+		return fmt.Errorf("invalid MINIDP_MODE %q: must be %q or %q", string(c.Mode), ModePublic, ModeConfidential)
 	}
-	// The token audience defaults to the registered client id, matching what
-	// rego-adventure expects (AUTH_AUDIENCE = AUTH_CLIENT_ID). A distinct
-	// resource audience can be configured with IDP_AUDIENCE.
-	cfg.Audience = envOr("IDP_AUDIENCE", cfg.ClientID)
+	return nil
+}
+
+// loadRedirectPolicy parses ALLOWED_REDIRECTS into the registered redirect
+// set. The redirect policy IS the client registration of the single
+// configured client; an empty allowlist must not fall back to "any host"
+// (that would send authorization codes to arbitrary URLs).
+func (c *Config) loadRedirectPolicy() error {
 	if raw := os.Getenv("ALLOWED_REDIRECTS"); raw != "" {
 		for _, r := range strings.Split(raw, ",") {
-			if r = strings.TrimSpace(r); r == "" {
-				continue
-			}
-			// Fail fast on entries that could never be honoured safely: in
-			// allowlist mode redirectURIAllowed is a plain string comparison,
-			// so a typo'd or non-http(s) entry would otherwise be accepted
-			// silently (e.g. a javascript: URI in the allowlist).
-			u, err := url.Parse(r)
-			if err != nil {
-				return cfg, fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: %w", r, err)
-			}
-			if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Fragment != "" {
-				return cfg, fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: must be an absolute http(s) URL with a host", r)
-			}
-			cfg.AllowedRedirects = append(cfg.AllowedRedirects, r)
-		}
-	}
-	// The redirect policy IS the client registration of the single configured
-	// client; an empty allowlist must not fall back to "any host" (that would
-	// send authorization codes to arbitrary URLs).
-	if len(cfg.AllowedRedirects) == 0 {
-		return cfg, fmt.Errorf("ALLOWED_REDIRECTS is empty: declare the registered redirect_uri values of client %q", cfg.ClientID)
-	}
-	if raw := os.Getenv("IDP_ALLOWED_ORIGINS"); raw != "" {
-		for _, o := range strings.Split(raw, ",") {
-			if o = strings.TrimSpace(o); o != "" {
-				cfg.AllowedOrigins = append(cfg.AllowedOrigins, o)
+			if err := c.addRedirect(r); err != nil {
+				return err
 			}
 		}
 	}
-
-	// Accounts come from the users file; there is no fallback credential.
-	cfg.UsersFile = os.Getenv("IDP_USERS_FILE")
-	if cfg.UsersFile == "" {
-		return cfg, fmt.Errorf("IDP_USERS_FILE is not set: minidp has no built-in accounts, create a users file (see minidp-users) and point IDP_USERS_FILE at it")
+	if len(c.AllowedRedirects) == 0 {
+		return fmt.Errorf("ALLOWED_REDIRECTS is empty: declare the registered redirect_uri values of client %q", c.ClientID)
 	}
+	return nil
+}
 
-	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+// addRedirect validates and appends one ALLOWED_REDIRECTS entry. Fail fast on
+// entries that could never be honoured safely: in allowlist mode
+// redirectURIAllowed is a plain string comparison, so a typo'd or non-http(s)
+// entry would otherwise be accepted silently (e.g. a javascript: URI in the
+// allowlist).
+func (c *Config) addRedirect(raw string) error {
+	r := strings.TrimSpace(raw)
+	if r == "" {
+		return nil
+	}
+	u, err := url.Parse(r)
 	if err != nil {
-		return cfg, err
+		return fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: %w", r, err)
 	}
-	cfg.TrustedProxies = proxies
-	return cfg, nil
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Fragment != "" {
+		return fmt.Errorf("invalid ALLOWED_REDIRECTS entry %q: must be an absolute http(s) URL with a host", r)
+	}
+	c.AllowedRedirects = append(c.AllowedRedirects, r)
+	return nil
+}
+
+// loadAllowedOrigins parses the explicit CORS origin allowlist
+// (IDP_ALLOWED_ORIGINS).
+func (c *Config) loadAllowedOrigins() {
+	raw := os.Getenv("IDP_ALLOWED_ORIGINS")
+	if raw == "" {
+		return
+	}
+	for _, o := range strings.Split(raw, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			c.AllowedOrigins = append(c.AllowedOrigins, o)
+		}
+	}
+}
+
+// loadUsersFile reads the mandatory users file path. Accounts come from the
+// users file; there is no fallback credential.
+func (c *Config) loadUsersFile() error {
+	c.UsersFile = os.Getenv("IDP_USERS_FILE")
+	if c.UsersFile == "" {
+		return fmt.Errorf("IDP_USERS_FILE is not set: minidp has no built-in accounts, create a users file (see minidp-users) and point IDP_USERS_FILE at it")
+	}
+	return nil
 }
 
 // Confidential reports whether the single registered client is a confidential

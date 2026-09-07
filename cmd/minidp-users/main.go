@@ -118,39 +118,68 @@ func parseRoles(value string) []string {
 func resolvePassword(flagValue string, confirm bool) (string, error) {
 	switch {
 	case flagValue == "-":
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil && line == "" {
-			return "", fmt.Errorf("read password from stdin: %w", err)
-		}
-		return strings.TrimRight(line, "\r\n"), nil
+		return readPasswordFromStdin()
 	case flagValue != "":
 		return flagValue, nil
 	case !term.IsTerminal(int(os.Stdin.Fd())):
 		return "", fmt.Errorf("no password: use -password (or '-password -' with piped stdin)")
 	}
+	return promptPassword(confirm)
+}
 
-	fmt.Fprint(os.Stderr, "Enter password: ")
-	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Fprintln(os.Stderr)
+// readPasswordFromStdin reads the first line of stdin as the password.
+func readPasswordFromStdin() (string, error) {
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("read password from stdin: %w", err)
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// promptPassword reads a password interactively, optionally asking for a
+// confirmation.
+func promptPassword(confirm bool) (string, error) {
+	pw, err := readSecret("Enter password: ")
 	if err != nil {
 		return "", err
 	}
 	if len(pw) == 0 {
 		return "", fmt.Errorf("password must not be empty")
 	}
-	if !confirm {
-		return string(pw), nil
+	if confirm {
+		again, err := readSecret("Confirm password: ")
+		if err != nil {
+			return "", err
+		}
+		if string(pw) != string(again) {
+			return "", fmt.Errorf("passwords do not match")
+		}
 	}
-	fmt.Fprint(os.Stderr, "Confirm password: ")
-	again, err := term.ReadPassword(int(os.Stdin.Fd()))
+	return string(pw), nil
+}
+
+// readSecret prompts on stderr and reads one password invisibly.
+func readSecret(prompt string) ([]byte, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return nil, err
+	}
+	return pw, nil
+}
+
+// newPasswordHash resolves the password from -password and hashes it with
+// bcrypt, rejecting an empty password.
+func newPasswordHash(flagValue string, cost int, confirm bool) (string, error) {
+	password, err := resolvePassword(flagValue, confirm)
 	if err != nil {
 		return "", err
 	}
-	if string(pw) != string(again) {
-		return "", fmt.Errorf("passwords do not match")
+	if password == "" {
+		return "", fmt.Errorf("password must not be empty")
 	}
-	return string(pw), nil
+	return idp.HashPassword(password, cost)
 }
 
 // readUsersForUpdate loads the users file, treating a missing file as empty
@@ -192,14 +221,7 @@ func add(args []string) error {
 	if findUserIndex(users, *u.username) >= 0 {
 		return fmt.Errorf("user %q already exists (use the update command)", *u.username)
 	}
-	password, err := resolvePassword(*u.password, true)
-	if err != nil {
-		return err
-	}
-	if password == "" {
-		return fmt.Errorf("password must not be empty")
-	}
-	hash, err := idp.HashPassword(password, *u.cost)
+	hash, err := newPasswordHash(*u.password, *u.cost, true)
 	if err != nil {
 		return err
 	}
@@ -217,80 +239,107 @@ func add(args []string) error {
 	return nil
 }
 
-func update(args []string) error {
-	fs := flag.NewFlagSet("update", flag.ExitOnError)
-	u := registerUserFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *u.username == "" {
-		return fmt.Errorf("-username is required")
-	}
-	users, ok, err := readUsersForUpdate(*u.file)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("users file %q does not exist yet", *u.file)
-	}
-	idx := findUserIndex(users, *u.username)
-	if idx < 0 {
-		return fmt.Errorf("user %q does not exist", *u.username)
-	}
+// updateSpec bundles the parsed update invocation: the shared flags plus which
+// of them were explicitly provided.
+type updateSpec struct {
+	u                *userFlags
+	passwordProvided bool
+	rolesProvided    bool
+}
 
+// parseUpdateArgs parses the update flags and records which of -password and
+// -roles were explicitly set.
+func parseUpdateArgs(args []string) (*updateSpec, error) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	spec := &updateSpec{u: registerUserFlags(fs)}
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if *spec.u.username == "" {
+		return nil, fmt.Errorf("-username is required")
+	}
 	// fs.Visit reports which flags were actually set, so "no -password flag"
 	// (keep the existing hash) is distinguishable from "-password -" (read one
 	// line from stdin) and "-password ''" (prompt interactively). The same
 	// applies to -roles: absent keeps the existing roles, "-roles ''" clears
 	// them.
-	passwordProvided := false
-	rolesProvided := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "password":
-			passwordProvided = true
+			spec.passwordProvided = true
 		case "roles":
-			rolesProvided = true
+			spec.rolesProvided = true
 		}
 	})
+	return spec, nil
+}
 
+// loadExistingUsers reads the users file for commands that mutate an existing
+// entry: a missing file is an error, unlike `add` which may create it.
+func loadExistingUsers(path string) ([]idp.User, error) {
+	users, ok, err := readUsersForUpdate(path)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("users file %q does not exist yet", path)
+	}
+	return users, nil
+}
+
+// applyUpdates applies the explicitly provided flags to the user entry in
+// place and reports whether anything changed.
+func applyUpdates(user *idp.User, spec *updateSpec) (bool, error) {
 	changed := false
-	if passwordProvided {
-		password, err := resolvePassword(*u.password, false)
+	if spec.passwordProvided {
+		hash, err := newPasswordHash(*spec.u.password, *spec.u.cost, false)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if password == "" {
-			return fmt.Errorf("password must not be empty")
-		}
-		hash, err := idp.HashPassword(password, *u.cost)
-		if err != nil {
-			return err
-		}
-		users[idx].PasswordHash = hash
+		user.PasswordHash = hash
 		changed = true
-	} else if *u.cost != bcrypt.DefaultCost {
-		return fmt.Errorf("-cost requires a new password (-password)")
+	} else if *spec.u.cost != bcrypt.DefaultCost {
+		return false, fmt.Errorf("-cost requires a new password (-password)")
 	}
-	if *u.email != "" {
-		users[idx].Email = *u.email
+	if *spec.u.email != "" {
+		user.Email = *spec.u.email
 		changed = true
 	}
-	if *u.name != "" {
-		users[idx].Name = *u.name
+	if *spec.u.name != "" {
+		user.Name = *spec.u.name
 		changed = true
 	}
-	if rolesProvided {
-		users[idx].Roles = parseRoles(*u.roles)
+	if spec.rolesProvided {
+		user.Roles = parseRoles(*spec.u.roles)
 		changed = true
+	}
+	return changed, nil
+}
+
+func update(args []string) error {
+	spec, err := parseUpdateArgs(args)
+	if err != nil {
+		return err
+	}
+	users, err := loadExistingUsers(*spec.u.file)
+	if err != nil {
+		return err
+	}
+	idx := findUserIndex(users, *spec.u.username)
+	if idx < 0 {
+		return fmt.Errorf("user %q does not exist", *spec.u.username)
+	}
+	changed, err := applyUpdates(&users[idx], spec)
+	if err != nil {
+		return err
 	}
 	if !changed {
 		return fmt.Errorf("nothing to update: provide -password, -email, -name or -roles")
 	}
-	if err := idp.SaveUsers(*u.file, users); err != nil {
+	if err := idp.SaveUsers(*spec.u.file, users); err != nil {
 		return err
 	}
-	fmt.Printf("user %q updated in %s (takes effect on IdP restart)\n", *u.username, *u.file)
+	fmt.Printf("user %q updated in %s (takes effect on IdP restart)\n", *spec.u.username, *spec.u.file)
 	return nil
 }
 
@@ -360,14 +409,7 @@ func hash(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	pw, err := resolvePassword(*password, false)
-	if err != nil {
-		return err
-	}
-	if pw == "" {
-		return fmt.Errorf("password must not be empty")
-	}
-	h, err := idp.HashPassword(pw, *cost)
+	h, err := newPasswordHash(*password, *cost, false)
 	if err != nil {
 		return err
 	}

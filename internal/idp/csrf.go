@@ -55,33 +55,35 @@ func (m *csrfManager) verify(action string, params url.Values, nonce []byte, tok
 	if !ok {
 		return false
 	}
-	mac := hmac.New(sha256.New, m.key)
-	mac.Write([]byte(payload))
-	expected, err := base64.RawURLEncoding.DecodeString(sig)
-	if err != nil {
-		return false
-	}
-	if subtle.ConstantTimeCompare(mac.Sum(nil), expected) != 1 {
+	if !m.validSignature(payload, sig) {
 		return false
 	}
 	parts := strings.SplitN(payload, "|", 4)
 	if len(parts) != 4 {
 		return false
 	}
+	return claimsMatch(parts, action, params, nonce)
+}
+
+// validSignature verifies the HMAC part of the token in constant time.
+func (m *csrfManager) validSignature(payload, sig string) bool {
+	mac := hmac.New(sha256.New, m.key)
+	mac.Write([]byte(payload))
+	expected, err := base64.RawURLEncoding.DecodeString(sig)
+	return err == nil && subtle.ConstantTimeCompare(mac.Sum(nil), expected) == 1
+}
+
+// claimsMatch compares the payload fields against the expected expiry,
+// action, parameter fingerprint and browser nonce fingerprint, in constant
+// time.
+func claimsMatch(parts []string, action string, params url.Values, nonce []byte) bool {
 	expUnix, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || time.Now().Unix() > expUnix {
 		return false
 	}
-	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(action)) != 1 {
-		return false
-	}
-	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(fingerprint(params))) != 1 {
-		return false
-	}
-	if subtle.ConstantTimeCompare([]byte(parts[3]), []byte(nonceFingerprint(nonce))) != 1 {
-		return false
-	}
-	return true
+	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(action)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(parts[2]), []byte(fingerprint(params))) == 1 &&
+		subtle.ConstantTimeCompare([]byte(parts[3]), []byte(nonceFingerprint(nonce))) == 1
 }
 
 // fingerprint is a stable digest of the canonical parameter encoding

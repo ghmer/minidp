@@ -62,74 +62,93 @@ func NewSigningKey(pemPath, keyDir string) (*signingKey, error) {
 // for it to appear and load it.
 func persistentSigningKey(keyDir string) (*signingKey, error) {
 	dir := filepath.Clean(keyDir)
-	path := filepath.Join(dir, keyFileName)
-	tmpName := keyFileName + ".tmp"
-
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, fmt.Errorf("open key dir %q: %w", dir, err)
 	}
 	defer func() { _ = root.Close() }()
 
+	path := filepath.Join(dir, keyFileName)
+	tmpName := keyFileName + ".tmp"
 	for attempt := 0; ; attempt++ {
 		if _, err := os.Stat(path); err == nil {
 			return loadSigningKey(path)
 		} else if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("stat signing key %q: %w", path, err)
 		}
-
 		// Exclusive create: the winner generates the key, everyone else waits.
 		tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if os.IsExist(err) {
 			// Another instance is generating right now (or a crashed start
-			// left the temp file behind). Wait for the final key, then load it.
-			if err := awaitFile(path, 10*time.Second); err != nil {
-				if attempt > 0 {
-					return nil, fmt.Errorf("gave up waiting for signing key %q: %w", path, err)
-				}
-				// Break the deadlock once: the temp file is stale (the
-				// generating instance crashed mid-write). Remove it and let
-				// the next round retry generation.
-				slog.Warn("stale signing-key temp file detected, taking over", "path", filepath.Join(dir, tmpName))
-				_ = root.Remove(tmpName)
-				continue
+			// left the temp file behind): wait for the final key, or take
+			// over a stale temp file once. Either way, retry the round.
+			if err := waitForPeerKey(root, dir, tmpName, path, attempt); err != nil {
+				return nil, err
 			}
-			continue // final key has appeared: load it on the next round
+			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("create temp signing key in %q: %w", dir, err)
 		}
-
-		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		key, err := generateAndPersistKey(root, dir, tmpName, path, tmp)
 		if err != nil {
-			_ = tmp.Close()
-			_ = root.Remove(tmpName)
-			return nil, fmt.Errorf("generate rsa key: %w", err)
+			return nil, err
 		}
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(key),
-		})
-
-		// Write to the exclusively created temp file, then rename, so a crash
-		// mid-write can never leave a truncated key behind. The file is
-		// created with 0600 directly (os.Root.Create would umask it to 0644).
-		if _, err := tmp.Write(pemBytes); err != nil {
-			_ = tmp.Close()
-			_ = root.Remove(tmpName)
-			return nil, fmt.Errorf("write signing key in %q: %w", dir, err)
-		}
-		if err := tmp.Close(); err != nil {
-			_ = root.Remove(tmpName)
-			return nil, fmt.Errorf("close signing key in %q: %w", dir, err)
-		}
-		if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
-			_ = root.Remove(tmpName)
-			return nil, fmt.Errorf("persist signing key to %q: %w", path, err)
-		}
-		slog.Info("generated and persisted RSA signing key", "path", path)
 		return &signingKey{key: key, kid: "minidp-1", version: "1.0"}, nil
 	}
+}
+
+// waitForPeerKey handles the case where another instance holds the exclusive
+// temp file: it waits for the final key to appear. When the wait times out on
+// the first attempt the temp file is stale (the generating instance crashed
+// mid-write): it is removed so the caller can retry generation.
+func waitForPeerKey(root *os.Root, dir, tmpName, path string, attempt int) error {
+	err := awaitFile(path, 10*time.Second)
+	if err == nil {
+		return nil
+	}
+	if attempt > 0 {
+		return fmt.Errorf("gave up waiting for signing key %q: %w", path, err)
+	}
+	slog.Warn("stale signing-key temp file detected, taking over", "path", filepath.Join(dir, tmpName))
+	_ = root.Remove(tmpName)
+	return nil
+}
+
+// generateAndPersistKey generates a fresh RSA-2048 key and persists it to
+// path via the exclusively created temp file tmp: write, close, rename, so a
+// crash mid-write can never leave a truncated key behind. The temp file is
+// created with 0600 directly (os.Root.Create would umask it to 0644).
+func generateAndPersistKey(root *os.Root, dir, tmpName, path string, tmp *os.File) (*rsa.PrivateKey, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		discardTempFile(root, tmp, tmpName)
+		return nil, fmt.Errorf("generate rsa key: %w", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	if _, err := tmp.Write(pemBytes); err != nil {
+		discardTempFile(root, tmp, tmpName)
+		return nil, fmt.Errorf("write signing key in %q: %w", dir, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = root.Remove(tmpName)
+		return nil, fmt.Errorf("close signing key in %q: %w", dir, err)
+	}
+	if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
+		_ = root.Remove(tmpName)
+		return nil, fmt.Errorf("persist signing key to %q: %w", path, err)
+	}
+	slog.Info("generated and persisted RSA signing key", "path", path)
+	return key, nil
+}
+
+// discardTempFile closes and removes a temp file after a failed write.
+func discardTempFile(root *os.Root, tmp *os.File, tmpName string) {
+	_ = tmp.Close()
+	_ = root.Remove(tmpName)
 }
 
 // awaitFile polls until path exists or the timeout elapses.

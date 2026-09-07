@@ -221,29 +221,19 @@ func (s *store) revokeToken(id string) {
 // dropExpired removes expired entries. The caller must hold the lock.
 func (s *store) dropExpired() {
 	now := time.Now()
-	for id, c := range s.codes {
-		if now.After(c.ExpiresAt) {
-			delete(s.codes, id)
-		}
-	}
-	for id, f := range s.refresh {
-		if now.After(f.ExpiresAt) {
-			delete(s.refresh, id)
-		}
-	}
-	for id, f := range s.usedRefresh {
-		if now.After(f.ExpiresAt) {
-			delete(s.usedRefresh, id)
-		}
-	}
-	for jti, rec := range s.accessJTI {
-		if now.After(rec.exp) {
-			delete(s.accessJTI, jti)
-		}
-	}
-	for jti, until := range s.deniedJTI {
-		if now.After(until) {
-			delete(s.deniedJTI, jti)
+	dropWhere(s.codes, func(c *authCode) bool { return now.After(c.ExpiresAt) })
+	dropWhere(s.refresh, func(f *refreshEntry) bool { return now.After(f.ExpiresAt) })
+	dropWhere(s.usedRefresh, func(f *refreshEntry) bool { return now.After(f.ExpiresAt) })
+	dropWhere(s.accessJTI, func(rec jtiRecord) bool { return now.After(rec.exp) })
+	dropWhere(s.deniedJTI, func(until time.Time) bool { return now.After(until) })
+}
+
+// dropWhere removes every map entry whose value satisfies the expired
+// predicate.
+func dropWhere[K comparable, V any](m map[K]V, expired func(V) bool) {
+	for id, v := range m {
+		if expired(v) {
+			delete(m, id)
 		}
 	}
 }

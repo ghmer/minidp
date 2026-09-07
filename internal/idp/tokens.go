@@ -43,6 +43,83 @@ type idClaims struct {
 	SessionID         string   `json:"sid,omitempty"`
 }
 
+// profileData is the scope-gated profile information released into tokens.
+type profileData struct {
+	email string
+	name  string
+	roles []string
+}
+
+// profileFor loads the users-file record and releases its claims strictly
+// according to the granted scopes (OIDC Core §5.4): profile unlocks name,
+// email unlocks the email claim. Roles are authorization data, not profile
+// claims: they are released whenever the record defines them, regardless of
+// the scopes. The values come from the users-file record; nothing is
+// fabricated, so an absent claim is simply omitted.
+func (s *Server) profileFor(sub string, wantProfile, wantEmail bool) profileData {
+	var p profileData
+	u, ok := s.users.Lookup(sub)
+	if !ok {
+		return p
+	}
+	if wantEmail {
+		p.email = u.Email
+	}
+	if wantProfile {
+		p.name = u.Name
+	}
+	p.roles = u.Roles
+	return p
+}
+
+// registeredClaims builds the registered claims shared by every issued
+// token: the configured issuer and audience (never a caller-chosen one), the
+// subject and the standard timestamps.
+func (s *Server) registeredClaims(sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
+	return jwt.RegisteredClaims{
+		Issuer:    s.cfg.Issuer,
+		Subject:   sub,
+		Audience:  jwt.ClaimStrings{s.cfg.Audience},
+		ExpiresAt: jwt.NewNumericDate(expires),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ID:        jti,
+	}
+}
+
+// newAccessClaims builds the access-token claims. preferred_username is
+// released with the profile scope.
+func newAccessClaims(rc jwt.RegisteredClaims, scope string, wantProfile bool, p profileData) *accessClaims {
+	access := &accessClaims{
+		RegisteredClaims: rc,
+		Scope:            scope,
+		Email:            p.email,
+		Roles:            p.roles,
+	}
+	if wantProfile {
+		access.Username = rc.Subject
+	}
+	return access
+}
+
+// newIDClaims builds the id_token claims. preferred_username and name are
+// released with the profile scope; sid carries the token family (one
+// authorization) so /end_session can revoke exactly that authorization's
+// tokens from an id_token_hint.
+func newIDClaims(rc jwt.RegisteredClaims, nonce, family string, wantProfile bool, p profileData) *idClaims {
+	id := &idClaims{
+		RegisteredClaims: rc,
+		Nonce:            nonce,
+		SessionID:        family,
+		Email:            p.email,
+		Roles:            p.roles,
+	}
+	if wantProfile {
+		id.PreferredUsername = rc.Subject
+		id.Name = p.name
+	}
+	return id
+}
+
 // issueTokens mints a fresh access token, an id_token (when the openid scope is
 // present, as it is for rego-adventure) and a brand-new refresh token. Refresh
 // tokens are rotated: every issuance retires the previous one, so a refresh
@@ -61,43 +138,13 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("generate access token jti: %w", err)
 	}
-
-	// Scope-based claim release (OIDC Core §5.4): profile unlocks
-	// preferred_username and name, email unlocks the email claim. The values
-	// come from the users-file record; nothing is fabricated (no
-	// placeholder@example.com), so an absent claim is simply omitted. Roles
-	// are authorization data, not profile claims: they are released on both
-	// tokens whenever the record defines them, regardless of the scopes.
 	wantProfile := hasScope(ctx.Scopes, "profile")
 	wantEmail := hasScope(ctx.Scopes, "email")
-	var email, name string
-	var roles []string
-	if u, ok := s.users.Lookup(ctx.Sub); ok {
-		if wantEmail {
-			email = u.Email
-		}
-		if wantProfile {
-			name = u.Name
-		}
-		roles = u.Roles
-	}
+	profile := s.profileFor(ctx.Sub, wantProfile, wantEmail)
 
-	access := &accessClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    s.cfg.Issuer,
-			Subject:   ctx.Sub,
-			Audience:  jwt.ClaimStrings{s.cfg.Audience},
-			ExpiresAt: jwt.NewNumericDate(accessExpires),
-			IssuedAt:  jwt.NewNumericDate(now),
-			ID:        accessJTI,
-		},
-		Scope: joinScopes(ctx.Scopes),
-	}
-	if wantProfile {
-		access.Username = ctx.Sub
-	}
-	access.Email = email
-	access.Roles = roles
+	access := newAccessClaims(
+		s.registeredClaims(ctx.Sub, accessJTI, now, accessExpires),
+		joinScopes(ctx.Scopes), wantProfile, profile)
 	accessTokenString, err := s.key.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
@@ -112,35 +159,10 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 		ExpiresIn:   int(s.cfg.AccessTokenTTL.Seconds()),
 		Scope:       joinScopes(ctx.Scopes),
 	}
-
 	if hasScope(ctx.Scopes, "openid") {
-		idJTI, err := randomJTI()
-		if err != nil {
-			return nil, fmt.Errorf("generate id token jti: %w", err)
+		if resp.IDToken, err = s.issueIDToken(ctx, now, accessExpires, wantProfile, profile); err != nil {
+			return nil, err
 		}
-		id := &idClaims{
-			RegisteredClaims: jwt.RegisteredClaims{
-				Issuer:    s.cfg.Issuer,
-				Subject:   ctx.Sub,
-				Audience:  jwt.ClaimStrings{s.cfg.Audience},
-				ExpiresAt: jwt.NewNumericDate(accessExpires),
-				IssuedAt:  jwt.NewNumericDate(now),
-				ID:        idJTI,
-			},
-			Nonce:     ctx.Nonce,
-			SessionID: ctx.Family,
-		}
-		if wantProfile {
-			id.PreferredUsername = ctx.Sub
-			id.Name = name
-		}
-		id.Email = email
-		id.Roles = roles
-		idTokenString, err := s.key.sign(id)
-		if err != nil {
-			return nil, fmt.Errorf("sign id token: %w", err)
-		}
-		resp.IDToken = idTokenString
 	}
 
 	// Mint a single-use refresh token that itself carries forward the subject,
@@ -160,6 +182,24 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	resp.RefreshToken = refresh
 
 	return resp, nil
+}
+
+// issueIDToken mints and signs the id_token for the token set. The caller
+// checks the openid scope.
+func (s *Server) issueIDToken(ctx *authContext, now, expires time.Time, wantProfile bool, profile profileData) (string, error) {
+	// A crypto/rand failure must not panic here (review finding F6).
+	idJTI, err := randomJTI()
+	if err != nil {
+		return "", fmt.Errorf("generate id token jti: %w", err)
+	}
+	id := newIDClaims(
+		s.registeredClaims(ctx.Sub, idJTI, now, expires),
+		ctx.Nonce, ctx.Family, wantProfile, profile)
+	idTokenString, err := s.key.sign(id)
+	if err != nil {
+		return "", fmt.Errorf("sign id token: %w", err)
+	}
+	return idTokenString, nil
 }
 
 // randomJTI returns a 128-bit random claim id. crypto/rand failures are
