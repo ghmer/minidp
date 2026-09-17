@@ -206,7 +206,7 @@ func (s *Server) ipTrusted(ip net.IP) bool {
 // contentSecurityPolicy for the login HTML. The page uses no inline scripts
 // or styles, so a strict policy without 'unsafe-inline' is possible.
 const contentSecurityPolicy = "default-src 'self'; style-src 'self'; img-src 'self'; " +
-	"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+	"frame-ancestors 'none'; base-uri 'self'"
 
 // withCORS wraps next with security headers and CORS handling. Browser-based
 // clients (e.g. SPAs using oidc-client-ts) exchange the code for tokens

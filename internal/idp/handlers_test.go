@@ -1780,6 +1780,9 @@ func TestSecurityHeaders(t *testing.T) {
 			t.Errorf("%s = %q, want it set and containing %q", header, got, want)
 		}
 	}
+	if got := resp.Header.Get("Content-Security-Policy"); strings.Contains(got, "form-action") {
+		t.Errorf("Content-Security-Policy = %q, must not set form-action because it blocks login through a host-mapped container port", got)
+	}
 }
 
 func TestClientIPHonoursTrustedProxies(t *testing.T) {
