@@ -97,6 +97,9 @@ func (s *Server) Handler() http.Handler {
 	// Discovery + keys.
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.handleDiscovery)
 	mux.HandleFunc("GET /openid-configuration", s.handleDiscovery)
+	// RFC 8414 authorization-server metadata, the path OAuth-only
+	// (non-OIDC) clients probe; same document as openid-configuration.
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleDiscovery)
 	mux.HandleFunc("GET /oauth2/jwks", s.handleJWKS)
 	mux.HandleFunc("GET /jwks", s.handleJWKS)
 

@@ -9,6 +9,9 @@ BASE="http://localhost:8099"
 CLIENT="demo-app"          # public client on instance 1
 CONF_CLIENT="conf-app"     # confidential client on instance 1
 CONF_SECRET="smoke-test-confidential-secret"
+M2M_CLIENT="m2m-service"   # machine-to-machine client (client_credentials only)
+M2M_SECRET="smoke-test-m2m-secret"
+M2M_API="smoke-api"        # audience of the M2M client's tokens
 REDIRECT="http://localhost:3000/callback"
 CONF_REDIRECT="https://conf.example.com/cb"
 VERIFIER=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | tr -d '\n')
@@ -68,6 +71,9 @@ CFILE="$WORKDIR/clients.json"
   -post-logout "https://conf.example.com/" >/dev/null
 "$CTL" user add -file "$CFILE" -client "$CONF_CLIENT" -username bob \
   -password builder >/dev/null
+"$CTL" client add -file "$CFILE" -client "$M2M_CLIENT" -type confidential \
+  -secret "$M2M_SECRET" -audience "$M2M_API" \
+  -grant-types client_credentials -cc-scopes "smoke:read,smoke:write" >/dev/null
 "$CTL" client list -file "$CFILE" >/dev/null && echo "clientctl: clients file created and listed"
 mkdir -p "$WORKDIR/keys"
 IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_CLIENTS_FILE="$CFILE" \
@@ -457,6 +463,31 @@ assert typ(d['access_token'])=='at+jwt', typ
 print('confidential code grant with client_secret_basic OK (no PKCE needed)')
 "
 REFRESHC=$(printf '%s' "$TOKC" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
+
+echo "== 18b. client_credentials grant (machine-to-machine, RFC 6749 §4.4) =="
+TOKM=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=client_credentials&scope=smoke:admin")  # scope param must be ignored
+printf '%s' "$TOKM" | python3 -c "
+import json,sys,base64
+d=json.load(sys.stdin)
+def claims(t):
+    p=t.split('.')[1]; p+='='*(-len(p)%4)
+    return json.loads(base64.urlsafe_b64decode(p))
+def typ(t):
+    h=t.split('.')[0]; h+='='*(-len(h)%4)
+    return json.loads(base64.urlsafe_b64decode(h))['typ']
+ac=claims(d['access_token'])
+assert d['scope']=='smoke:read smoke:write', d.get('scope')   # static, not requested
+assert ac['aud']==['$M2M_API'], ac                            # audience from the clients file
+assert ac['sub']=='$M2M_CLIENT', ac                           # service-account-like subject
+assert typ(d['access_token'])=='at+jwt', typ
+assert 'id_token' not in d and 'refresh_token' not in d, d.keys()
+print('client_credentials grant OK (static scopes, aud=$M2M_API, sub=client_id, no refresh/id token)')
+"
+# A client without the grant is refused (RFC 6749 §5.2 unauthorized_client).
+RC3=$(curl -s -u "$CONF_CLIENT:$CONF_SECRET" -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \
+  -d "grant_type=client_credentials")
+[ "$RC3" = "400" ] && echo "client_credentials without opt-in rejected (400) OK"
 
 # RFC 6749 §6: refreshing also requires client authentication.
 RC1=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \

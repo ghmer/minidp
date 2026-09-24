@@ -599,11 +599,41 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		s.handleCodeGrant(w, r)
 	case "refresh_token":
 		s.handleRefreshGrant(w, r)
+	case "client_credentials":
+		s.handleClientCredentialsGrant(w, r)
 	case "":
 		writeAuthError(w, "invalid_request", "Missing grant_type.")
 	default:
-		writeAuthError(w, "unsupported_grant_type", "Only authorization_code and refresh_token are supported.")
+		writeAuthError(w, "unsupported_grant_type",
+			"Only authorization_code, refresh_token and client_credentials are supported.")
 	}
+}
+
+// handleClientCredentialsGrant implements the machine-to-machine grant
+// (RFC 6749 §4.4): the confidential client authenticates with its own
+// credentials and receives an access token minted for itself. There is no
+// user context: the token's subject is the client id, the audience and the
+// scopes come exclusively from the client's registration (audience field,
+// client_credentials_scopes), and no id_token or refresh token is issued.
+//
+// RFC 6749 §4.4.2 allows the client to send a scope parameter, but minidp
+// resolves the scopes statically from the clients file — there is no login
+// or consent step that could approve a runtime request, so the parameter is
+// ignored and the configured scopes are granted.
+func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request) {
+	client, ok := s.authenticateClient(w, r)
+	if !ok {
+		return
+	}
+	if !client.Confidential() || !client.AllowsGrant(GrantClientCredentials) {
+		// The client either cannot keep a secret (public profile) or is not
+		// opted in to the grant: both are policy, not authentication,
+		// failures (RFC 6749 §5.2 unauthorized_client).
+		writeAuthError(w, "unauthorized_client",
+			"The client is not authorized to use the client_credentials grant.")
+		return
+	}
+	s.issueAndWriteClientCredentials(w, client)
 }
 
 // verifyPKCE checks the code_verifier against the stored challenge. Only
@@ -707,6 +737,20 @@ func (s *Server) issueAndWriteTokens(w http.ResponseWriter, grant string, ctx *a
 		return
 	}
 	slog.Info("tokens issued", "grant", grant, "client", ctx.ClientID, "sub", ctx.Sub)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// issueAndWriteClientCredentials mints and writes the client_credentials
+// grant response; a failure degrades to a 500 instead of panicking the
+// process (finding F6).
+func (s *Server) issueAndWriteClientCredentials(w http.ResponseWriter, client *registeredClient) {
+	resp, err := s.issueClientCredentialsTokens(client)
+	if err != nil {
+		slog.Error("token issuance failed", "grant", "client_credentials", "client", client.ID(), "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
+		return
+	}
+	slog.Info("tokens issued", "grant", "client_credentials", "client", client.ID(), "sub", client.ID())
 	writeJSON(w, http.StatusOK, resp)
 }
 

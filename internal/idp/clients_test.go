@@ -86,7 +86,9 @@ func TestClientValidation(t *testing.T) {
 		"bad post-logout":     mutated(func(c *Client) { c.PostLogoutRedirectURIs = []string{"http://"} }),
 		"bad origin":          mutated(func(c *Client) { c.AllowedOrigins = []string{"not a url"} }),
 		"plaintext password":  mutated(func(c *Client) { c.Users = []User{{Username: "a", PasswordHash: "secret"}} }),
-		"empty username":      mutated(func(c *Client) { c.Users = []User{{Username: "  ", PasswordHash: "$2a$10$0123456789012345678901234567890123456789012345678901234"}} }),
+		"empty username": mutated(func(c *Client) {
+			c.Users = []User{{Username: "  ", PasswordHash: "$2a$10$0123456789012345678901234567890123456789012345678901234"}}
+		}),
 		"duplicate users": mutated(func(c *Client) {
 			c.Users = []User{
 				{Username: "a", PasswordHash: "$2a$10$0123456789012345678901234567890123456789012345678901234"},

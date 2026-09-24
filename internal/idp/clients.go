@@ -26,6 +26,15 @@ const (
 	TypeConfidential ClientType = "confidential"
 )
 
+// OAuth2 grant types a client may be registered for (RFC 6749). Clients
+// without an explicit grant_types entry keep the historic default:
+// GrantAuthorizationCode and GrantRefreshToken.
+const (
+	GrantAuthorizationCode = "authorization_code"
+	GrantRefreshToken      = "refresh_token"
+	GrantClientCredentials = "client_credentials"
+)
+
 // Client is one registered OAuth2/OIDC client in the clients file. Each
 // client carries its own redirect policy, its own audience and its own user
 // accounts, so a client's users can never sign in to another client's flow.
@@ -43,6 +52,18 @@ type Client struct {
 	// Audience is the "aud" value written into the client's tokens. It
 	// defaults to the client id.
 	Audience string `json:"audience,omitempty"`
+	// GrantTypes are the OAuth2 grants the client may use at /token.
+	// Optional; the default is ["authorization_code", "refresh_token"] so
+	// pre-grant registrations behave exactly as before. client_credentials
+	// is the machine-to-machine grant (RFC 6749 §4.4) and is opt-in per
+	// client; it requires the confidential profile.
+	GrantTypes []string `json:"grant_types,omitempty"`
+	// ClientCredentialsScopes are the scopes released on the client's
+	// client_credentials access tokens. There is no login or consent step
+	// for that grant, so scopes cannot be requested at token time: they
+	// must be configured statically here (and be non-empty when the
+	// client_credentials grant is enabled).
+	ClientCredentialsScopes []string `json:"client_credentials_scopes,omitempty"`
 	// RedirectURIs are the registered authorization-response targets. The
 	// policy is mandatory; requests are honoured only for these exact values.
 	RedirectURIs []string `json:"redirect_uris"`
@@ -61,6 +82,33 @@ type Client struct {
 
 // Confidential reports whether the client uses the confidential profile.
 func (c Client) Confidential() bool { return c.Type == TypeConfidential }
+
+// grants resolves the client's enabled grants: the configured list, or the
+// historic default for registrations without an explicit one.
+func (c Client) grants() []string {
+	if len(c.GrantTypes) == 0 {
+		return []string{GrantAuthorizationCode, GrantRefreshToken}
+	}
+	return c.GrantTypes
+}
+
+// AllowsGrant reports whether the client may use the given OAuth2 grant at
+// the token endpoint.
+func (c Client) AllowsGrant(grant string) bool {
+	for _, g := range c.grants() {
+		if g == grant {
+			return true
+		}
+	}
+	return false
+}
+
+// Interactive reports whether the client participates in the browser-based
+// authorization_code or refresh_token flows — the only grants with user
+// context, and therefore the only ones that need redirect URIs and accounts.
+func (c Client) Interactive() bool {
+	return c.AllowsGrant(GrantAuthorizationCode) || c.AllowsGrant(GrantRefreshToken)
+}
 
 // MarshalJSON serializes a client for the clients file. Implementing the
 // marshaler explicitly keeps the on-disk format in one place. The
@@ -84,9 +132,10 @@ func (c Client) validate() error {
 		return err
 	}
 	// The users array is validated structurally (duplicates, hashes, roles).
-	// A client without users is a transient state the clientctl tool may
-	// write (client created, user not yet added); the IdP refuses to start
-	// with one, and the tool warns about it.
+	// A client without users is either a transient state the clientctl tool
+	// may write for an interactive client (client created, user not yet
+	// added; the IdP refuses to start with one) or a legitimate
+	// machine-to-machine client without interactive accounts.
 	if err := validateUserSlice(c.Users); err != nil {
 		return fmt.Errorf("client %q: %w", c.ClientID, err)
 	}
@@ -118,7 +167,7 @@ func (c Client) validateProfile() error {
 		}
 	case TypeConfidential:
 		if c.ClientSecret == "" {
-			return fmt.Errorf("client %q: a confidential client requires a client_secret " +
+			return fmt.Errorf("client %q: a confidential client requires a client_secret "+
 				"(generate one with: openssl rand -base64 32)", c.ClientID)
 		}
 		if len(c.ClientSecret) < 16 {
@@ -133,12 +182,62 @@ func (c Client) validateProfile() error {
 	if a := c.audience(); strings.ContainsAny(a, " \t\r\n") {
 		return fmt.Errorf("client %q: audience %q must not contain whitespace", c.ClientID, a)
 	}
+	return c.validateGrants()
+}
+
+// validateGrants checks the grant_types / client_credentials_scopes pair:
+// known grant names, the machine-to-machine grant only for confidential
+// clients, statically configured (non-empty) scopes for it, and no scopes
+// entry without the grant.
+func (c Client) validateGrants() error {
+	hasCC := false
+	seen := make(map[string]bool, len(c.GrantTypes))
+	for _, g := range c.GrantTypes {
+		switch g {
+		case GrantAuthorizationCode, GrantRefreshToken:
+		case GrantClientCredentials:
+			hasCC = true
+		default:
+			return fmt.Errorf("client %q: invalid grant type %q: must be %q, %q or %q",
+				c.ClientID, g, GrantAuthorizationCode, GrantRefreshToken, GrantClientCredentials)
+		}
+		if seen[g] {
+			return fmt.Errorf("client %q: duplicate grant type %q", c.ClientID, g)
+		}
+		seen[g] = true
+	}
+	if !hasCC {
+		if len(c.ClientCredentialsScopes) > 0 {
+			return fmt.Errorf("client %q: client_credentials_scopes are set but the %q grant is not enabled",
+				c.ClientID, GrantClientCredentials)
+		}
+		return nil
+	}
+	if !c.Confidential() {
+		return fmt.Errorf("client %q: the %q grant requires the confidential profile "+
+			"(client authentication at the token endpoint, RFC 6749 §4.4)",
+			c.ClientID, GrantClientCredentials)
+	}
+	if len(c.ClientCredentialsScopes) == 0 {
+		return fmt.Errorf("client %q: the %q grant requires a non-empty client_credentials_scopes list "+
+			"(there is no login step, so scopes cannot be requested at token time)",
+			c.ClientID, GrantClientCredentials)
+	}
+	for _, sc := range c.ClientCredentialsScopes {
+		if strings.TrimSpace(sc) == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
+			return fmt.Errorf("client %q: client_credentials_scope %q must not be empty, whitespace-padded or contain whitespace",
+				c.ClientID, sc)
+		}
+	}
 	return nil
 }
 
-// validateURLs checks the redirect, post-logout and origin lists.
+// validateURLs checks the redirect, post-logout and origin lists. A
+// redirect_uri is required only for clients with an interactive grant: a
+// purely machine-to-machine client (client_credentials only) never sends the
+// browser anywhere. Extra lists stay validated whenever present.
 func (c Client) validateURLs() error {
-	if len(c.RedirectURIs) == 0 {
+	if c.Interactive() && len(c.RedirectURIs) == 0 {
 		return fmt.Errorf("client %q: at least one redirect_uri is required", c.ClientID)
 	}
 	for _, raw := range c.RedirectURIs {
@@ -220,6 +319,12 @@ func validateClientSlice(clients []Client) error {
 	return nil
 }
 
+// ValidateClient checks one client entry against the clients-file rules and
+// returns its validation error. Exported for the clientctl tool: it can
+// pre-flight a mutated in-memory entry before a save, instead of letting the
+// save-time slice validation report the problem.
+func ValidateClient(c Client) error { return c.validate() }
+
 // SaveClients validates and writes the clients file atomically (temp file +
 // rename, mode 0600). Used by the clientctl tool. The file holds client
 // secrets and password hashes, so it must stay private.
@@ -253,6 +358,16 @@ func (rc *registeredClient) Audience() string { return rc.client.audience() }
 // Confidential reports the client's RFC 6749 profile.
 func (rc *registeredClient) Confidential() bool { return rc.client.Confidential() }
 
+// allowsGrant reports whether this client may use the given OAuth2 grant at
+// the token endpoint.
+func (rc *registeredClient) AllowsGrant(grant string) bool { return rc.client.AllowsGrant(grant) }
+
+// clientCredentialsScopes returns the statically configured scopes for this
+// client's client_credentials access tokens (validated non-empty at load).
+func (rc *registeredClient) clientCredentialsScopes() []string {
+	return rc.client.ClientCredentialsScopes
+}
+
 // secret returns the client's credential (empty for public clients).
 func (rc *registeredClient) secret() string { return rc.client.ClientSecret }
 
@@ -282,8 +397,8 @@ func constantTimeEqual(a, b string) bool {
 // the provider-wide metadata (CORS origins, accepted token audiences, client
 // authentication methods).
 type clientRegistry struct {
-	byID            map[string]*registeredClient
-	ids             []string
+	byID map[string]*registeredClient
+	ids  []string
 	// redirects and logoutRedirects hold the per-client allowlists keyed by
 	// client id, so the redirect-target selection at the HTTP layer resolves
 	// them from the server's own registry (never through a request-derived
@@ -312,6 +427,7 @@ func LoadClients(path string) (*clientRegistry, error) {
 		slog.Info("client registered",
 			"client", rc.ID(),
 			"type", string(rc.client.Type),
+			"grants", strings.Join(rc.client.grants(), ","),
 			"audience", rc.Audience(),
 			"redirect_uris", len(rc.client.RedirectURIs),
 			"users", rc.userCount(),
@@ -336,7 +452,7 @@ func newClientRegistry(clients []Client) (*clientRegistry, error) {
 		origins:         make(map[string]bool),
 	}
 	for _, c := range clients {
-		if len(c.Users) == 0 {
+		if c.Interactive() && len(c.Users) == 0 {
 			return nil, fmt.Errorf("client %q has no users: add at least one account (clientctl user add)", c.ClientID)
 		}
 		if _, dup := r.byID[c.ClientID]; dup {
@@ -385,6 +501,18 @@ func (r *clientRegistry) clientIDs() []string { return r.ids }
 // confidential. The introspection and revocation endpoints require client
 // authentication only when a secret exists that could authenticate anybody.
 func (r *clientRegistry) anyConfidential() bool { return r.hasConfidential }
+
+// anyClientCredentials reports whether at least one registered client is
+// enabled for the client_credentials grant. Discovery advertises the grant
+// only when a client could actually use it.
+func (r *clientRegistry) anyClientCredentials() bool {
+	for _, id := range r.ids {
+		if r.byID[id].AllowsGrant(GrantClientCredentials) {
+			return true
+		}
+	}
+	return false
+}
 
 // audienceAllowed reports whether one of the token's audiences belongs to a
 // registered client. Resource endpoints (userinfo, introspection) accept

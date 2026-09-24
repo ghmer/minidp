@@ -191,6 +191,45 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	return resp, nil
 }
 
+// issueClientCredentialsTokens mints the access token for the
+// client_credentials grant (RFC 6749 §4.4): a token for the client itself,
+// with no user context. The subject is the client id, the audience and the
+// scopes come exclusively from the client's registration, and no id_token
+// or refresh token is issued (RFC 6749 §4.4.3: no refresh token for this
+// grant). No profile claims are released: there is no user record the
+// token could speak about.
+func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenResponse, error) {
+	scopes := client.clientCredentialsScopes()
+	now := time.Now()
+	expires := now.Add(s.cfg.AccessTokenTTL)
+
+	// A crypto/rand failure must not panic here (review finding F6): this
+	// runs inside a request handler, so the error degrades to a 500.
+	jti, err := randomJTI()
+	if err != nil {
+		return nil, fmt.Errorf("generate access token jti: %w", err)
+	}
+	access := &accessClaims{
+		RegisteredClaims: s.registeredClaims(client.Audience(), client.ID(), jti, now, expires),
+		Scope:            joinScopes(scopes),
+	}
+	accessTokenString, err := s.key.signAccess(access)
+	if err != nil {
+		return nil, fmt.Errorf("sign access token: %w", err)
+	}
+	// Track the access token so /revoke can deny it (the JWT itself is
+	// stateless and cannot be deleted). There is no refresh chain: the
+	// family id stays empty, and revocation denies the jti until expiry.
+	s.store.registerJTI(jti, client.ID(), "", expires)
+
+	return &tokenResponse{
+		AccessToken: accessTokenString,
+		TokenType:   "Bearer",
+		ExpiresIn:   int(s.cfg.AccessTokenTTL.Seconds()),
+		Scope:       joinScopes(scopes),
+	}, nil
+}
+
 // issueIDToken mints and signs the id_token for the token set. The caller
 // checks the openid scope and passes the audience of the client the token is
 // minted for.

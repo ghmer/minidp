@@ -26,5 +26,13 @@
         "password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
       }
     ]
+  },
+  {
+    "client_id": "m2m-service",
+    "type": "confidential",
+    "client_secret": "REPLACE-WITH-openssl-rand-base64-32",
+    "audience": "backend-api",
+    "grant_types": ["client_credentials"],
+    "client_credentials_scopes": ["backend-api:read", "backend-api:write"]
   }
 ]

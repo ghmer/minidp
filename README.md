@@ -36,6 +36,12 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
   whenever the user record defines it — roles are authorization data, not
   scope-gated profile claims.
 - Refresh token grant with single-use rotation.
+- Machine-to-machine `client_credentials` grant (RFC 6749 §4.4) for
+  confidential service clients, with a statically configured scope list
+  (`client_credentials_scopes`) and `sub = client_id`; such clients need
+  no redirect URIs and no user accounts.
+- RFC 8414 metadata at `/.well-known/oauth-authorization-server`, mirroring
+  the OIDC discovery document.
 - `userinfo`, `introspect` (RFC 7662) and `revoke` (RFC 7009) endpoints.
 - CORS support for browser-based SPAs (e.g. `oidc-client-ts`). Only origins
   derived from a client's registered redirects, or listed in its
@@ -110,13 +116,14 @@ Managing clients and accounts — profiles, secrets, redirect policies, the
 
 ## Endpoints
 
-| Endpoint                                  | Purpose                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------- |
-| `GET   /.well-known/openid-configuration` | OIDC discovery                                                       |
-| `GET   /jwks`                             | JSON Web Key Set (`RS256` public key)                                |
-| `GET/POST /authorize`                     | Login form + authorization code issuance                             |
-| `POST /token`                             | `authorization_code` and `refresh_token` grants                      |
-| `GET/POST /userinfo`                      | Claims of the bearer token's subject                                 |
+| Endpoint                                       | Purpose                                                              |
+| ---------------------------------------------- | -------------------------------------------------------------------- |
+| `GET   /.well-known/openid-configuration`      | OIDC discovery                                                       |
+| `GET   /.well-known/oauth-authorization-server`| RFC 8414 authorization-server metadata (same document)               |
+| `GET   /jwks`                                  | JSON Web Key Set (`RS256` public key)                                |
+| `GET/POST /authorize`                          | Login form + authorization code issuance                             |
+| `POST /token`                                  | `authorization_code`, `refresh_token` and `client_credentials` grants |
+| `GET/POST /userinfo`                           | Claims of the bearer token's subject                                 |
 | `POST /introspect`                        | RFC 7662 token introspection                                         |
 | `POST /revoke`                            | RFC 7009 revocation (refresh + access tokens via `jti` denylist)     |
 | `GET   /end_session`                      | Logout; with `id_token_hint`, the authorization's tokens are revoked |

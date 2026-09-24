@@ -85,6 +85,64 @@ another client can't redeem it even with valid credentials — the attempt
 burns the code as a theft signal, just as a client mismatch on a refresh
 token revokes the whole token family.
 
+## Machine-to-machine: the `client_credentials` grant
+
+For service-to-service calls without an interactive user (RFC 6749 §4.4),
+a confidential client can be opted in to the `client_credentials` grant:
+
+- `grant_types` selects the grants the client may use at `/token`; the
+  default (and the behaviour of every pre-existing entry) is
+  `["authorization_code", "refresh_token"]`.
+- `client_credentials` requires the confidential profile — the client
+  authenticates with the same `client_secret_basic`/`client_secret_post`
+  credentials as the interactive confidential flow. A public client or a
+  client without the grant answers `400 unauthorized_client`.
+- The issued token is an access token only: no `id_token` (there is no
+  user session) and no `refresh_token` (RFC 6749 §4.4.3). The subject is
+  the `client_id` itself — a service-account-like identity, as in other
+  IdPs (Keycloak service accounts, Azure AD). No user-derived claims
+  (`preferred_username`, `email`, `name`, `roles`) are released, and
+  `/userinfo` is meaningless for such a token.
+- The audience is the client's registered `audience` field, so a purely
+  service client can mint tokens for a *different* API's audience (e.g.
+  `audience: "fake-hr"`) than its own `client_id`.
+- Scopes cannot be requested at token time — there is no login or consent
+  step that could approve them. They come exclusively from the client's
+  static `client_credentials_scopes` list, which is mandatory (non-empty)
+  with the grant; a `scope` request parameter is ignored.
+- `/revoke` (via the `jti` denylist) and `/introspect` work as for any
+  other access token.
+
+A purely service client needs neither `redirect_uris` nor `users`: only
+clients with an interactive grant (`authorization_code` or
+`refresh_token`) are required to have them. Combined with `audience`,
+this makes the client a first-class API consumer in its own right:
+
+```json
+{
+  "client_id": "fake-hr-mcp-service",
+  "type": "confidential",
+  "client_secret": "...",
+  "audience": "fake-hr",
+  "grant_types": ["client_credentials"],
+  "client_credentials_scopes": ["fake-hr:read", "fake-hr:write"]
+}
+```
+
+```sh
+clientctl client add -file clients.json -client fake-hr-mcp-service \
+  -type confidential -secret "$(openssl rand -base64 32)" \
+  -audience fake-hr -grant-types client_credentials -cc-scopes fake-hr:read,fake-hr:write
+
+curl -s -u fake-hr-mcp-service:SECRET -d grant_type=client_credentials \
+  http://localhost:8080/token
+```
+
+Discovery advertises `client_credentials` in `grant_types_supported` when
+at least one registered client is opted in, and the same metadata document
+is additionally served at `/.well-known/oauth-authorization-server` (RFC
+8414), the path OAuth-only (non-OIDC) libraries probe.
+
 ## The clients file
 
 Set `IDP_CLIENTS_FILE` to a JSON file containing an array of clients. Each
@@ -168,6 +226,12 @@ File format (see `clients.json.example`):
   random bits), a public entry must not have one. `audience` defaults to
   the `client_id`. Every `redirect_uri` must be an absolute http(s) URL
   without a fragment, compared by exact string match at `/authorize`.
+- `grant_types` selects the OAuth grants the client may use at `/token`
+  (default `["authorization_code", "refresh_token"]`; see
+  [the client_credentials grant](#machine-to-machine-the-client_credentials-grant)).
+  `client_credentials` requires the confidential profile and a non-empty
+  `client_credentials_scopes` list; clients without an interactive grant
+  need no `redirect_uris` and no `users`.
 - `post_logout_redirect_uris` are the targets `/end_session` may redirect
   to for that client (resolved from the `id_token_hint`'s audience or the
    `client_id` parameter). An empty list means logout renders a confirmation
