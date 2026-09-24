@@ -10,10 +10,12 @@
 //	clientctl client list                                          [-file clients.json]
 //	clientctl client show    -client app                           [-file clients.json]
 //	clientctl client add     -client app -type public|confidential [-file clients.json]
-//	                         [-secret ...|-] [-audience ...] -redirect uri[,uri...]
+//	                         [-secret ...|-] [-audience ...] [-grant-types ...]
+//	                         [-cc-scopes ...] [-redirect uri[,uri...]]
 //	                         [-post-logout uri,...] [-origin uri,...]
 //	clientctl client update  -client app                           [-file clients.json]
-//	                         [-type ...] [-secret ...|-] [-audience ...] [-redirect ...]
+//	                         [-type ...] [-secret ...|-] [-audience ...]
+//	                         [-grant-types ...] [-cc-scopes ...] [-redirect ...]
 //	                         [-post-logout ...] [-origin ...]
 //	clientctl client remove  -client app                           [-file clients.json]
 //	clientctl user list      -client app                           [-file clients.json]
@@ -77,10 +79,12 @@ Usage:
   clientctl client list                                          [-file clients.json]
   clientctl client show    -client app                           [-file clients.json]
   clientctl client add     -client app -type public|confidential [-file clients.json]
-                           [-secret ...|-] [-audience ...] -redirect uri[,uri...]
+                           [-secret ...|-] [-audience ...] [-grant-types ...]
+                           [-cc-scopes ...] [-redirect uri[,uri...]]
                            [-post-logout uri,...] [-origin uri,...]
   clientctl client update  -client app                           [-file clients.json]
-                           [-type ...] [-secret ...|-] [-audience ...] [-redirect ...]
+                           [-type ...] [-secret ...|-] [-audience ...]
+                           [-grant-types ...] [-cc-scopes ...] [-redirect ...]
                            [-post-logout ...] [-origin ...]
   clientctl client remove  -client app                           [-file clients.json]
   clientctl user list      -client app                           [-file clients.json]
@@ -96,7 +100,11 @@ printed. "-password -"/"-secret -" read one line from stdin; without the flag
 an interactive prompt (with confirmation) is used where applicable. -roles
 takes a comma-separated list; updating with "-roles ''" clears all roles.
 Redirect URIs, post-logout URIs and origins are comma-separated lists that
-replace the previous set when provided.
+replace the previous set when provided. -grant-types and -cc-scopes are
+comma-separated lists too: -grant-types picks the OAuth grants the client may
+use (default: authorization_code,refresh_token); a client_credentials-only
+client needs no redirect URIs and no users, but -cc-scopes (its statically
+configured token scopes) and -secret (confidential profile) are required.
 `)
 }
 
@@ -278,6 +286,8 @@ type clientFlags struct {
 	typ        *string
 	secret     *string
 	audience   *string
+	grantTypes *string
+	ccScopes   *string
 	redirect   *string
 	postLogout *string
 	origin     *string
@@ -289,7 +299,9 @@ func registerClientFlags(fs *flag.FlagSet) *clientFlags {
 	f.typ = fs.String("type", "", "client profile: public (mandatory PKCE) or confidential (client auth at /token)")
 	f.secret = fs.String("secret", "", "client secret for a confidential client; '-' reads one line from stdin")
 	f.audience = fs.String("audience", "", "token audience; defaults to the client_id")
-	f.redirect = fs.String("redirect", "", "comma-separated registered redirect_uri values (required)")
+	f.grantTypes = fs.String("grant-types", "", "comma-separated OAuth grants: authorization_code, refresh_token, client_credentials (default: authorization_code,refresh_token)")
+	f.ccScopes = fs.String("cc-scopes", "", "comma-separated scopes of the client_credentials access tokens (required with -grant-types client_credentials)")
+	f.redirect = fs.String("redirect", "", "comma-separated registered redirect_uri values (required unless client_credentials is the only grant)")
 	f.postLogout = fs.String("post-logout", "", "comma-separated post_logout_redirect_uri values for /end_session")
 	f.origin = fs.String("origin", "", "comma-separated extra CORS origins granted to this client")
 	return f
@@ -335,7 +347,17 @@ func clientAdd(args []string) error {
 	if *f.typ != string(idp.TypePublic) && *f.typ != string(idp.TypeConfidential) {
 		return fmt.Errorf("-type is required and must be %q or %q", idp.TypePublic, idp.TypeConfidential)
 	}
-	if *f.redirect == "" {
+	// A redirect policy is only required for clients with an interactive
+	// grant: a purely machine-to-machine client (client_credentials only)
+	// never sends the browser anywhere.
+	effectiveGrants := effectiveGrantTypes(*f.grantTypes)
+	interactive := false
+	for _, g := range effectiveGrants {
+		if g == idp.GrantAuthorizationCode {
+			interactive = true
+		}
+	}
+	if *f.redirect == "" && interactive {
 		return fmt.Errorf("-redirect is required: declare the registered redirect_uri values")
 	}
 	clients, _, err := loadClients(*f.selector.file)
@@ -346,13 +368,15 @@ func clientAdd(args []string) error {
 		return fmt.Errorf("client %q already exists (use the update command)", *f.selector.client)
 	}
 	client := idp.Client{
-		ClientID:               *f.selector.client,
-		Type:                   idp.ClientType(*f.typ),
-		Audience:               *f.audience,
-		RedirectURIs:           parseList(*f.redirect),
-		PostLogoutRedirectURIs: parseList(*f.postLogout),
-		AllowedOrigins:         parseList(*f.origin),
-		Users:                  []idp.User{},
+		ClientID:                *f.selector.client,
+		Type:                    idp.ClientType(*f.typ),
+		Audience:                *f.audience,
+		GrantTypes:              parseList(*f.grantTypes),
+		ClientCredentialsScopes: parseList(*f.ccScopes),
+		RedirectURIs:            parseList(*f.redirect),
+		PostLogoutRedirectURIs:  parseList(*f.postLogout),
+		AllowedOrigins:          parseList(*f.origin),
+		Users:                   []idp.User{},
 	}
 	if client.Confidential() {
 		secret, err := resolveNewSecret(*f.secret)
@@ -362,6 +386,11 @@ func clientAdd(args []string) error {
 		client.ClientSecret = secret
 	}
 	clients = append(clients, client)
+	// Pre-flight the new entry so an inconsistent grant/profile/scopes
+	// combination is reported before the file is touched.
+	if err := idp.ValidateClient(client); err != nil {
+		return err
+	}
 	if err := idp.SaveClients(*f.selector.file, clients); err != nil {
 		return err
 	}
@@ -381,6 +410,17 @@ func applyClientChanges(client *idp.Client, spec *clientChangeSpec) (bool, error
 		return false, err
 	}
 	return profileChanged || endpointChanged, nil
+}
+
+// effectiveGrantTypes resolves the grant list of a client from an optional
+// comma-separated flag value: parsed entries, or the historic default
+// (authorization_code + refresh_token) when the flag is absent.
+func effectiveGrantTypes(flagValue string) []string {
+	grants := parseList(flagValue)
+	if len(grants) == 0 {
+		return []string{idp.GrantAuthorizationCode, idp.GrantRefreshToken}
+	}
+	return grants
 }
 
 // applyClientProfileChange applies the -type and -secret flags and enforces
@@ -414,18 +454,23 @@ func applyClientProfileChange(client *idp.Client, spec *clientChangeSpec) (bool,
 	return changed, nil
 }
 
-// applyClientEndpointChanges applies the audience/redirect/post-logout/origin
-// flags.
+// applyClientEndpointChanges applies the audience/grants/scopes/redirect/
+// post-logout/origin flags.
 func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (bool, error) {
 	changed := false
 	if spec.provid["audience"] {
 		client.Audience = *spec.f.audience
 		changed = true
 	}
+	if spec.provid["grant-types"] {
+		client.GrantTypes = effectiveGrantTypes(*spec.f.grantTypes)
+		changed = true
+	}
+	if spec.provid["cc-scopes"] {
+		client.ClientCredentialsScopes = parseList(*spec.f.ccScopes)
+		changed = true
+	}
 	if spec.provid["redirect"] {
-		if *spec.f.redirect == "" {
-			return false, fmt.Errorf("-redirect must not be empty: a client needs at least one redirect_uri")
-		}
 		client.RedirectURIs = parseList(*spec.f.redirect)
 		changed = true
 	}
@@ -458,7 +503,13 @@ func clientUpdate(args []string) error {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -redirect, -post-logout or -origin")
+		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -redirect, -post-logout or -origin")
+	}
+	// Pre-flight the mutated entry so an inconsistent combination (e.g.
+	// -grant-types client_credentials without -cc-scopes) is reported
+	// before the file is touched.
+	if err := idp.ValidateClient(clients[idx]); err != nil {
+		return err
 	}
 	if err := idp.SaveClients(*spec.f.selector.file, clients); err != nil {
 		return err
@@ -502,8 +553,16 @@ func describeClient(c idp.Client) string {
 	if audience == "" {
 		audience = c.ClientID
 	}
+	grants := c.GrantTypes
+	if len(grants) == 0 {
+		grants = []string{idp.GrantAuthorizationCode, idp.GrantRefreshToken}
+	}
 	line := c.ClientID + "\ttype: " + string(c.Type) + "\taudience: " + audience +
-		"\tredirects: " + strings.Join(c.RedirectURIs, ",")
+		"\tgrants: " + strings.Join(grants, ",")
+	if len(c.ClientCredentialsScopes) > 0 {
+		line += "\tcc-scopes: " + strings.Join(c.ClientCredentialsScopes, ",")
+	}
+	line += "\tredirects: " + strings.Join(c.RedirectURIs, ",")
 	if len(c.PostLogoutRedirectURIs) > 0 {
 		line += "\tpost-logout: " + strings.Join(c.PostLogoutRedirectURIs, ",")
 	}

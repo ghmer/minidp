@@ -70,10 +70,10 @@ func testIDPClients(t *testing.T, clients []Client, mutate func(*Config)) (*http
 		t.Fatalf("SaveClients: %v", err)
 	}
 	cfg := Config{
-		Host:           "127.0.0.1",
-		ClientsFile:    clientsFile,
-		Issuer:         "http://" + ln.Addr().String(),
-		AccessTokenTTL: time.Hour,
+		Host:            "127.0.0.1",
+		ClientsFile:     clientsFile,
+		Issuer:          "http://" + ln.Addr().String(),
+		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 2 * time.Hour,
 	}
 	if mutate != nil {
@@ -1530,7 +1530,7 @@ func TestAssetOverrides(t *testing.T) {
 	t.Run("per-file fallback to embedded default", func(t *testing.T) {
 		setup(t, "logo.svg")
 		ts, _ := testIDP(t, nil)
-		if css := get(t, ts.URL + "/login.css"); !themeAccentRe.MatchString(css) {
+		if css := get(t, ts.URL+"/login.css"); !themeAccentRe.MatchString(css) {
 			t.Error("login.css must fall back to the embedded Deep Water theme")
 		}
 		if logo := get(t, ts.URL+"/logo.svg"); logo != customLogo {

@@ -2,9 +2,22 @@ package idp
 
 import "net/http"
 
+// grantTypesSupported lists the token-endpoint grants this provider
+// implements. The client_credentials grant (RFC 6749 §4.4) is advertised
+// only when at least one registered client is enabled for it.
+func (s *Server) grantTypesSupported() []string {
+	grants := []string{GrantAuthorizationCode, GrantRefreshToken}
+	if s.clients.anyClientCredentials() {
+		grants = append(grants, GrantClientCredentials)
+	}
+	return grants
+}
+
 // handleDiscovery serves the OIDC discovery document. Clients fetch
 // <issuer>/.well-known/openid-configuration to learn the
 // endpoint URLs and the jwks_uri used for JWT validation.
+// The same document is served at /.well-known/oauth-authorization-server,
+// the RFC 8414 metadata path that OAuth-only (non-OIDC) clients probe.
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	// Client authentication methods are provider-wide metadata: "none" is
 	// always available (public clients identify themselves with client_id
@@ -24,7 +37,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"introspection_endpoint":                        s.cfg.Issuer + "/introspect",
 		"end_session_endpoint":                          s.cfg.Issuer + "/end_session",
 		"response_types_supported":                      []string{"code"},
-		"grant_types_supported":                         []string{"authorization_code", "refresh_token"},
+		"grant_types_supported":                         s.grantTypesSupported(),
 		"subject_types_supported":                       []string{"public"},
 		"id_token_signing_alg_values_supported":         []string{"RS256"},
 		"token_endpoint_auth_methods_supported":         clientAuthMethods,

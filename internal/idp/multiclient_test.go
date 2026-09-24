@@ -14,11 +14,11 @@ import (
 func multiClientIDP(t *testing.T, secret string) (*httptest.Server, *Server) {
 	t.Helper()
 	conf := Client{
-		ClientID:     "conf-app",
-		Type:         TypeConfidential,
-		ClientSecret: secret,
-		Audience:     "conf-api",
-		RedirectURIs: []string{"https://conf.example.com/cb"},
+		ClientID:               "conf-app",
+		Type:                   TypeConfidential,
+		ClientSecret:           secret,
+		Audience:               "conf-api",
+		RedirectURIs:           []string{"https://conf.example.com/cb"},
 		PostLogoutRedirectURIs: []string{"https://conf.example.com/"},
 		Users: []User{
 			{Username: "bob", PasswordHash: testHash(t, "builder")},
