@@ -131,7 +131,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /logo.svg", s.handleStaticLogo)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			slog.Debug("healthz write failed", "error", err)
+		}
 	})
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
@@ -273,7 +275,9 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Debug("json response write failed", "error", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, errCode, desc string) {

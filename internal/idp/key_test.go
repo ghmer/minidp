@@ -69,7 +69,11 @@ func TestJWKSPublishedKeyVerifiesToken(t *testing.T) {
 	var set struct {
 		Keys []jwk `json:"keys"`
 	}
-	if err := json.Unmarshal(keySetOf(k).JWKS(), &set); err != nil {
+	jwks, err := keySetOf(k).JWKS()
+	if err != nil {
+		t.Fatalf("JWKS: %v", err)
+	}
+	if err := json.Unmarshal(jwks, &set); err != nil {
 		t.Fatalf("JWKS is not valid JSON: %v", err)
 	}
 	if len(set.Keys) != 1 {
@@ -276,7 +280,11 @@ func TestRotateKeysStagesOverlapAndKeepsOldTokensValid(t *testing.T) {
 	var jwksSet struct {
 		Keys []jwk `json:"keys"`
 	}
-	if err := json.Unmarshal(set.JWKS(), &jwksSet); err != nil {
+	jwksBytes, err := set.JWKS()
+	if err != nil {
+		t.Fatalf("JWKS: %v", err)
+	}
+	if err := json.Unmarshal(jwksBytes, &jwksSet); err != nil {
 		t.Fatalf("JWKS is not valid JSON: %v", err)
 	}
 	kids := map[string]bool{}

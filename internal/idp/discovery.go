@@ -1,6 +1,9 @@
 package idp
 
-import "net/http"
+import (
+	"log/slog"
+	"net/http"
+)
 
 // grantTypesSupported lists the token-endpoint grants this provider
 // implements. The client_credentials grant (RFC 6749 §4.4) is advertised
@@ -75,6 +78,14 @@ func (s *Server) scopesSupported() []string {
 // handleJWKS serves the JSON Web Key Set with the RSA public signing key.
 // Resource servers verify access-token signatures against this key set.
 func (s *Server) handleJWKS(w http.ResponseWriter, _ *http.Request) {
+	jwks, err := s.keys.JWKS()
+	if err != nil {
+		slog.Error("marshal jwks failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(s.keys.JWKS())
+	if _, err := w.Write(jwks); err != nil {
+		slog.Debug("jwks write failed", "error", err)
+	}
 }

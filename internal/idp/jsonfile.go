@@ -3,9 +3,19 @@ package idp
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
+
+// removeTempFile best-effort removes a temp file after a failed write. The
+// error is logged, never ignored: a leftover 0600 temp file holding secrets
+// must not vanish silently.
+func removeTempFile(root *os.Root, tmpName string) {
+	if err := root.Remove(tmpName); err != nil {
+		slog.Warn("temp file cleanup failed", "name", tmpName, "error", err)
+	}
+}
 
 // readScopedFile reads path via an os.Root anchored at the file's directory
 // so a crafted path cannot traverse outside it (gosec G304/G703).
@@ -56,15 +66,15 @@ func saveJSONFile(path string, data []byte) error {
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("write file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("close file: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("persist file to %q: %w", path, err)
 	}
 	return nil

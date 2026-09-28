@@ -289,7 +289,7 @@ func waitForPeerKey(root *os.Root, dir, tmpName, path string, attempt int) error
 		return fmt.Errorf("gave up waiting for signing key %q: %w", path, err)
 	}
 	slog.Warn("stale signing-key temp file detected, taking over", "path", filepath.Join(dir, tmpName))
-	_ = root.Remove(tmpName)
+	removeTempFile(root, tmpName)
 	return nil
 }
 
@@ -312,11 +312,11 @@ func generateAndPersistKey(root *os.Root, dir, tmpName, path string, tmp *os.Fil
 		return nil, fmt.Errorf("write signing key in %q: %w", dir, err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return nil, fmt.Errorf("close signing key in %q: %w", dir, err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return nil, fmt.Errorf("persist signing key to %q: %w", path, err)
 	}
 	slog.Info("generated and persisted RSA signing key", "path", path)
@@ -326,7 +326,7 @@ func generateAndPersistKey(root *os.Root, dir, tmpName, path string, tmp *os.Fil
 // discardTempFile closes and removes a temp file after a failed write.
 func discardTempFile(root *os.Root, tmp *os.File, tmpName string) {
 	_ = tmp.Close()
-	_ = root.Remove(tmpName)
+	removeTempFile(root, tmpName)
 }
 
 // awaitFile polls until path exists or the timeout elapses.
@@ -464,11 +464,11 @@ func persistKeyPEM(root *os.Root, dir, name string, key *rsa.PrivateKey) error {
 		return fmt.Errorf("write signing key: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("close signing key: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), filepath.Join(dir, name)); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("persist signing key to %q: %w", name, err)
 	}
 	return nil
@@ -491,11 +491,11 @@ func saveKeyRing(root *os.Root, dir, name string, ring *keyringFile) error {
 		return fmt.Errorf("write keyring: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("close keyring: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), filepath.Join(dir, name)); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("persist keyring to %q: %w", name, err)
 	}
 	return nil
@@ -620,7 +620,7 @@ func (ks *keySet) signAccess(claims jwt.Claims) (string, error) {
 // kid matches the token header. An unknown or missing kid fails closed — a
 // token that references no published key cannot be trusted.
 func (ks *keySet) verifyKey(tok *jwt.Token) (any, error) {
-	kid, _ := tok.Header["kid"].(string)
+	kid := claimString(tok.Header, "kid")
 	for _, k := range ks.published {
 		if k.kid == kid {
 			return &k.key.PublicKey, nil
@@ -634,15 +634,18 @@ func (ks *keySet) verifyKey(tok *jwt.Token) (any, error) {
 // the retiring keys until their retention horizon has passed. This is what
 // resource servers pull via the discovery document's jwks_uri to verify
 // token signatures.
-func (ks *keySet) JWKS() []byte {
+func (ks *keySet) JWKS() ([]byte, error) {
 	keys := make([]jwk, 0, len(ks.published))
 	for _, k := range ks.published {
 		keys = append(keys, k.jwkOf())
 	}
-	out, _ := json.MarshalIndent(struct {
+	out, err := json.MarshalIndent(struct {
 		Keys []jwk `json:"keys"`
 	}{Keys: keys}, "", "  ")
-	return out
+	if err != nil {
+		return nil, fmt.Errorf("marshal jwks: %w", err)
+	}
+	return out, nil
 }
 
 // pkceS256 computes the PKCE S256 challenge for a code_verifier.

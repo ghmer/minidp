@@ -65,15 +65,17 @@ func csrfNonce(r *http.Request) []byte {
 // a request: the query for GET (initial render) and the echoed form fields for
 // POST (verification), merged via r.Form so both sides produce the same
 // fingerprint.
-func oauthParamsOf(r *http.Request) url.Values {
-	_ = r.ParseForm() // r.Form merges query and body; errors yield an empty set
+func oauthParamsOf(r *http.Request) (url.Values, error) {
+	if err := r.ParseForm(); err != nil {
+		return nil, err
+	}
 	out := url.Values{}
 	for _, key := range oauthParamKeys {
 		if vals, ok := r.Form[key]; ok {
 			out[key] = vals
 		}
 	}
-	return out
+	return out, nil
 }
 
 // supportedScopes is the scope policy of the IdP: exactly what discovery
@@ -314,7 +316,12 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 				SameSite: http.SameSiteLaxMode,
 			})
 		}
-		data.CSRFToken = s.csrf.issue(data.Action, oauthParamsOf(r), nonce)
+		params, err := oauthParamsOf(r)
+		if err != nil {
+			http.Error(w, "malformed request", http.StatusBadRequest)
+			return
+		}
+		data.CSRFToken = s.csrf.issue(data.Action, params, nonce)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
@@ -323,7 +330,9 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 		// clean error page is impossible; log the details and show the user
 		// nothing internal.
 		slog.Error("login template render failed", "error", err)
-		_, _ = w.Write([]byte("<!-- render failed -->\nInternal error."))
+		if _, werr := w.Write([]byte("<!-- render failed -->\nInternal error.")); werr != nil {
+			slog.Debug("login page write failed", "error", werr)
+		}
 	}
 }
 
@@ -383,7 +392,8 @@ func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	// through an authenticated user's browser. The token is bound to the nonce
 	// cookie of the browser that rendered the form; a token pre-fetched by an
 	// attacker does not match the victim's cookie.
-	if !s.csrf.verify("/authorize", oauthParamsOf(r), csrfNonce(r), form.Get("csrf_token")) {
+	params, err := oauthParamsOf(r)
+	if err != nil || !s.csrf.verify("/authorize", params, csrfNonce(r), form.Get("csrf_token")) {
 		slog.Warn("login rejected: invalid CSRF token", "ip", ip)
 		s.renderAuthorizeError(w, r, form, http.StatusBadRequest, "Your sign-in session expired or the request was tampered with. Please start again.")
 		return
@@ -831,21 +841,21 @@ func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid token")
 	}
-	if typ, _ := token.Header["typ"].(string); typ != typAccessToken {
+	if typ := claimString(token.Header, "typ"); typ != typAccessToken {
 		return nil, fmt.Errorf("invalid token: not an access token")
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		return nil, fmt.Errorf("invalid claims")
 	}
-	aud, _ := claims.GetAudience()
-	if len(aud) == 0 {
+	aud, err := claims.GetAudience()
+	if err != nil || len(aud) == 0 {
 		return nil, fmt.Errorf("invalid token: missing audience")
 	}
 	if requireAudience && !s.clients.audienceAllowed(aud) {
 		return nil, fmt.Errorf("invalid token: audience not accepted here")
 	}
-	if jti, _ := claims["jti"].(string); jti != "" && s.store.isDeniedJTI(jti) {
+	if jti := claimString(claims, "jti"); jti != "" && s.store.isDeniedJTI(jti) {
 		return nil, fmt.Errorf("invalid token: revoked")
 	}
 	return claims, nil
@@ -873,18 +883,18 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 	if err != nil || !token.Valid {
 		return nil, nil, fmt.Errorf("invalid token")
 	}
-	if typ, _ := token.Header["typ"].(string); typ != typIDToken {
+	if typ := claimString(token.Header, "typ"); typ != typIDToken {
 		return nil, nil, fmt.Errorf("invalid token: not an id token")
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid claims")
 	}
-	if iss, _ := claims["iss"].(string); iss != s.cfg.Issuer {
+	if iss := claimString(claims, "iss"); iss != s.cfg.Issuer {
 		return nil, nil, fmt.Errorf("invalid token: foreign issuer")
 	}
-	aud, _ := claims.GetAudience()
-	if len(aud) == 0 {
+	aud, err := claims.GetAudience()
+	if err != nil || len(aud) == 0 {
 		return nil, nil, fmt.Errorf("invalid token: missing audience")
 	}
 	// The id_token audience is the client id (OIDC Core §2), so the audience
@@ -900,6 +910,20 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 		return nil, nil, fmt.Errorf("invalid token: audience not accepted here")
 	}
 	return claims, client, nil
+}
+
+// claimString returns a JWT claim (or header field) as a string, or "" when
+// the field is absent or of another JSON type.
+func claimString(m map[string]any, key string) string {
+	v, present := m[key]
+	if !present {
+		return ""
+	}
+	s, isString := v.(string)
+	if !isString {
+		return ""
+	}
+	return s
 }
 
 // bearerToken extracts the Bearer token from the Authorization header.
@@ -938,7 +962,10 @@ func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool 
 			}
 		}
 	}
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		// A malformed body cannot carry form credentials; fail closed.
+		slog.Debug("client auth form parse failed", "error", err)
+	}
 	if id := r.PostForm.Get("client_id"); id != "" {
 		if client := s.clients.lookup(id); client != nil && client.Confidential() &&
 			constantTimeEqual(r.PostForm.Get("client_secret"), client.secret()) {
@@ -977,7 +1004,7 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A token without a scope claim grants nothing: fail closed.
-	scopeRaw, _ := claims["scope"].(string)
+	scopeRaw := claimString(claims, "scope")
 	scopes := parseScopes(scopeRaw)
 	if !hasScope(scopes, "openid") {
 		insufficientScope(w)
@@ -995,18 +1022,18 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 // name claim, so for such subjects the name is simply omitted (an absent
 // claim is never fabricated).
 func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[string]any {
-	sub, _ := claims["sub"].(string)
+	sub := claimString(claims, "sub")
 	wantProfile := hasScope(scopes, "profile")
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
 	var store UserStore
-	if cid, _ := claims["client_id"].(string); cid != "" {
+	if cid := claimString(claims, "client_id"); cid != "" {
 		if client := s.clients.lookup(cid); client != nil {
 			store = client.users
 		}
 	}
 	if store == nil {
-		if aud, _ := claims.GetAudience(); len(aud) > 0 {
+		if aud, err := claims.GetAudience(); err == nil && len(aud) > 0 {
 			if client := s.clients.clientForAudience(aud[0]); client != nil {
 				store = client.users
 			}
@@ -1018,8 +1045,8 @@ func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[strin
 			return out
 		}
 	}
-	username, _ := claims["preferred_username"].(string)
-	email, _ := claims["email"].(string)
+	username := claimString(claims, "preferred_username")
+	email := claimString(claims, "email")
 	addScopeClaims(out, wantProfile, wantEmail, username, "", email)
 	return out
 }
@@ -1044,14 +1071,18 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	if !s.requireClientAuth(w, r) {
 		return
 	}
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		// A malformed body carries no token; report inactive (fail closed).
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
 	claims, err := s.verifyAccessToken(r.PostForm.Get("token"))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"active": false})
 		return
 	}
-	sub, _ := claims["sub"].(string)
-	scope, _ := claims["scope"].(string)
+	sub := claimString(claims, "sub")
+	scope := claimString(claims, "scope")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active":    true,
 		"sub":       sub,
@@ -1076,15 +1107,20 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	if !s.requireClientAuth(w, r) {
 		return
 	}
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		// Per RFC 7009 the response is 200 regardless; an unparseable body
+		// carries no token to revoke.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	token := r.PostForm.Get("token")
 	if token != "" {
 		// Any audience is accepted here: /revoke must be able to deny tokens
 		// minted under a previous audience configuration, too.
 		if claims, err := s.parseAccessToken(token, false); err == nil {
-			if jti, _ := claims["jti"].(string); jti != "" {
+			if jti := claimString(claims, "jti"); jti != "" {
 				until := time.Now().Add(s.cfg.AccessTokenTTL) // fail-safe horizon
-				if exp, _ := claims.GetExpirationTime(); exp != nil {
+				if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
 					until = exp.Time
 				}
 				s.store.denyJTI(jti, until)
@@ -1119,7 +1155,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 		// the session to terminate (review findings M6/F4).
 		if claims, hintClient, err := s.parseIDTokenHint(hint); err == nil {
 			client = hintClient
-			if sid, _ := claims["sid"].(string); sid != "" {
+			if sid := claimString(claims, "sid"); sid != "" {
 				s.store.revokeFamilyTokens(sid)
 				slog.Info("logout: token family revoked", "sub", claims["sub"], "client", client.ID())
 			}
@@ -1146,12 +1182,16 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 // an operator-provided override from the assets directory.
 func (s *Server) handleStaticCSS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	_, _ = w.Write(s.template.css)
+	if _, err := w.Write(s.template.css); err != nil {
+		slog.Debug("css write failed", "error", err)
+	}
 }
 
 // handleStaticLogo serves the active logo: the embedded default or an
 // operator-provided override from the assets directory.
 func (s *Server) handleStaticLogo(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
-	_, _ = w.Write(s.template.logo)
+	if _, err := w.Write(s.template.logo); err != nil {
+		slog.Debug("logo write failed", "error", err)
+	}
 }
