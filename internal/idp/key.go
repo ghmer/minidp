@@ -396,13 +396,13 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	ring, err := loadOrCreateRing(root, dir)
+	ring, err := loadOrCreateRing(root)
 	if err != nil {
 		return err
 	}
 	now := time.Now()
-	if err := retireRingKeys(ring, dir, now.Add(retention)); err != nil {
-		return err
+	if rerr := retireRingKeys(ring, dir, now.Add(retention)); rerr != nil {
+		return rerr
 	}
 
 	// Generate the new active key and persist it under its thumbprint kid.
@@ -446,7 +446,7 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 
 // loadOrCreateRing reads the ring document, falling back to the legacy
 // single-key layout (or an empty ring) when it does not exist yet.
-func loadOrCreateRing(root *os.Root, dir string) (*keyringFile, error) {
+func loadOrCreateRing(root *os.Root) (*keyringFile, error) {
 	ring, err := readKeyRing(root, keyRingFileName)
 	switch {
 	case err == nil:
