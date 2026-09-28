@@ -36,6 +36,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -132,7 +133,7 @@ func clientCmd(args []string) error {
 	case "show":
 		return clientShow(args[1:])
 	default:
-		return fmt.Errorf("unknown client command %q (want add, update, remove, list or show)", args[0])
+		return fmt.Errorf("unknown client command %q %w", args[0], errUnknownClientCmd)
 	}
 }
 
@@ -151,7 +152,7 @@ func userCmd(args []string) error {
 	case "list":
 		return userList(args[1:])
 	default:
-		return fmt.Errorf("unknown user command %q (want add, update, remove or list)", args[0])
+		return fmt.Errorf("unknown user command %q %w", args[0], errUnknownUserCmd)
 	}
 }
 
@@ -165,7 +166,7 @@ func resolveSecret(flagValue, what string, confirm bool) (string, error) {
 	case flagValue != "":
 		return flagValue, nil
 	case !term.IsTerminal(int(os.Stdin.Fd())):
-		return "", fmt.Errorf("no %s: use the flag (or '-<flag> -' with piped stdin)", what)
+		return "", fmt.Errorf("no %s: %w", what, errNoSecret)
 	}
 	return promptSecret(what, confirm)
 }
@@ -187,15 +188,15 @@ func promptSecret(what string, confirm bool) (string, error) {
 		return "", err
 	}
 	if len(pw) == 0 {
-		return "", fmt.Errorf("%s must not be empty", what)
+		return "", fmt.Errorf("%s %w", what, errMustBeNotEmpty)
 	}
 	if confirm {
 		again, err := readSecretPrompt("Confirm " + what + ": ")
 		if err != nil {
 			return "", err
 		}
-		if string(pw) != string(again) {
-			return "", fmt.Errorf("%ss do not match", what)
+		if !bytes.Equal(pw, again) {
+			return "", fmt.Errorf("%ss %w", what, errValuesDoNotMatch)
 		}
 	}
 	return string(pw), nil
@@ -207,7 +208,7 @@ func readSecretPrompt(prompt string) ([]byte, error) {
 	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read password: %w", err)
 	}
 	return pw, nil
 }
@@ -217,7 +218,7 @@ func readSecretPrompt(prompt string) ([]byte, error) {
 // result always satisfies the clients-file validation.
 func parseList(value string) []string {
 	var out []string
-	for _, item := range strings.Split(value, ",") {
+	for item := range strings.SplitSeq(value, ",") {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}
@@ -238,7 +239,7 @@ func loadClients(path string) ([]idp.Client, bool, error) {
 	case errors.Is(err, os.ErrNotExist):
 		return nil, false, nil
 	default:
-		return nil, false, err
+		return nil, false, fmt.Errorf("read clients file: %w", err)
 	}
 }
 
@@ -250,15 +251,15 @@ func loadExistingClients(path string) ([]idp.Client, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("clients file %q does not exist yet", path)
+		return nil, fmt.Errorf("clients file %q %w", path, errClientsFileMissing)
 	}
 	return clients, nil
 }
 
 // findClient returns the index of the client with the given id, or -1.
 func findClient(clients []idp.Client, id string) int {
-	for i, c := range clients {
-		if c.ClientID == id {
+	for i := range clients {
+		if clients[i].ClientID == id {
 			return i
 		}
 	}
@@ -282,7 +283,7 @@ func registerClientSelector(fs *flag.FlagSet) *clientSelector {
 // requireSelector validates the shared -client flag.
 func requireSelector(sel *clientSelector) error {
 	if *sel.client == "" {
-		return fmt.Errorf("-client is required")
+		return errClientFlagRequired
 	}
 	return nil
 }
@@ -331,7 +332,7 @@ func parseClientChangeArgs(args []string) (*clientChangeSpec, error) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	spec := &clientChangeSpec{f: registerClientFlags(fs), provid: map[string]bool{}}
 	if err := fs.Parse(args); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(spec.f.selector); err != nil {
 		return nil, err
@@ -350,13 +351,13 @@ func clientAdd(args []string) error {
 	fs := flag.NewFlagSet("client add", flag.ExitOnError)
 	f := registerClientFlags(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(f.selector); err != nil {
 		return err
 	}
 	if *f.typ != string(idp.TypePublic) && *f.typ != string(idp.TypeConfidential) {
-		return fmt.Errorf("-type is required and must be %q or %q", idp.TypePublic, idp.TypeConfidential)
+		return fmt.Errorf("-type is required and %w", errTypeMustBe)
 	}
 	// A redirect policy is only required for clients with an interactive
 	// grant: a purely machine-to-machine client (client_credentials only)
@@ -369,14 +370,14 @@ func clientAdd(args []string) error {
 		}
 	}
 	if *f.redirect == "" && interactive {
-		return fmt.Errorf("-redirect is required: declare the registered redirect_uri values")
+		return errRedirectRequired
 	}
 	clients, _, err := loadClients(*f.selector.file)
 	if err != nil {
 		return err
 	}
 	if findClient(clients, *f.selector.client) >= 0 {
-		return fmt.Errorf("client %q already exists (use the update command)", *f.selector.client)
+		return fmt.Errorf("client %q %w", *f.selector.client, errClientExistsHint)
 	}
 	client := idp.Client{
 		ClientID:                *f.selector.client,
@@ -401,11 +402,11 @@ func clientAdd(args []string) error {
 	clients = append(clients, client)
 	// Pre-flight the new entry so an inconsistent grant/profile/scopes
 	// combination is reported before the file is touched.
-	if err := idp.ValidateClient(client); err != nil {
-		return err
+	if err := idp.ValidateClient(&client); err != nil {
+		return fmt.Errorf("validate client: %w", err)
 	}
 	if err := idp.SaveClients(*f.selector.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	fmt.Printf("client %q added to %s\n", client.ClientID, *f.selector.file)
 	return nil
@@ -418,10 +419,7 @@ func applyClientChanges(client *idp.Client, spec *clientChangeSpec) (bool, error
 	if err != nil {
 		return false, err
 	}
-	endpointChanged, err := applyClientEndpointChanges(client, spec)
-	if err != nil {
-		return false, err
-	}
+	endpointChanged := applyClientEndpointChanges(client, spec)
 	return profileChanged || endpointChanged, nil
 }
 
@@ -442,7 +440,7 @@ func applyClientProfileChange(client *idp.Client, spec *clientChangeSpec) (bool,
 	changed := false
 	if spec.provid["type"] {
 		if *spec.f.typ != string(idp.TypePublic) && *spec.f.typ != string(idp.TypeConfidential) {
-			return false, fmt.Errorf("invalid -type %q: must be %q or %q", *spec.f.typ, idp.TypePublic, idp.TypeConfidential)
+			return false, fmt.Errorf("invalid -type %q: %w", *spec.f.typ, errTypeMustBe)
 		}
 		previous := client.Confidential()
 		client.Type = idp.ClientType(*spec.f.typ)
@@ -462,14 +460,14 @@ func applyClientProfileChange(client *idp.Client, spec *clientChangeSpec) (bool,
 		changed = true
 	}
 	if client.Confidential() && client.ClientSecret == "" {
-		return false, fmt.Errorf("client %q is confidential and needs a secret: provide -secret", client.ClientID)
+		return false, fmt.Errorf("client %q %w", client.ClientID, errConfidentialNeeds)
 	}
 	return changed, nil
 }
 
 // applyClientEndpointChanges applies the audience/grants/scopes/redirect/
 // post-logout/origin flags.
-func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (bool, error) {
+func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) bool {
 	changed := false
 	if spec.provid["audience"] {
 		client.Audience = *spec.f.audience
@@ -503,7 +501,7 @@ func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (boo
 		client.AllowedOrigins = parseList(*spec.f.origin)
 		changed = true
 	}
-	return changed, nil
+	return changed
 }
 
 func clientUpdate(args []string) error {
@@ -517,23 +515,23 @@ func clientUpdate(args []string) error {
 	}
 	idx := findClient(clients, *spec.f.selector.client)
 	if idx < 0 {
-		return fmt.Errorf("client %q does not exist", *spec.f.selector.client)
+		return fmt.Errorf("client %q %w", *spec.f.selector.client, errClientDoesNotExist)
 	}
 	changed, err := applyClientChanges(&clients[idx], spec)
 	if err != nil {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -cc-roles, -allowed-scopes, -redirect, -post-logout or -origin")
+		return errNothingToUpdateCli
 	}
 	// Pre-flight the mutated entry so an inconsistent combination (e.g.
 	// -grant-types client_credentials without -cc-scopes) is reported
 	// before the file is touched.
-	if err := idp.ValidateClient(clients[idx]); err != nil {
-		return err
+	if err := idp.ValidateClient(&clients[idx]); err != nil {
+		return fmt.Errorf("validate client: %w", err)
 	}
 	if err := idp.SaveClients(*spec.f.selector.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	fmt.Printf("client %q updated in %s (takes effect on IdP restart)\n", clients[idx].ClientID, *spec.f.selector.file)
 	return nil
@@ -543,7 +541,7 @@ func clientRemove(args []string) error {
 	fs := flag.NewFlagSet("client remove", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
@@ -554,11 +552,11 @@ func clientRemove(args []string) error {
 	}
 	idx := findClient(clients, *sel.client)
 	if idx < 0 {
-		return fmt.Errorf("client %q does not exist", *sel.client)
+		return fmt.Errorf("client %q %w", *sel.client, errClientDoesNotExist)
 	}
 	clients = append(clients[:idx], clients[idx+1:]...)
 	if err := idp.SaveClients(*sel.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	if len(clients) == 0 {
 		fmt.Println("warning: the clients file is now empty; minidp will refuse to start with it")
@@ -569,7 +567,7 @@ func clientRemove(args []string) error {
 
 // describeClient renders one list/show line. Secrets and hashes are never
 // printed.
-func describeClient(c idp.Client) string {
+func describeClient(c *idp.Client) string {
 	audience := c.Audience
 	if audience == "" {
 		audience = c.ClientID
@@ -604,14 +602,14 @@ func clientList(args []string) error {
 	fs := flag.NewFlagSet("client list", flag.ExitOnError)
 	file := fs.String("file", "clients.json", "path to the clients JSON file")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	clients, err := idp.ReadClients(*file)
 	if err != nil {
-		return err
+		return fmt.Errorf("read clients file: %w", err)
 	}
-	for _, c := range clients {
-		fmt.Println(describeClient(c))
+	for i := range clients {
+		fmt.Println(describeClient(&clients[i]))
 	}
 	fmt.Fprintf(os.Stderr, "%d client(s)\n", len(clients))
 	return nil
@@ -621,7 +619,7 @@ func clientShow(args []string) error {
 	fs := flag.NewFlagSet("client show", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
@@ -632,10 +630,10 @@ func clientShow(args []string) error {
 	}
 	idx := findClient(clients, *sel.client)
 	if idx < 0 {
-		return fmt.Errorf("client %q does not exist", *sel.client)
+		return fmt.Errorf("client %q %w", *sel.client, errClientDoesNotExist)
 	}
 	c := clients[idx]
-	fmt.Println(describeClient(c))
+	fmt.Println(describeClient(&c))
 	for _, u := range c.Users {
 		line := "  user: " + u.Username
 		if u.Email != "" {
@@ -679,7 +677,7 @@ func registerUserFlags(fs *flag.FlagSet) *userFlags {
 func userStoreOf(clients []idp.Client, sel *clientSelector) ([]idp.User, error) {
 	idx := findClient(clients, *sel.client)
 	if idx < 0 {
-		return nil, fmt.Errorf("client %q does not exist (add it with: clientctl client add)", *sel.client)
+		return nil, fmt.Errorf("client %q %w", *sel.client, errClientMissingHint)
 	}
 	return clients[idx].Users, nil
 }
@@ -692,9 +690,13 @@ func newUserHash(flagValue string, cost int, confirm bool) (string, error) {
 		return "", err
 	}
 	if password == "" {
-		return "", fmt.Errorf("password must not be empty")
+		return "", errPasswordEmpty
 	}
-	return idp.HashPassword(password, cost)
+	h, err := idp.HashPassword(password, cost)
+	if err != nil {
+		return "", fmt.Errorf("hash password: %w", err)
+	}
+	return h, nil
 }
 
 func findUserIndex(users []idp.User, username string) int {
@@ -710,13 +712,13 @@ func userAdd(args []string) error {
 	fs := flag.NewFlagSet("user add", flag.ExitOnError)
 	u := registerUserFlags(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(u.selector); err != nil {
 		return err
 	}
 	if *u.username == "" {
-		return fmt.Errorf("-username is required")
+		return errUsernameRequired
 	}
 	clients, _, err := loadClients(*u.selector.file)
 	if err != nil {
@@ -727,7 +729,7 @@ func userAdd(args []string) error {
 		return err
 	}
 	if findUserIndex(users, *u.username) >= 0 {
-		return fmt.Errorf("user %q already exists (use the update command)", *u.username)
+		return fmt.Errorf("user %q %w", *u.username, errUserExistsHint)
 	}
 	hash, err := newUserHash(*u.password, *u.cost, true)
 	if err != nil {
@@ -752,7 +754,10 @@ func userAdd(args []string) error {
 func saveClientUsers(clients []idp.Client, sel *clientSelector, users []idp.User, file string) error {
 	idx := findClient(clients, *sel.client)
 	clients[idx].Users = users
-	return idp.SaveClients(file, clients)
+	if err := idp.SaveClients(file, clients); err != nil {
+		return fmt.Errorf("save clients file: %w", err)
+	}
+	return nil
 }
 
 // userChangeSpec bundles the parsed user update invocation: the shared flags
@@ -769,13 +774,13 @@ func parseUserChangeArgs(args []string) (*userChangeSpec, error) {
 	fs := flag.NewFlagSet("user update", flag.ExitOnError)
 	spec := &userChangeSpec{u: registerUserFlags(fs)}
 	if err := fs.Parse(args); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(spec.u.selector); err != nil {
 		return nil, err
 	}
 	if *spec.u.username == "" {
-		return nil, fmt.Errorf("-username is required")
+		return nil, errUsernameRequired
 	}
 	// fs.Visit reports which flags were actually set, so "no -password flag"
 	// (keep the existing hash) is distinguishable from "-password -" (read one
@@ -805,7 +810,7 @@ func applyUserUpdates(user *idp.User, spec *userChangeSpec) (bool, error) {
 		user.PasswordHash = hash
 		changed = true
 	} else if *spec.u.cost != bcrypt.DefaultCost {
-		return false, fmt.Errorf("-cost requires a new password (-password)")
+		return false, errCostNeedsPassword
 	}
 	if *spec.u.email != "" {
 		user.Email = *spec.u.email
@@ -837,14 +842,14 @@ func userUpdate(args []string) error {
 	}
 	idx := findUserIndex(users, *spec.u.username)
 	if idx < 0 {
-		return fmt.Errorf("user %q does not exist in client %q", *spec.u.username, *spec.u.selector.client)
+		return fmt.Errorf("user %q %w %q", *spec.u.username, errUserNotInClient, *spec.u.selector.client)
 	}
 	changed, err := applyUserUpdates(&users[idx], spec)
 	if err != nil {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -password, -email, -name or -roles")
+		return errNothingToUpdateUsr
 	}
 	if err := saveClientUsers(clients, spec.u.selector, users, *spec.u.selector.file); err != nil {
 		return err
@@ -858,13 +863,13 @@ func userRemove(args []string) error {
 	sel := registerClientSelector(fs)
 	username := fs.String("username", "", "login name (required)")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
 	}
 	if *username == "" {
-		return fmt.Errorf("-username is required")
+		return errUsernameRequired
 	}
 	clients, err := loadExistingClients(*sel.file)
 	if err != nil {
@@ -876,7 +881,7 @@ func userRemove(args []string) error {
 	}
 	idx := findUserIndex(users, *username)
 	if idx < 0 {
-		return fmt.Errorf("user %q does not exist in client %q", *username, *sel.client)
+		return fmt.Errorf("user %q %w %q", *username, errUserNotInClient, *sel.client)
 	}
 	users = append(users[:idx], users[idx+1:]...)
 	if err := saveClientUsers(clients, sel, users, *sel.file); err != nil {
@@ -893,14 +898,14 @@ func userList(args []string) error {
 	fs := flag.NewFlagSet("user list", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
 	}
 	clients, err := idp.ReadClients(*sel.file)
 	if err != nil {
-		return err
+		return fmt.Errorf("read clients file: %w", err)
 	}
 	users, err := userStoreOf(clients, sel)
 	if err != nil {
@@ -928,7 +933,7 @@ func hash(args []string) error {
 	password := fs.String("password", "", "password; '-' reads one line from stdin, empty prompts interactively")
 	cost := fs.Int("cost", bcrypt.DefaultCost, "bcrypt cost factor")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	h, err := newUserHash(*password, *cost, false)
 	if err != nil {

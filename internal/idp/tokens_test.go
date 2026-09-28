@@ -1,6 +1,7 @@
 package idp
 
 import (
+	"maps"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -16,7 +17,7 @@ func newTestServer(t *testing.T) *Server {
 	if err := SaveClients(clientsFile, []Client{testPublicClient(t)}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -115,7 +116,7 @@ func TestIssueTokensSeparateAudiences(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{conf}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -167,7 +168,7 @@ func TestEntraClaimShape(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{conf, service}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -280,7 +281,7 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 	}
 }
 
-// TestIssueTokensReleasesRoles pins the roles behaviour: a users-file record
+// TestIssueTokensReleasesRoles pins the roles behavior: a users-file record
 // with roles gets the roles array claim on both the access and the ID token,
 // independent of the granted scopes, while a user without roles gets no roles
 // claim at all.
@@ -294,7 +295,7 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{client}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -417,9 +418,7 @@ func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
 
 	// A foreign audience.
 	wrong := jwt.MapClaims{}
-	for k, v := range base {
-		wrong[k] = v
-	}
+	maps.Copy(wrong, base)
 	wrong["aud"] = "some-other-client"
 	if _, err := srv.verifyAccessToken(signedTestToken(t, srv, wrong, true)); err == nil {
 		t.Error("a token minted for another audience must be rejected")
@@ -427,9 +426,7 @@ func TestVerifyAccessTokenRequiresAudience(t *testing.T) {
 
 	// The configured audience is accepted.
 	right := jwt.MapClaims{}
-	for k, v := range base {
-		right[k] = v
-	}
+	maps.Copy(right, base)
 	right["aud"] = testClientID
 	if _, err := srv.verifyAccessToken(signedTestToken(t, srv, right, true)); err != nil {
 		t.Errorf("a token for the configured audience must be accepted: %v", err)
@@ -486,9 +483,7 @@ func TestParseIDTokenHintAcceptsExpired(t *testing.T) {
 		t.Error("an access token must be rejected as id_token_hint")
 	}
 	foreign := jwt.MapClaims{}
-	for k, v := range claims {
-		foreign[k] = v
-	}
+	maps.Copy(foreign, claims)
 	foreign["iss"] = "https://evil.example"
 	if _, _, err := srv.parseIDTokenHint(signedTestToken(t, srv, foreign, false)); err == nil {
 		t.Error("a hint from another issuer must be rejected")

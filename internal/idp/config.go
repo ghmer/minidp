@@ -41,10 +41,6 @@ type Config struct {
 	// the single-client environment variables of earlier versions were
 	// removed.
 	ClientsFile string
-	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
-	AccessTokenTTL time.Duration
-	// RefreshTokenTTL is how long a refresh_token stays valid.
-	RefreshTokenTTL time.Duration
 	// Title / Subtitle are rendered on the login form.
 	Title    string
 	Subtitle string
@@ -58,10 +54,14 @@ type Config struct {
 	// tokens stay valid across restarts and replicas.
 	KeyDir string
 	// TrustedProxies is a list of CIDR ranges (TRUSTED_PROXIES) whose
-	// X-Forwarded-For header is honoured when resolving the client IP for rate
+	// X-Forwarded-For header is honored when resolving the client IP for rate
 	// limiting and audit logs. Empty means: trust no proxy, use the socket
 	// address.
 	TrustedProxies []string
+	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
+	AccessTokenTTL time.Duration
+	// RefreshTokenTTL is how long a refresh_token stays valid.
+	RefreshTokenTTL time.Duration
 	// LoginRateLimit is the number of login attempts (POST /authorize and
 	// POST /login) allowed per minute and client IP.
 	LoginRateLimit int
@@ -72,6 +72,9 @@ type Config struct {
 // weaken security (no clients file, removed single-client or single-user
 // variables, unreadable key material, invalid proxy CIDRs).
 func LoadConfig() (Config, error) {
+	if err := rejectRemovedVariables(); err != nil {
+		return Config{}, err
+	}
 	accessTokenTTL, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
 	if err != nil {
 		return Config{}, err
@@ -82,9 +85,6 @@ func LoadConfig() (Config, error) {
 	}
 	loginRateLimit, err := envInt("IDP_LOGIN_RATE_LIMIT", 20)
 	if err != nil {
-		return Config{}, err
-	}
-	if err := rejectRemovedVariables(); err != nil {
 		return Config{}, err
 	}
 	cfg := Config{
@@ -101,7 +101,7 @@ func LoadConfig() (Config, error) {
 		ClientsFile:     os.Getenv("IDP_CLIENTS_FILE"),
 	}
 	if cfg.ClientsFile == "" {
-		return cfg, fmt.Errorf("IDP_CLIENTS_FILE is not set: minidp registers its clients (profiles, redirect policies, audiences and users) in a clients file; create one (see clientctl and clients.json.example) and point IDP_CLIENTS_FILE at it")
+		return cfg, errClientsFileUnset
 	}
 	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
 	if err != nil {
@@ -129,7 +129,7 @@ var removedVariables = []string{
 func rejectRemovedVariables() error {
 	for _, removed := range removedVariables {
 		if os.Getenv(removed) != "" {
-			return fmt.Errorf("%s is no longer supported: register clients in the IDP_CLIENTS_FILE clients file (see clientctl and clients.json.example)", removed)
+			return fmt.Errorf("%s %w", removed, errRemovedVariable)
 		}
 	}
 	return nil
@@ -141,7 +141,7 @@ func parseTrustedProxies(raw string) ([]string, error) {
 		return nil, nil
 	}
 	var out []string
-	for _, cidr := range strings.Split(raw, ",") {
+	for cidr := range strings.SplitSeq(raw, ",") {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
 			continue
@@ -185,10 +185,10 @@ func envInt(key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: must be a whole number", key, v)
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, errIntNotWholeNumber)
 	}
 	if n <= 0 {
-		return 0, fmt.Errorf("invalid %s %q: must be positive", key, v)
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, errIntNotPositive)
 	}
 	return n, nil
 }

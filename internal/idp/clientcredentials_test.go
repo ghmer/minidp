@@ -93,7 +93,7 @@ func TestClientCredentialsClientSecretPost(t *testing.T) {
 	}
 }
 
-// TestClientCredentialsRejectsWrongSecret pins that the grant honours client
+// TestClientCredentialsRejectsWrongSecret pins that the grant honors client
 // authentication: a wrong secret is invalid_client, not a token.
 func TestClientCredentialsRejectsWrongSecret(t *testing.T) {
 	ts, _ := testIDPClients(t, []Client{testServiceClient(t, "fake-hr-mcp-service", "a-confidential-secret")}, nil)

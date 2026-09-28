@@ -181,7 +181,7 @@ func TestRevokeToken(t *testing.T) {
 
 func TestRandomTokenUnique(t *testing.T) {
 	seen := make(map[string]bool, 100)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		id, err := randomToken()
 		if err != nil {
 			t.Fatalf("randomToken: %v", err)

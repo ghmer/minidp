@@ -35,27 +35,26 @@ type UserStore interface {
 }
 
 // validate checks one user entry when the clients file is loaded or saved.
-func (u User) validate() error {
+func (u *User) validate() error {
 	if strings.TrimSpace(u.Username) == "" {
-		return fmt.Errorf("username must not be empty")
+		return errUsernameEmpty
 	}
 	if u.Username != strings.TrimSpace(u.Username) {
-		return fmt.Errorf("username %q must not have leading or trailing whitespace", u.Username)
+		return fmt.Errorf("username %q: %w", u.Username, errPaddedValue)
 	}
 	if !isBcryptHash(u.PasswordHash) {
-		return fmt.Errorf("user %q: password_hash must be a 60-character bcrypt hash "+
-			"like $2a$10$... (generate one with: clientctl hash)", u.Username)
+		return fmt.Errorf("user %q: %w", u.Username, errPasswordHashShape)
 	}
 	seenRoles := make(map[string]bool, len(u.Roles))
 	for _, role := range u.Roles {
 		if strings.TrimSpace(role) == "" {
-			return fmt.Errorf("user %q: roles must not contain empty entries", u.Username)
+			return fmt.Errorf("user %q: %w", u.Username, errRolesEmptyEntry)
 		}
 		if role != strings.TrimSpace(role) {
-			return fmt.Errorf("user %q: role %q must not have leading or trailing whitespace", u.Username, role)
+			return fmt.Errorf("user %q: role %q: %w", u.Username, role, errPaddedValue)
 		}
 		if seenRoles[role] {
-			return fmt.Errorf("user %q: duplicate role %q", u.Username, role)
+			return fmt.Errorf("user %q: %w %q", u.Username, errDuplicateRole, role)
 		}
 		seenRoles[role] = true
 	}
@@ -66,12 +65,13 @@ func (u User) validate() error {
 // user validation. Called for every client's users array.
 func validateUserSlice(users []User) error {
 	seen := make(map[string]bool, len(users))
-	for i, u := range users {
+	for i := range users {
+		u := &users[i]
 		if err := u.validate(); err != nil {
 			return fmt.Errorf("user entry %d: %w", i, err)
 		}
 		if seen[u.Username] {
-			return fmt.Errorf("duplicate username %q", u.Username)
+			return fmt.Errorf("%w %q", errDuplicateUsername, u.Username)
 		}
 		seen[u.Username] = true
 	}
@@ -92,7 +92,7 @@ func newDummyHash(cost int) string {
 	h, err := bcrypt.GenerateFromPassword([]byte("minidp-timing-equalizer-dummy"), cost)
 	if err != nil {
 		// Cannot happen for a fixed plaintext and valid cost; fail loudly.
-		panic(fmt.Sprintf("generate timing-equalisation dummy hash: %v", err))
+		panic(fmt.Sprintf("generate timing-equalization dummy hash: %v", err))
 	}
 	return string(h)
 }
@@ -115,11 +115,11 @@ func bcryptCostOf(hash string) int {
 // the clientctl tool.
 func HashPassword(password string, cost int) (string, error) {
 	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
-		return "", fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
+		return "", errBcryptCostRange
 	}
 	h, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("hash password: %w", err)
 	}
 	return string(h), nil
 }

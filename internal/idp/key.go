@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,11 +44,11 @@ const (
 // keyringEntry is one entry of the persisted keyring: a PEM file inside the
 // key directory, its published kid and its lifecycle state.
 type keyringEntry struct {
+	CreatedAt time.Time `json:"created_at"`
+	RetireAt  time.Time `json:"retire_at"`
 	KID       string    `json:"kid"`
 	File      string    `json:"file"`
-	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
-	RetireAt  time.Time `json:"retire_at,omitempty"`
 }
 
 // keyringFile is the on-disk keyring document (keyring.json inside
@@ -135,12 +136,12 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 	defer func() { _ = root.Close() }()
 
 	ring, err := readKeyRing(root, keyRingFileName)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		// No keyring document: the legacy (pre-rotation) layout of exactly
 		// one persisted key with the fixed kid.
-		k, err := persistentSigningKey(dir)
-		if err != nil {
-			return nil, err
+		k, perr := persistentSigningKey(dir)
+		if perr != nil {
+			return nil, perr
 		}
 		return keySetOf(k), nil
 	}
@@ -148,17 +149,36 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 		return nil, err
 	}
 
+	kept, err := pruneRetiredKeys(root, dir, ring)
+	if err != nil {
+		return nil, err
+	}
+	set, err := loadPublishedKeys(dir, kept)
+	if err != nil {
+		return nil, err
+	}
+	if set.active == nil {
+		return nil, fmt.Errorf("keyring %q %w", keyRingPath(dir), errKeyringNoActiveKey)
+	}
+	return set, nil
+}
+
+// pruneRetiredKeys validates the ring entries and drops retiring entries whose
+// retention horizon has passed: their key files are removed and the entries
+// dropped, so the JWKS only publishes keys that can still be referenced by
+// unexpired tokens.
+func pruneRetiredKeys(root *os.Root, dir string, ring *keyringFile) ([]keyringEntry, error) {
 	now := time.Now()
 	kept := make([]keyringEntry, 0, len(ring.Keys))
 	byKid := make(map[string]bool, len(ring.Keys))
 	for _, entry := range ring.Keys {
 		switch {
 		case entry.KID == "" || entry.File == "":
-			return nil, fmt.Errorf("keyring %q: entry with empty kid or file", filepath.Join(dir, keyRingFileName))
+			return nil, fmt.Errorf("keyring %q: %w", filepath.Join(dir, keyRingFileName), errKeyringEntryIncomplete)
 		case entry.State != keyStateActive && entry.State != keyStateRetiring:
-			return nil, fmt.Errorf("keyring %q: entry %q has invalid state %q", filepath.Join(dir, keyRingFileName), entry.KID, entry.State)
+			return nil, fmt.Errorf("keyring %q: entry %q %w %q", filepath.Join(dir, keyRingFileName), entry.KID, errKeyringStateInvalid, entry.State)
 		case byKid[entry.KID]:
-			return nil, fmt.Errorf("keyring %q: duplicate kid %q", filepath.Join(dir, keyRingFileName), entry.KID)
+			return nil, fmt.Errorf("keyring %q: %w %q", filepath.Join(dir, keyRingFileName), errKeyringDuplicateKid, entry.KID)
 		}
 		byKid[entry.KID] = true
 		if entry.State == keyStateRetiring && !entry.RetireAt.IsZero() && entry.RetireAt.Before(now) {
@@ -173,9 +193,14 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 		kept = append(kept, entry)
 	}
 	if len(kept) == 0 {
-		return nil, fmt.Errorf("keyring %q contains no keys", filepath.Join(dir, keyRingFileName))
+		return nil, fmt.Errorf("keyring %q %w", filepath.Join(dir, keyRingFileName), errKeyringContainsNoKeys)
 	}
+	return kept, nil
+}
 
+// loadPublishedKeys loads the PEM material for the kept entries and assembles
+// the published key set with its active key.
+func loadPublishedKeys(dir string, kept []keyringEntry) (*keySet, error) {
 	set := &keySet{published: make([]*signingKey, 0, len(kept))}
 	for _, entry := range kept {
 		k, err := loadSigningKey(filepath.Join(dir, entry.File))
@@ -193,20 +218,17 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 			// The keyring is the source of truth for kids; a PEM swapped
 			// under a published kid would silently break verification. The
 			// legacy kid is a fixed label (no thumbprint to check against).
-			return nil, fmt.Errorf("keyring %q: entry %q does not match the key material's RFC 7638 thumbprint",
-				keyRingPath(dir), entry.KID)
+			return nil, fmt.Errorf("keyring %q: entry %q %w",
+				keyRingPath(dir), entry.KID, errKeyringThumbprintMismatch)
 		}
 		k.kid = entry.KID
 		if entry.State == keyStateActive {
 			if set.active != nil {
-				return nil, fmt.Errorf("keyring %q: more than one active key", keyRingPath(dir))
+				return nil, fmt.Errorf("keyring %q: %w", keyRingPath(dir), errKeyringMultipleActive)
 			}
 			set.active = k
 		}
 		set.published = append(set.published, k)
-	}
-	if set.active == nil {
-		return nil, fmt.Errorf("keyring %q has no active key", keyRingPath(dir))
 	}
 	return set, nil
 }
@@ -219,7 +241,8 @@ func keyRingPath(dir string) string { return filepath.Join(dir, keyRingFileName)
 func readKeyRing(root *os.Root, name string) (*keyringFile, error) {
 	f, err := root.Open(name)
 	if err != nil {
-		return nil, err
+		// %w keeps os.ErrNotExist intact: it is the legacy-layout signal.
+		return nil, fmt.Errorf("open keyring: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	raw, err := io.ReadAll(f)
@@ -260,8 +283,8 @@ func persistentSigningKey(keyDir string) (*signingKey, error) {
 			// Another instance is generating right now (or a crashed start
 			// left the temp file behind): wait for the final key, or take
 			// over a stale temp file once. Either way, retry the round.
-			if err := waitForPeerKey(root, dir, tmpName, path, attempt); err != nil {
-				return nil, err
+			if werr := waitForPeerKey(root, dir, tmpName, path, attempt); werr != nil {
+				return nil, werr
 			}
 			continue
 		}
@@ -289,7 +312,7 @@ func waitForPeerKey(root *os.Root, dir, tmpName, path string, attempt int) error
 		return fmt.Errorf("gave up waiting for signing key %q: %w", path, err)
 	}
 	slog.Warn("stale signing-key temp file detected, taking over", "path", filepath.Join(dir, tmpName))
-	_ = root.Remove(tmpName)
+	removeTempFile(root, tmpName)
 	return nil
 }
 
@@ -312,11 +335,11 @@ func generateAndPersistKey(root *os.Root, dir, tmpName, path string, tmp *os.Fil
 		return nil, fmt.Errorf("write signing key in %q: %w", dir, err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return nil, fmt.Errorf("close signing key in %q: %w", dir, err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), path); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return nil, fmt.Errorf("persist signing key to %q: %w", path, err)
 	}
 	slog.Info("generated and persisted RSA signing key", "path", path)
@@ -326,7 +349,7 @@ func generateAndPersistKey(root *os.Root, dir, tmpName, path string, tmp *os.Fil
 // discardTempFile closes and removes a temp file after a failed write.
 func discardTempFile(root *os.Root, tmp *os.File, tmpName string) {
 	_ = tmp.Close()
-	_ = root.Remove(tmpName)
+	removeTempFile(root, tmpName)
 }
 
 // awaitFile polls until path exists or the timeout elapses.
@@ -337,7 +360,7 @@ func awaitFile(path string, timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s", timeout)
+			return fmt.Errorf("%w %s", errAwaitTimedOut, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -364,7 +387,7 @@ func jwkThumbprint(pub *rsa.PublicKey) string {
 // as the retiring key and the ring document is created.
 func RotateKeys(keyDir string, retention time.Duration) error {
 	if strings.TrimSpace(keyDir) == "" {
-		return fmt.Errorf("key rotation requires IDP_KEY_DIR")
+		return errKeyDirRequired
 	}
 	dir := filepath.Clean(keyDir)
 	root, err := os.OpenRoot(dir)
@@ -373,37 +396,13 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	ring, err := readKeyRing(root, keyRingFileName)
-	switch {
-	case err == nil:
-	case os.IsNotExist(err):
-		// Legacy layout: adopt the persisted key (or start empty) as the
-		// active entry of a fresh ring.
-		ring = &keyringFile{}
-		if _, statErr := root.Stat(keyFileName); statErr == nil {
-			ring.Keys = []keyringEntry{{
-				KID:       legacyKid,
-				File:      keyFileName,
-				CreatedAt: time.Now(),
-				State:     keyStateActive,
-			}}
-		}
-	default:
-		return fmt.Errorf("read keyring: %w", err)
+	ring, err := loadOrCreateRing(root)
+	if err != nil {
+		return err
 	}
-
 	now := time.Now()
-	for i := range ring.Keys {
-		switch ring.Keys[i].State {
-		case keyStateActive:
-			ring.Keys[i].State = keyStateRetiring
-			ring.Keys[i].RetireAt = now.Add(retention)
-		case keyStateRetiring:
-			// Keep the previous retirement horizon untouched.
-		default:
-			return fmt.Errorf("keyring %q: entry %q has invalid state %q",
-				keyRingPath(dir), ring.Keys[i].KID, ring.Keys[i].State)
-		}
+	if rerr := retireRingKeys(ring, dir, now.Add(retention)); rerr != nil {
+		return rerr
 	}
 
 	// Generate the new active key and persist it under its thumbprint kid.
@@ -414,7 +413,7 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	kid := jwkThumbprint(&key.PublicKey)
 	for _, entry := range ring.Keys {
 		if entry.KID == kid {
-			return fmt.Errorf("keyring %q: generated kid %q already exists", keyRingPath(dir), kid)
+			return fmt.Errorf("keyring %q: generated kid %q %w", keyRingPath(dir), kid, errGeneratedKidExists)
 		}
 	}
 	fileName := "minidp-rsa-" + kid + ".pem"
@@ -445,6 +444,49 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	return nil
 }
 
+// loadOrCreateRing reads the ring document, falling back to the legacy
+// single-key layout (or an empty ring) when it does not exist yet.
+func loadOrCreateRing(root *os.Root) (*keyringFile, error) {
+	ring, err := readKeyRing(root, keyRingFileName)
+	switch {
+	case err == nil:
+		return ring, nil
+	case errors.Is(err, os.ErrNotExist):
+		// Legacy layout: adopt the persisted key (or start empty) as the
+		// active entry of a fresh ring.
+		fresh := &keyringFile{}
+		if _, statErr := root.Stat(keyFileName); statErr == nil {
+			fresh.Keys = []keyringEntry{{
+				KID:       legacyKid,
+				File:      keyFileName,
+				CreatedAt: time.Now(),
+				State:     keyStateActive,
+			}}
+		}
+		return fresh, nil
+	default:
+		return nil, fmt.Errorf("read keyring: %w", err)
+	}
+}
+
+// retireRingKeys marks every active entry as retiring with the given horizon
+// and rejects entries with an unknown state.
+func retireRingKeys(ring *keyringFile, dir string, retireAt time.Time) error {
+	for i := range ring.Keys {
+		switch ring.Keys[i].State {
+		case keyStateActive:
+			ring.Keys[i].State = keyStateRetiring
+			ring.Keys[i].RetireAt = retireAt
+		case keyStateRetiring:
+			// Keep the previous retirement horizon untouched.
+		default:
+			return fmt.Errorf("keyring %q: entry %q %w %q",
+				keyRingPath(dir), ring.Keys[i].KID, errKeyringStateInvalid, ring.Keys[i].State)
+		}
+	}
+	return nil
+}
+
 // persistKeyPEM writes the private key to <dir>/<name> (mode 0600) via an
 // exclusively created temp file + rename, so a crash mid-write can never
 // leave a truncated key behind. O_EXCL also serializes concurrent rotations:
@@ -464,11 +506,11 @@ func persistKeyPEM(root *os.Root, dir, name string, key *rsa.PrivateKey) error {
 		return fmt.Errorf("write signing key: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("close signing key: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), filepath.Join(dir, name)); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("persist signing key to %q: %w", name, err)
 	}
 	return nil
@@ -491,11 +533,11 @@ func saveKeyRing(root *os.Root, dir, name string, ring *keyringFile) error {
 		return fmt.Errorf("write keyring: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("close keyring: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, tmpName), filepath.Join(dir, name)); err != nil {
-		_ = root.Remove(tmpName)
+		removeTempFile(root, tmpName)
 		return fmt.Errorf("persist keyring to %q: %w", name, err)
 	}
 	return nil
@@ -524,7 +566,7 @@ func loadSigningKey(pemPath string) (*signingKey, error) {
 	}
 	block, _ := pem.Decode(raw)
 	if block == nil {
-		return nil, fmt.Errorf("rsa key: no PEM block found in %q", pemPath)
+		return nil, fmt.Errorf("%w in %q", errNoPEMBlock, pemPath)
 	}
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
@@ -535,7 +577,7 @@ func loadSigningKey(pemPath string) (*signingKey, error) {
 		}
 		rk, ok := pk.(*rsa.PrivateKey)
 		if !ok {
-			return nil, fmt.Errorf("rsa key in %q is not an RSA key", pemPath)
+			return nil, fmt.Errorf("rsa key in %q %w", pemPath, errNotAnRSAKey)
 		}
 		key = rk
 	}
@@ -567,7 +609,11 @@ func (k *signingKey) signTyped(claims jwt.Claims, typ string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = k.kid
 	token.Header["typ"] = typ
-	return token.SignedString(k.key)
+	signed, err := token.SignedString(k.key)
+	if err != nil {
+		return "", fmt.Errorf("sign token: %w", err)
+	}
+	return signed, nil
 }
 
 // jwk is a single JSON Web Key as described by RFC 7517.
@@ -620,13 +666,13 @@ func (ks *keySet) signAccess(claims jwt.Claims) (string, error) {
 // kid matches the token header. An unknown or missing kid fails closed — a
 // token that references no published key cannot be trusted.
 func (ks *keySet) verifyKey(tok *jwt.Token) (any, error) {
-	kid, _ := tok.Header["kid"].(string)
+	kid := claimString(tok.Header, "kid")
 	for _, k := range ks.published {
 		if k.kid == kid {
 			return &k.key.PublicKey, nil
 		}
 	}
-	return nil, fmt.Errorf("unknown kid %q", kid)
+	return nil, fmt.Errorf("%w %q", errUnknownKid, kid)
 }
 
 // JWKS returns the JSON Web Key Set containing the public halves of every
@@ -634,15 +680,18 @@ func (ks *keySet) verifyKey(tok *jwt.Token) (any, error) {
 // the retiring keys until their retention horizon has passed. This is what
 // resource servers pull via the discovery document's jwks_uri to verify
 // token signatures.
-func (ks *keySet) JWKS() []byte {
+func (ks *keySet) JWKS() ([]byte, error) {
 	keys := make([]jwk, 0, len(ks.published))
 	for _, k := range ks.published {
 		keys = append(keys, k.jwkOf())
 	}
-	out, _ := json.MarshalIndent(struct {
+	out, err := json.MarshalIndent(struct {
 		Keys []jwk `json:"keys"`
 	}{Keys: keys}, "", "  ")
-	return out
+	if err != nil {
+		return nil, fmt.Errorf("marshal jwks: %w", err)
+	}
+	return out, nil
 }
 
 // pkceS256 computes the PKCE S256 challenge for a code_verifier.

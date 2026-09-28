@@ -55,7 +55,7 @@ func main() {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
 	}
-	srv, err := idp.New(cfg)
+	srv, err := idp.New(&cfg)
 	if err != nil {
 		slog.Error("startup failed", "error", err)
 		os.Exit(1)
@@ -96,9 +96,12 @@ func main() {
 func rotateKeys() error {
 	retention, err := idp.LoadKeyRetention()
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve key retention: %w", err)
 	}
-	return idp.RotateKeys(os.Getenv("IDP_KEY_DIR"), retention)
+	if err := idp.RotateKeys(os.Getenv("IDP_KEY_DIR"), retention); err != nil {
+		return fmt.Errorf("rotate signing keys: %w", err)
+	}
+	return nil
 }
 
 // usage prints the command summary.

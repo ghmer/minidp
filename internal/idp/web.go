@@ -41,10 +41,13 @@ func loadAsset(name, embedded string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if data != nil {
-		return data, nil
+	if data == nil {
+		data, err = webFS.ReadFile(embedded)
+		if err != nil {
+			return nil, fmt.Errorf("read embedded asset %q: %w", embedded, err)
+		}
 	}
-	return webFS.ReadFile(embedded)
+	return data, nil
 }
 
 // readAssetOverride reads a single override file from assetDir through os.Root
@@ -67,7 +70,8 @@ func readAssetOverride(name string) ([]byte, error) {
 		return nil, fmt.Errorf("read asset override %s/%s: %w", assetDir, name, err)
 	}
 	if len(data) > assetOverrideLimit {
-		return nil, fmt.Errorf("asset override %s/%s is %d bytes, the limit is %d", assetDir, name, len(data), assetOverrideLimit)
+		return nil, fmt.Errorf("asset override %s/%s is %d bytes, the limit is %d: %w",
+			assetDir, name, len(data), assetOverrideLimit, errAssetOverrideTooLarge)
 	}
 	slog.Info("using login page asset override", "path", assetDir+"/"+name, "bytes", len(data))
 	return data, nil
@@ -77,10 +81,10 @@ func readAssetOverride(name string) ([]byte, error) {
 // assets.
 type loginTemplate struct {
 	tmpl     *template.Template
-	css      []byte
-	logo     []byte
 	title    string
 	subtitle string
+	css      []byte
+	logo     []byte
 }
 
 // loginField is one hidden <input> that carries an OAuth2 parameter from the
@@ -100,18 +104,18 @@ type loginData struct {
 	Error string
 	// Username is pre-filled after a failed attempt (never the password).
 	Username string
-	// Hidden carries the OAuth2 parameters echoed back into the form.
-	Hidden []loginField
 	// CSRFToken is the signed form token; rendered as a hidden input.
 	CSRFToken string
 	// Message, when set, replaces the form (e.g. "Signed in as alice").
 	Message string
+	// Hidden carries the OAuth2 parameters echoed back into the form.
+	Hidden []loginField
 }
 
 func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {
 	tmpl, err := template.ParseFS(webFS, "web/login.html")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse login template: %w", err)
 	}
 	css, err := loadAsset("login.css", "web/login.css")
 	if err != nil {
@@ -132,12 +136,15 @@ func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {
 
 // render writes the login page. Empty Title/Subtitle in data fall back to the
 // configured defaults.
-func (lt *loginTemplate) render(w io.Writer, data loginData) error {
+func (lt *loginTemplate) render(w io.Writer, data *loginData) error {
 	if data.Title == "" {
 		data.Title = lt.title
 	}
 	if data.Subtitle == "" {
 		data.Subtitle = lt.subtitle
 	}
-	return lt.tmpl.Execute(w, data)
+	if err := lt.tmpl.Execute(w, data); err != nil {
+		return fmt.Errorf("render login page: %w", err)
+	}
+	return nil
 }

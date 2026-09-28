@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,8 +18,8 @@ type tokenResponse struct {
 	IDToken      string `json:"id_token,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
 	Scope        string `json:"scope,omitempty"`
+	ExpiresIn    int    `json:"expires_in"`
 }
 
 // accessClaims are the claims embedded in the issued access token. client_id
@@ -50,8 +51,8 @@ type idClaims struct {
 	Email             string   `json:"email,omitempty"`
 	Name              string   `json:"name,omitempty"`
 	PreferredUsername string   `json:"preferred_username,omitempty"`
-	Roles             []string `json:"roles,omitempty"`
 	SessionID         string   `json:"sid,omitempty"`
+	Roles             []string `json:"roles,omitempty"`
 }
 
 // profileData is the scope-gated profile information released into tokens.
@@ -89,13 +90,13 @@ func profileFor(store UserStore, sub string, wantProfile, wantEmail bool) profil
 // timestamps including nbf (Entra ID always emits it).
 func (s *Server) registeredClaims(audience, sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
 	return jwt.RegisteredClaims{
-		Issuer:     s.cfg.Issuer,
-		Subject:    sub,
-		Audience:   jwt.ClaimStrings{audience},
-		ExpiresAt:  jwt.NewNumericDate(expires),
-		NotBefore:  jwt.NewNumericDate(now),
-		IssuedAt:   jwt.NewNumericDate(now),
-		ID:         jti,
+		Issuer:    s.cfg.Issuer,
+		Subject:   sub,
+		Audience:  jwt.ClaimStrings{audience},
+		ExpiresAt: jwt.NewNumericDate(expires),
+		NotBefore: jwt.NewNumericDate(now),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ID:        jti,
 	}
 }
 
@@ -118,9 +119,9 @@ func shortScopeNames(scopes []string) []string {
 // shape, scp carries the granted resource permissions as short names, the
 // RFC 9068 scope claim keeps the full granted strings, and
 // preferred_username is released with the profile scope.
-func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, wantProfile bool, p profileData) *accessClaims {
+func newAccessClaims(rc *jwt.RegisteredClaims, clientID string, scopes []string, wantProfile bool, p profileData) *accessClaims {
 	access := &accessClaims{
-		RegisteredClaims: rc,
+		RegisteredClaims: *rc,
 		ClientID:         clientID,
 		Azp:              clientID,
 		Idtyp:            "user",
@@ -139,9 +140,9 @@ func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, 
 // preferred_username and name are released with the profile scope; sid
 // carries the token family (one authorization) so /end_session can revoke
 // exactly that authorization's tokens from an id_token_hint.
-func newIDClaims(rc jwt.RegisteredClaims, azp, nonce, family string, wantProfile bool, p profileData) *idClaims {
+func newIDClaims(rc *jwt.RegisteredClaims, azp, nonce, family string, wantProfile bool, p profileData) *idClaims {
 	id := &idClaims{
-		RegisteredClaims: rc,
+		RegisteredClaims: *rc,
 		Azp:              azp,
 		Nonce:            nonce,
 		SessionID:        family,
@@ -173,7 +174,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	// the client's own, and its profile claims come from its own users.
 	client := s.clients.lookup(ctx.ClientID)
 	if client == nil {
-		return nil, fmt.Errorf("issue tokens for unregistered client %q", ctx.ClientID)
+		return nil, fmt.Errorf("%w %q", errTokensUnregCli, ctx.ClientID)
 	}
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)
@@ -188,8 +189,9 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	wantEmail := hasScope(ctx.Scopes, "email")
 	profile := profileFor(client.users, ctx.Sub, wantProfile, wantEmail)
 
+	rc := s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires)
 	access := newAccessClaims(
-		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
+		&rc,
 		client.ID(), ctx.Scopes, wantProfile, profile)
 	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {
@@ -285,8 +287,9 @@ func (s *Server) issueIDToken(ctx *authContext, audience string, now, expires ti
 	if err != nil {
 		return "", fmt.Errorf("generate id token jti: %w", err)
 	}
+	rc := s.registeredClaims(audience, ctx.Sub, idJTI, now, expires)
 	id := newIDClaims(
-		s.registeredClaims(audience, ctx.Sub, idJTI, now, expires),
+		&rc,
 		ctx.ClientID, ctx.Nonce, ctx.Family, wantProfile, profile)
 	idTokenString, err := s.keys.sign(id)
 	if err != nil {
@@ -321,10 +324,5 @@ func joinScopes(scopes []string) string {
 }
 
 func hasScope(scopes []string, want string) bool {
-	for _, sc := range scopes {
-		if sc == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, want)
 }

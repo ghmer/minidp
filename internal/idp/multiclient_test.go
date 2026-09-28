@@ -1,6 +1,7 @@
 package idp
 
 import (
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -498,9 +499,7 @@ func loginForScopes(t *testing.T, base, clientID, redirect, user, pass, verifier
 	params := authorizeFormFor(clientID, redirect, verifier)
 	params.Set("scope", scope)
 	form := url.Values{}
-	for k, v := range params {
-		form[k] = v
-	}
+	maps.Copy(form, params)
 	form.Set("username", user)
 	form.Set("password", pass)
 	browser := newBrowser()

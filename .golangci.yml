@@ -1,0 +1,140 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: false
+
+linters:
+  default: standard
+
+  enable:
+    # Correctness / bugs
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - bodyclose
+    - nilerr
+    - nilnesserr
+    - errorlint
+    - modernize
+
+    # Error handling
+    - err113
+    - errname
+    - wrapcheck
+
+    # Code quality
+    - gocritic
+    - revive
+    - unconvert
+    - unparam
+    - misspell
+    - prealloc
+
+    # Complexity / maintainability
+    - cyclop
+    - funlen
+    - gocognit
+    - nestif
+
+    # Security
+    - gosec
+
+    # Style
+    - godot
+    - whitespace
+
+  settings:
+    cyclop:
+      max-complexity: 15
+
+    funlen:
+      lines: 100
+      statements: 50
+
+    gocognit:
+      min-complexity: 20
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - performance
+        - style
+
+    godot:
+      scope: declarations
+
+    misspell:
+      locale: US
+
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+        - name: var-naming
+        - name: indent-error-flow
+        - name: range
+        - name: error-strings
+        - name: error-naming
+        - name: receiver-naming
+        - name: increment-decrement
+        - name: errorf
+        - name: string-of-int
+        - name: var-declaration
+        - name: package-comments
+
+    gosec:
+      excludes:
+        - G104
+
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    govet:
+      enable-all: true
+
+  exclusions:
+    generated: lax
+
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+
+    rules:
+      # Tests can reasonably be less strict.
+      - path: "_test\\.go"
+        linters:
+          - funlen
+          - cyclop
+          - gocognit
+          - gosec
+          - err113
+          - wrapcheck
+
+      # Examples often intentionally ignore errors.
+      - path: "example_.*\\.go"
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    gofmt:
+      simplify: true
+
+    goimports:
+      local-prefixes:
+        - example.com/yourproject
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

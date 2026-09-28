@@ -127,7 +127,7 @@ func TestLoadKeyRetention(t *testing.T) {
 			t.Errorf("retention = %v, want %v", got, want)
 		}
 	})
-	t.Run("token TTL envs are honoured", func(t *testing.T) {
+	t.Run("token TTL envs are honored", func(t *testing.T) {
 		t.Setenv("IDP_ACCESS_TOKEN_TTL", "300")
 		t.Setenv("IDP_REFRESH_TOKEN_TTL", "600")
 		got, err := LoadKeyRetention()

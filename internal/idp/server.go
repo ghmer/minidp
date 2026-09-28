@@ -3,9 +3,11 @@ package idp
 import (
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -16,9 +18,9 @@ import (
 type authContext struct {
 	Sub      string
 	ClientID string
-	Scopes   []string
 	Nonce    string
 	Family   string
+	Scopes   []string
 }
 
 // subject identifies the authenticated user carried through to token
@@ -31,7 +33,6 @@ type subject struct {
 
 // Server is the in-memory OIDC provider.
 type Server struct {
-	cfg            Config
 	keys           *keySet
 	store          *store
 	template       *loginTemplate
@@ -39,11 +40,12 @@ type Server struct {
 	limiter        *loginLimiter
 	clients        *clientRegistry
 	allowedOrigins map[string]bool
+	cfg            Config
 }
 
 // New constructs a Server, resolving the signing material, the registered
 // clients (each with its own accounts), and compiling the login template.
-func New(cfg Config) (*Server, error) {
+func New(cfg *Config) (*Server, error) {
 	keys, err := NewSigningKeySet(cfg.RSAPeM, cfg.KeyDir)
 	if err != nil {
 		return nil, err
@@ -58,10 +60,10 @@ func New(cfg Config) (*Server, error) {
 	}
 	csrfSecret := make([]byte, 32)
 	if _, err := rand.Read(csrfSecret); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate csrf secret: %w", err)
 	}
 	s := &Server{
-		cfg:            cfg,
+		cfg:            *cfg,
 		keys:           keys,
 		store:          newStore(),
 		template:       tmpl,
@@ -130,7 +132,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /logo.svg", s.handleStaticLogo)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			slog.Debug("healthz write failed", "error", err)
+		}
 	})
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
@@ -185,7 +189,7 @@ func (s *Server) authenticate(client *registeredClient, username, password strin
 // is walked from right to left and the rightmost entry NOT belonging to a
 // trusted proxy is used: standard proxies append the real client address, so
 // an attacker-supplied leftmost entry ("X-Forwarded-For: <random>, <real>")
-// can neither select nor rotate the rate-limit key. X-Real-IP is honoured only
+// can neither select nor rotate the rate-limit key. X-Real-IP is honored only
 // when X-Forwarded-For is absent (proxies that set it overwrite the header).
 // Without a trusted proxy, the socket address itself is used.
 func (s *Server) clientIP(r *http.Request) string {
@@ -200,9 +204,9 @@ func (s *Server) clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		return s.forwardedClientIP(xff, host)
 	}
-	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
-		if realIP := net.ParseIP(real); realIP != nil && !s.ipTrusted(realIP) {
-			return real
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		if parsed := net.ParseIP(realIP); parsed != nil && !s.ipTrusted(parsed) {
+			return realIP
 		}
 	}
 	return host
@@ -215,8 +219,8 @@ func (s *Server) clientIP(r *http.Request) string {
 // for is the socket peer itself (host).
 func (s *Server) forwardedClientIP(xff, host string) string {
 	parts := strings.Split(xff, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		candidate := strings.TrimSpace(parts[i])
+	for _, part := range slices.Backward(parts) {
+		candidate := strings.TrimSpace(part)
 		cIP := net.ParseIP(candidate)
 		if cIP == nil {
 			continue // malformed entry: cannot be the real client, keep walking
@@ -272,7 +276,9 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Debug("json response write failed", "error", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, errCode, desc string) {

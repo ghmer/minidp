@@ -111,12 +111,14 @@ func TestClientValidation(t *testing.T) {
 			c.AllowedScopes = []string{"api://other-api/read"}
 		}),
 	} {
-		if err := tc.validate(); err == nil {
+		c := tc
+		if err := c.validate(); err == nil {
 			t.Errorf("%s: expected a validation error, got none", name)
 		}
 	}
 	// The unmutated entry and a valid confidential variant pass.
-	if err := validClient(t).validate(); err != nil {
+	c := validClient(t)
+	if err := c.validate(); err != nil {
 		t.Errorf("valid public client rejected: %v", err)
 	}
 	confidential := validClient(t)
@@ -148,7 +150,7 @@ func TestClientValidation(t *testing.T) {
 func TestReadClientsErrors(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]string{
-		"malformed json": `[{"client_id": "app",`,
+		"malformed json":         `[{"client_id": "app",`,
 		"not an array or object": `{"client_id": "app"}`,
 		"object without clients": `{"resources": [{"audience": "api", "app_roles": ["r"]}]}`,
 		"duplicate ids": `[{"client_id": "app", "type": "public", "redirect_uris": ["https://a.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]},` +
@@ -422,7 +424,7 @@ func TestClientRegistry(t *testing.T) {
 
 	// Redirect policies are per client.
 	if conf.redirectURIAllowed("https://app.example.com/callback") {
-		t.Error("the confidential client must not honour the public client's redirect")
+		t.Error("the confidential client must not honor the public client's redirect")
 	}
 }
 
@@ -442,7 +444,7 @@ func TestHashPasswordRejectsInvalidCost(t *testing.T) {
 }
 
 // The dummy hash used to equalise failed lookups must be a real, verifiable
-// bcrypt hash so the timing equalisation actually burns the same work — at
+// bcrypt hash so the timing equalization actually burns the same work — at
 // the cost of the stored user hashes, not an assumed default.
 func TestDummyHashIsUsableBcryptHash(t *testing.T) {
 	h := newDummyHash(bcrypt.DefaultCost)
