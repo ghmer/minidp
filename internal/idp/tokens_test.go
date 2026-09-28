@@ -104,6 +104,57 @@ func TestIssueTokensAccessAndIDClaims(t *testing.T) {
 	}
 }
 
+// TestIssueTokensSeparateAudiences pins the OIDC Core / RFC 9068 audience
+// split for a client whose configured audience differs from its client id:
+// the access token is minted for the configured API audience and carries the
+// RFC 9068 §2.2 REQUIRED client_id claim; the id_token is minted for the
+// client id itself (OIDC Core §2: the id_token aud is the Relying Party) and
+// carries no client_id claim.
+func TestIssueTokensSeparateAudiences(t *testing.T) {
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	conf := testConfidentialClient(t, "a-confidential-secret")
+	conf.Audience = "conf-api"
+	if err := SaveClients(clientsFile, []Client{conf}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
+	srv, err := New(Config{
+		Issuer:          "https://idp.test",
+		ClientsFile:     clientsFile,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile", "email"},
+		Nonce:    testNonceValue,
+	})
+	if err != nil {
+		t.Fatalf("issueTokens: %v", err)
+	}
+
+	access := parseWithServer(t, srv, resp.AccessToken)
+	aud, _ := access.GetAudience()
+	if len(aud) != 1 || aud[0] != "conf-api" {
+		t.Errorf("access aud = %v, want [conf-api]", aud)
+	}
+	if access["client_id"] != testClientID {
+		t.Errorf("access client_id = %v, want %q (RFC 9068 §2.2)", access["client_id"], testClientID)
+	}
+
+	id := parseWithServer(t, srv, resp.IDToken)
+	audID, _ := id.GetAudience()
+	if len(audID) != 1 || audID[0] != testClientID {
+		t.Errorf("id aud = %v, want [%s] (the RP, not the API audience)", audID, testClientID)
+	}
+	if _, has := id["client_id"]; has {
+		t.Error("id token must not carry the RFC 9068 client_id claim")
+	}
+}
+
 // TestIssueTokensReleasesClaimsByScope pins the OIDC scope model: profile
 // unlocks preferred_username/name, email unlocks email, and nothing is
 // fabricated when the users-file record lacks a value.

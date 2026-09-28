@@ -17,7 +17,7 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
 
 - Multiple registered clients in one clients file (`IDP_CLIENTS_FILE`,
   managed with the bundled `clientctl` tool). Each client has its own
-  profile (public or confidential), redirect policy, token audience
+  profile (public or confidential), redirect policy, access-token audience
   (defaults to the client ID) and user accounts. A client's users cannot
   sign in through another client's flow, and any other `client_id` is
   rejected at `/authorize` and `/token`.
@@ -29,7 +29,10 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
   [Client profiles](docs/clients.md#client-profiles-public-vs-confidential) for the
   confidential variant.
 - RS256-signed tokens using the RFC 9068 `at+jwt` profile for access tokens
-   (`typ` header), so an ID token can't be replayed as an access token.
+   (`typ` header), so an ID token can't be replayed as an access token. The
+   two audiences are split per OIDC Core / RFC 9068: the ID token's `aud` is
+   the client ID, the access token's `aud` is the configured API audience,
+   and access tokens carry the RFC 9068 REQUIRED `client_id` claim.
 - Claims are released according to the granted scopes, from the
   authoritative account record (`profile` → `preferred_username`/`name`,
     `email` → `email`). `roles` is released on both access and ID tokens

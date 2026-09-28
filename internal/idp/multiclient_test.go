@@ -100,6 +100,96 @@ func TestMultiClientBothClientsFlow(t *testing.T) {
 	if len(audB) != 1 || audB[0] != "conf-api" {
 		t.Errorf("conf-app aud = %v, want [conf-api]", audB)
 	}
+	if claimsB["client_id"] != "conf-app" {
+		t.Errorf("conf-app client_id = %v, want [conf-app] (RFC 9068 §2.2)", claimsB["client_id"])
+	}
+}
+
+// TestMultiClientAPIAudienceIDToken pins the audience split at the HTTP
+// boundary: conf-app's access token is minted for its configured API
+// audience while its id_token is minted for the client id itself.
+func TestMultiClientAPIAudienceIDToken(t *testing.T) {
+	ts, _ := multiClientIDP(t, "a-confidential-secret")
+
+	verifier, _ := pkcePair()
+	location := loginFor(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier)
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+
+	idClaims := verifyTokenString(t, tokens["id_token"].(string), ts.URL)
+	audID, _ := idClaims["aud"].([]any)
+	if len(audID) != 1 || audID[0] != "conf-app" {
+		t.Errorf("id aud = %v, want [conf-app] (the RP, not the conf-api audience)", audID)
+	}
+	nonce, _ := idClaims["nonce"].(string)
+	if nonce != testNonceValue {
+		t.Errorf("id nonce = %q, want %q", nonce, testNonceValue)
+	}
+}
+
+// TestMultiClientAPIAudienceUserInfoAndLogout pins that the endpoints that
+// must resolve the client behind a token still work when the access token's
+// audience is the API audience, not the client id: /userinfo resolves the
+// account store via the RFC 9068 client_id claim, and /end_session resolves
+// the client from the id_token_hint's client-id audience and revokes the
+// token family.
+func TestMultiClientAPIAudienceUserInfoAndLogout(t *testing.T) {
+	ts, _ := multiClientIDP(t, "a-confidential-secret")
+
+	verifier, _ := pkcePair()
+	location := loginFor(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier)
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+	access := tokens["access_token"].(string)
+	idToken := tokens["id_token"].(string)
+
+	// /userinfo with an API-audience access token: the client_id claim —
+	// not the audience — resolves bob's account store.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+	req.Header.Set("Authorization", "Bearer "+access)
+	ui, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /userinfo: %v", err)
+	}
+	uiClaims := decodeJSON(t, ui)
+	_ = ui.Body.Close()
+	if ui.StatusCode != http.StatusOK {
+		t.Fatalf("/userinfo: status = %d, body = %v", ui.StatusCode, uiClaims)
+	}
+	if uiClaims["sub"] != "bob" || uiClaims["preferred_username"] != "bob" {
+		t.Errorf("userinfo = %v, want bob's profile resolved via the client_id claim", uiClaims)
+	}
+
+	// /end_session with the conf-app id_token_hint: the hint's audience (the
+	// client id) must resolve conf-app even though its registered audience
+	// is conf-api, and logout must revoke the token family.
+	logoutResp, err := noFollow().Get(ts.URL + "/end_session?id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("https://conf.example.com/"))
+	if err != nil {
+		t.Fatalf("GET /end_session: %v", err)
+	}
+	_ = logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusFound || logoutResp.Header.Get("Location") != "https://conf.example.com/" {
+		t.Errorf("end_session: status = %d, location = %q, want redirect to conf-app's allowlisted target",
+			logoutResp.StatusCode, logoutResp.Header.Get("Location"))
+	}
+
+	// The revoked family: the refresh token no longer redeems.
+	grant := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {tokens["refresh_token"].(string)},
+	}, "conf-app", "a-confidential-secret"))
+	if grant["error"] != "invalid_grant" {
+		t.Errorf("refresh after logout: %v, want invalid_grant", grant["error"])
+	}
 }
 
 // TestMultiClientPerClientRedirectPolicy pins that a client cannot use

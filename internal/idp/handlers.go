@@ -878,9 +878,15 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 	if len(aud) == 0 {
 		return nil, nil, fmt.Errorf("invalid token: missing audience")
 	}
-	// The audience identifies the registered client the hint belongs to; the
-	// post-logout redirect policy of THAT client governs the logout redirect.
-	client := s.clients.clientForAudience(aud[0])
+	// The id_token audience is the client id (OIDC Core §2), so the audience
+	// resolves the registered client directly; the configured-audience
+	// fallback keeps hints minted under the pre-split audience semantics
+	// working. The resolved client's post-logout redirect policy governs the
+	// logout redirect.
+	client := s.clients.lookup(aud[0])
+	if client == nil {
+		client = s.clients.clientForAudience(aud[0])
+	}
 	if client == nil {
 		return nil, nil, fmt.Errorf("invalid token: audience not accepted here")
 	}
@@ -972,20 +978,29 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // userinfoClaims assembles the UserInfo response for the token's subject.
-// The token's audience identifies the registered client whose user store
-// holds the authoritative record; the scope-gated token claims are the
-// fallback for subjects that have since been removed from the clients file.
-// The access token carries no name claim, so for such subjects the name is
-// simply omitted (an absent claim is never fabricated).
+// The RFC 9068 client_id claim names the client whose user store holds the
+// authoritative record; the audience is only a fallback for that resolution
+// (an access token minted for a configured API audience does not name the
+// client). The scope-gated token claims are the fallback for subjects that
+// have since been removed from the clients file. The access token carries no
+// name claim, so for such subjects the name is simply omitted (an absent
+// claim is never fabricated).
 func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[string]any {
 	sub, _ := claims["sub"].(string)
 	wantProfile := hasScope(scopes, "profile")
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
 	var store UserStore
-	if aud, _ := claims.GetAudience(); len(aud) > 0 {
-		if client := s.clients.clientForAudience(aud[0]); client != nil {
+	if cid, _ := claims["client_id"].(string); cid != "" {
+		if client := s.clients.lookup(cid); client != nil {
 			store = client.users
+		}
+	}
+	if store == nil {
+		if aud, _ := claims.GetAudience(); len(aud) > 0 {
+			if client := s.clients.clientForAudience(aud[0]); client != nil {
+				store = client.users
+			}
 		}
 	}
 	if store != nil {
@@ -1029,14 +1044,15 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	sub, _ := claims["sub"].(string)
 	scope, _ := claims["scope"].(string)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":   true,
-		"sub":      sub,
-		"scope":    scope,
-		"iss":      claims["iss"],
-		"aud":      claims["aud"],
-		"exp":      claims["exp"],
-		"iat":      claims["iat"],
-		"username": sub,
+		"active":    true,
+		"sub":       sub,
+		"client_id": claims["client_id"],
+		"scope":     scope,
+		"iss":       claims["iss"],
+		"aud":       claims["aud"],
+		"exp":       claims["exp"],
+		"iat":       claims["iat"],
+		"username":  sub,
 	})
 }
 

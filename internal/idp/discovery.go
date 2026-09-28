@@ -48,7 +48,8 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"claims_supported": []string{
 			// Exactly the claims minidp actually issues. auth_time was
 			// previously advertised but never embedded in any token.
-			"iss", "sub", "aud", "exp", "iat", "nonce",
+			// client_id is the RFC 9068 access-token claim.
+			"iss", "sub", "aud", "exp", "iat", "client_id", "nonce",
 			"preferred_username", "email", "name",
 		},
 	})

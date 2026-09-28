@@ -59,6 +59,9 @@ func TestClientCredentialsHappyPath(t *testing.T) {
 	if !ok || len(aud) != 1 || aud[0] != "fake-hr" {
 		t.Errorf("aud = %v, want [fake-hr]", claims["aud"])
 	}
+	if claims["client_id"] != "fake-hr-mcp-service" {
+		t.Errorf("client_id = %v, want %q (RFC 9068 §2.2)", claims["client_id"], "fake-hr-mcp-service")
+	}
 	if scope, _ := claims["scope"].(string); scope != "fake-hr:read fake-hr:write" {
 		t.Errorf("token scope = %v, want the configured scopes", claims["scope"])
 	}

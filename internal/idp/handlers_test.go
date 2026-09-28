@@ -1227,9 +1227,14 @@ func TestIntrospectRevokeClientAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("introspect with basic auth: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	introspection := decodeJSON(t, resp)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("introspect with basic auth: status = %d, want 200", resp.StatusCode)
+	}
+	// RFC 7662 §2.3: the response names the client the token was issued to.
+	if introspection["client_id"] != testClientID {
+		t.Errorf("introspection client_id = %v, want %q", introspection["client_id"], testClientID)
 	}
 
 	// A client_id/client_secret form pair is accepted as well.

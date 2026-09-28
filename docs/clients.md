@@ -56,9 +56,16 @@ secrets trigger a startup warning.
 
 ## Connecting a client application
 
-Every token carries the audience of the client it was issued for (the
-client's `audience`, defaulting to its `client_id`). Nothing is reflected —
-a token minted for, or presented at, any other audience is rejected. Point
+The two JWTs of a token set carry distinct, server-resolved audiences:
+
+- The **id_token** is minted for the client's `client_id` — OIDC Core §2
+  requires the id_token `aud` to be the Relying Party itself.
+- The **access token** is minted for the client's `audience` (defaulting to
+  its `client_id`) and additionally carries the RFC 9068 §2.2 REQUIRED
+  `client_id` claim naming the client that requested it.
+
+Nothing is reflected — a token minted for, or presented at, any other
+audience is rejected. Point
 your OIDC client library (oidc-client-ts, AppAuth, Auth.js, or any
 standards-compliant library) at minidp:
 
@@ -223,8 +230,10 @@ File format (see `clients.json.example`):
 
 - `client_id` must be unique and free of whitespace. `type` is `public` or
    `confidential`; a confidential entry requires `client_secret` (≥128
-  random bits), a public entry must not have one. `audience` defaults to
-  the `client_id`. Every `redirect_uri` must be an absolute http(s) URL
+  random bits), a public entry must not have one. `audience` is the
+  access-token audience (the API the token is minted for) and defaults to
+  the `client_id`; the id_token audience is always the `client_id` itself.
+  Every `redirect_uri` must be an absolute http(s) URL
   without a fragment, compared by exact string match at `/authorize`.
 - `grant_types` selects the OAuth grants the client may use at `/token`
   (default `["authorization_code", "refresh_token"]`; see

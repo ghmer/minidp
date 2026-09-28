@@ -21,9 +21,12 @@ type tokenResponse struct {
 	Scope        string `json:"scope,omitempty"`
 }
 
-// accessClaims are the claims embedded in the issued access token.
+// accessClaims are the claims embedded in the issued access token. client_id
+// is the RFC 9068 §2.2 REQUIRED identifier of the client that requested the
+// token; it is emitted without omitempty so every access token carries it.
 type accessClaims struct {
 	jwt.RegisteredClaims
+	ClientID string   `json:"client_id"`
 	Scope    string   `json:"scope,omitempty"`
 	Username string   `json:"preferred_username,omitempty"`
 	Email    string   `json:"email,omitempty"`
@@ -87,11 +90,13 @@ func (s *Server) registeredClaims(audience, sub, jti string, now, expires time.T
 	}
 }
 
-// newAccessClaims builds the access-token claims. preferred_username is
-// released with the profile scope.
-func newAccessClaims(rc jwt.RegisteredClaims, scope string, wantProfile bool, p profileData) *accessClaims {
+// newAccessClaims builds the access-token claims: client_id names the
+// requesting client (RFC 9068 §2.2), and preferred_username is released with
+// the profile scope.
+func newAccessClaims(rc jwt.RegisteredClaims, clientID, scope string, wantProfile bool, p profileData) *accessClaims {
 	access := &accessClaims{
 		RegisteredClaims: rc,
+		ClientID:         clientID,
 		Scope:            scope,
 		Email:            p.email,
 		Roles:            p.roles,
@@ -126,9 +131,14 @@ func newIDClaims(rc jwt.RegisteredClaims, nonce, family string, wantProfile bool
 // tokens are rotated: every issuance retires the previous one, so a refresh
 // token can only ever be used a single time.
 //
-// Every token carries the configured audience (s.cfg.Audience) — never a
-// caller-chosen one — and profile claims are released strictly according to
-// the granted scopes from the authoritative users-file record.
+// The two JWTs carry distinct, server-resolved audiences (never a
+// caller-chosen one): the access token is minted for the client's configured
+// API audience (its audience field, defaulting to the client id), while the
+// id_token is minted for the client id itself — OIDC Core requires the
+// id_token aud to be the Relying Party, and RFC 9068 §5 requires access-token
+// audiences that uniquely identify the targeted resource. Profile claims are
+// released strictly according to the granted scopes from the authoritative
+// clients-file record.
 func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	// The context's client must be registered: the audience of its tokens is
 	// the client's own, and its profile claims come from its own users.
@@ -151,7 +161,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 
 	access := newAccessClaims(
 		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
-		joinScopes(ctx.Scopes), wantProfile, profile)
+		client.ID(), joinScopes(ctx.Scopes), wantProfile, profile)
 	accessTokenString, err := s.key.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
@@ -167,7 +177,9 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 		Scope:       joinScopes(ctx.Scopes),
 	}
 	if hasScope(ctx.Scopes, "openid") {
-		if resp.IDToken, err = s.issueIDToken(ctx, client.Audience(), now, accessExpires, wantProfile, profile); err != nil {
+		// OIDC Core §2: the id_token audience is the Relying Party's
+		// client_id — never the API audience the access token targets.
+		if resp.IDToken, err = s.issueIDToken(ctx, client.ID(), now, accessExpires, wantProfile, profile); err != nil {
 			return nil, err
 		}
 	}
@@ -197,7 +209,8 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 // scopes come exclusively from the client's registration, and no id_token
 // or refresh token is issued (RFC 6749 §4.4.3: no refresh token for this
 // grant). No profile claims are released: there is no user record the
-// token could speak about.
+// token could speak about. client_id is the RFC 9068 §2.2 REQUIRED
+// identifier of the requesting client.
 func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenResponse, error) {
 	scopes := client.clientCredentialsScopes()
 	now := time.Now()
@@ -211,6 +224,7 @@ func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenR
 	}
 	access := &accessClaims{
 		RegisteredClaims: s.registeredClaims(client.Audience(), client.ID(), jti, now, expires),
+		ClientID:         client.ID(),
 		Scope:            joinScopes(scopes),
 	}
 	accessTokenString, err := s.key.signAccess(access)
