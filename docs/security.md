@@ -21,7 +21,10 @@
   probed.
 - **Persistent signing key**: with `IDP_KEY_DIR` set, the RSA key is
   generated once (mode 0600, temp-file + rename) and reloaded on restart,
-  so tokens survive restarts and the JWKS stays stable.
+  so tokens survive restarts and the JWKS stays stable. Staged rotation
+  (`minidp rotate-keys`) publishes old and new keys simultaneously — tokens
+  minted before a rotation verify until the retiring key's retention
+  horizon — and token verification fails closed on unknown `kid`s.
 - **Single-use authorization codes** (10 min TTL) and **single-use refresh
   tokens** with rotation. Replay is rejected, and replaying a rotated token
   revokes the whole token family of that authorization (RFC 9700 §4.14.2).

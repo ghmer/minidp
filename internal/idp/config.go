@@ -164,6 +164,8 @@ func envOr(key, def string) string {
 	return def
 }
 
+// envDurationSeconds reads an integer env value as seconds, returning the
+// default when the variable is unset.
 func envDurationSeconds(key string, def int) (time.Duration, error) {
 	n, err := envInt(key, def)
 	if err != nil {
@@ -189,4 +191,28 @@ func envInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid %s %q: must be positive", key, v)
 	}
 	return n, nil
+}
+
+// LoadKeyRetention resolves the retiring-key retention horizon used by key
+// rotation: the value of IDP_KEY_RETENTION in seconds when set, otherwise
+// the sum of the configured access- and refresh-token TTLs plus a
+// five-minute clock-skew margin — the maximum span over which a token
+// signed by a retiring key may still be presented for verification.
+func LoadKeyRetention() (time.Duration, error) {
+	if v := os.Getenv("IDP_KEY_RETENTION"); v != "" {
+		n, err := envInt("IDP_KEY_RETENTION", 0)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(n) * time.Second, nil
+	}
+	access, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
+	if err != nil {
+		return 0, err
+	}
+	refresh, err := envDurationSeconds("IDP_REFRESH_TOKEN_TTL", 7200)
+	if err != nil {
+		return 0, err
+	}
+	return access + refresh + 5*time.Minute, nil
 }

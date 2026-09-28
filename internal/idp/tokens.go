@@ -162,7 +162,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	access := newAccessClaims(
 		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
 		client.ID(), joinScopes(ctx.Scopes), wantProfile, profile)
-	accessTokenString, err := s.key.signAccess(access)
+	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -227,7 +227,7 @@ func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenR
 		ClientID:         client.ID(),
 		Scope:            joinScopes(scopes),
 	}
-	accessTokenString, err := s.key.signAccess(access)
+	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -256,7 +256,7 @@ func (s *Server) issueIDToken(ctx *authContext, audience string, now, expires ti
 	id := newIDClaims(
 		s.registeredClaims(audience, ctx.Sub, idJTI, now, expires),
 		ctx.Nonce, ctx.Family, wantProfile, profile)
-	idTokenString, err := s.key.sign(id)
+	idTokenString, err := s.keys.sign(id)
 	if err != nil {
 		return "", fmt.Errorf("sign id token: %w", err)
 	}

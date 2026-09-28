@@ -43,6 +43,10 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
   own audience) and request them at `/authorize`; granted scopes are
   released in the access token's `scope` claim and advertised in discovery.
 - Refresh token grant with single-use rotation.
+- Staged signing-key rotation (`minidp rotate-keys`): old and new keys are
+  published in the JWKS simultaneously, tokens signed before the rotation
+  stay verifiable until the retiring key's retention horizon passes, and
+  verification fails closed on unknown `kid`s.
 - Machine-to-machine `client_credentials` grant (RFC 6749 §4.4) for
   confidential service clients, with a statically configured scope list
   (`client_credentials_scopes`) and `sub = client_id`; such clients need
@@ -114,7 +118,7 @@ Server settings come from environment variables; everything about the
 clients lives in the clients file. Full tables and the list of removed
 variables are in **[docs/configuration.md](docs/configuration.md)** — key
 ones: `IDP_ISSUER`, `IDP_CLIENTS_FILE` (required), `IDP_ACCESS_TOKEN_TTL`,
-`IDP_REFRESH_TOKEN_TTL`, `IDP_KEY_DIR` / `IDP_RSA_PEM`, `TRUSTED_PROXIES`,
+`IDP_REFRESH_TOKEN_TTL`, `IDP_KEY_DIR` / `IDP_RSA_PEM`, `IDP_KEY_RETENTION`, `TRUSTED_PROXIES`,
 `IDP_LOGIN_RATE_LIMIT`, `IDP_TITLE`, `IDP_SUBTITLE`.
 
 Managing clients and accounts — profiles, secrets, redirect policies, the

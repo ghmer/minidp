@@ -67,5 +67,5 @@ func (s *Server) scopesSupported() []string {
 // Resource servers verify access-token signatures against this key set.
 func (s *Server) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(s.key.JWKS())
+	_, _ = w.Write(s.keys.JWKS())
 }

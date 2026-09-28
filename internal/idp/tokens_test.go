@@ -30,9 +30,7 @@ func newTestServer(t *testing.T) *Server {
 
 func parseWithServer(t *testing.T, srv *Server, tokenString string) jwt.MapClaims {
 	t.Helper()
-	parsed, err := jwt.Parse(tokenString, func(*jwt.Token) (any, error) {
-		return &srv.key.key.PublicKey, nil
-	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithExpirationRequired())
+	parsed, err := jwt.Parse(tokenString, srv.keys.verifyKey, jwt.WithValidMethods([]string{"RS256"}), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		t.Fatalf("token did not verify: %v", err)
 	}
@@ -301,9 +299,9 @@ func signedTestToken(t *testing.T, srv *Server, claims jwt.MapClaims, access boo
 	var err error
 	var signed string
 	if access {
-		signed, err = srv.key.signAccess(claims)
+		signed, err = srv.keys.signAccess(claims)
 	} else {
-		signed, err = srv.key.sign(claims)
+		signed, err = srv.keys.sign(claims)
 	}
 	if err != nil {
 		t.Fatalf("sign: %v", err)

@@ -300,8 +300,8 @@ func TestJWKSEndpoint(t *testing.T) {
 	if key["kty"] != "RSA" || key["alg"] != "RS256" || key["use"] != "sig" {
 		t.Errorf("unexpected JWK: %v", key)
 	}
-	if key["kid"] != srv.key.kid {
-		t.Errorf("kid = %v, want %q", key["kid"], srv.key.kid)
+	if key["kid"] != srv.keys.active.kid {
+		t.Errorf("kid = %v, want %q", key["kid"], srv.keys.active.kid)
 	}
 }
 
@@ -976,7 +976,7 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 		"iat": time.Now().Unix(),
 		"jti": "foreign-aud-jti",
 	}
-	signed, err := srv.key.signAccess(foreign)
+	signed, err := srv.keys.signAccess(foreign)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -1157,7 +1157,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 		"iat": time.Now().Unix(),
 		"sid": realSID,
 	}
-	hint, err := srv.key.sign(foreign)
+	hint, err := srv.keys.sign(foreign)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 		"iat": time.Now().Add(-time.Hour).Unix(),
 		"sid": realSID,
 	}
-	hint2, err := srv.key.sign(expired)
+	hint2, err := srv.keys.sign(expired)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}

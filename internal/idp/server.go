@@ -32,7 +32,7 @@ type subject struct {
 // Server is the in-memory OIDC provider.
 type Server struct {
 	cfg            Config
-	key            *signingKey
+	keys           *keySet
 	store          *store
 	template       *loginTemplate
 	csrf           *csrfManager
@@ -41,10 +41,10 @@ type Server struct {
 	allowedOrigins map[string]bool
 }
 
-// New constructs a Server, resolving the signing key, the registered clients
-// (each with its own accounts), and compiling the login template.
+// New constructs a Server, resolving the signing material, the registered
+// clients (each with its own accounts), and compiling the login template.
 func New(cfg Config) (*Server, error) {
-	key, err := NewSigningKey(cfg.RSAPeM, cfg.KeyDir)
+	keys, err := NewSigningKeySet(cfg.RSAPeM, cfg.KeyDir)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{
 		cfg:            cfg,
-		key:            key,
+		keys:           keys,
 		store:          newStore(),
 		template:       tmpl,
 		csrf:           newCSRFManager(csrfSecret, 15*time.Minute),
@@ -74,6 +74,8 @@ func New(cfg Config) (*Server, error) {
 		"issuer", cfg.Issuer,
 		"clients", strings.Join(clients.clientIDs(), ", "),
 		"users", clients.userCount(),
+		"publishedKeys", len(keys.published),
+		"activeKid", keys.active.kid,
 		"accessTTL", cfg.AccessTokenTTL,
 		"refreshTTL", cfg.RefreshTokenTTL,
 		"loginRateLimit", cfg.LoginRateLimit,

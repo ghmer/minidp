@@ -815,9 +815,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 // audience of one of the registered clients, so tokens minted for any other
 // audience are rejected at the resource endpoints (review finding H4).
 func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt.MapClaims, error) {
-	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
-		return &s.key.key.PublicKey, nil
-	},
+	token, err := jwt.Parse(tokenString, s.keys.verifyKey,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(s.cfg.Issuer),
 		jwt.WithExpirationRequired(),
@@ -860,9 +858,7 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 // provider has to honour (review finding F4). The registered-claims
 // validation is disabled and issuer/audience are checked manually instead.
 func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient, error) {
-	token, err := jwt.Parse(hint, func(t *jwt.Token) (any, error) {
-		return &s.key.key.PublicKey, nil
-	},
+	token, err := jwt.Parse(hint, s.keys.verifyKey,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithoutClaimsValidation(), // expiry is intentionally not enforced
 	)

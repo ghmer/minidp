@@ -60,17 +60,33 @@ Worth knowing up front:
 
 ## Key management & rotation
 
-The signing key is identified by a stable `kid` (`minidp-1`) published in
-the JWKS. To rotate:
+The signing key is identified by a stable `kid` published in the JWKS. A
+key directory without a rotation history (`keyring.json`) keeps the classic
+layout: one persisted key (`minidp-rsa.pem`) with the `kid` `minidp-1`.
 
-1. Put a new RSA key next to the old one (a second file in the key volume,
-   or a new Secret).
-2. Point `IDP_RSA_PEM` at the new key and restart minidp. All previously
-   issued tokens become invalid — users log in again; refresh tokens in
-   flight are rejected and the SPA falls back to a fresh authorization
-   request.
-3. Zero-downtime dual-key JWKS (old + new key published simultaneously) is
-   out of scope for a demo IdP.
+For a staged, zero-downtime rotation:
 
-Keep the key file mode `0600` and never commit it — treat it like the
-credential it is.
+1. Run `minidp rotate-keys` with `IDP_KEY_DIR` set. It marks the currently
+   active key as *retiring* (still published in the JWKS, so tokens signed
+   before the rotation verify until they expire), generates a fresh RSA-2048
+   key with an RFC 7638 thumbprint `kid`, writes it as
+   `minidp-rsa-<kid>.pem`, and persists the keyring document
+   (`keyring.json`, mode 0600).
+2. Restart minidp: it loads the new active key and publishes both keys in
+   the JWKS. New tokens are minted by the new key; the retiring key remains
+   published for verification.
+3. The retiring key is removed at the next start after its retention
+   horizon: `IDP_KEY_RETENTION` (seconds), defaulting to the sum of the
+   configured access- and refresh-token TTLs plus a five-minute clock-skew
+   margin — the maximum span over which a token signed by the retiring key
+   can still be presented.
+
+Verification is kid-driven: resource endpoints select the published key
+matching a token's `kid` header and fail closed on unknown or missing kids.
+
+The alternative to staged rotation stays available: point `IDP_RSA_PEM` at
+a new key and restart minidp — all previously issued tokens become invalid
+immediately and users log in again.
+
+Keep key files and the keyring mode `0600` and never commit them — treat
+them like the credentials they are.
