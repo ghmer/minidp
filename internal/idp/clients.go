@@ -453,39 +453,61 @@ func validateResourceRegistry(resources []ResourceDefinition, clients []Client) 
 			return fmt.Errorf("%w %q", errDuplicateResAudience, res.Audience)
 		}
 		seenAudience[res.Audience] = true
-		if len(res.AppRoles) == 0 {
-			return fmt.Errorf("resource %q: %w", res.Audience, errAppRolesRequired)
-		}
-		defined := make(map[string]bool, len(res.AppRoles))
-		for _, role := range res.AppRoles {
-			if role == "" || strings.ContainsAny(role, " \t\r\n") {
-				return fmt.Errorf("resource %q: app role %q: %w", res.Audience, role, errFreeOfWhitespace)
-			}
-			if defined[role] {
-				return fmt.Errorf("resource %q: %w %q", res.Audience, errDuplicateAppRole, role)
-			}
-			defined[role] = true
+		defined, err := validateResourceRoles(res)
+		if err != nil {
+			return err
 		}
 		roles[res.Audience] = defined
 	}
 	for i := range clients {
 		c := &clients[i]
-		defined, hasRegistry := roles[c.audience()]
-		if !hasRegistry {
-			continue
+		if err := validateClientRolesAgainstRegistry(c, roles); err != nil {
+			return err
 		}
-		for _, role := range c.ClientCredentialsRoles {
+	}
+	return nil
+}
+
+// validateResourceRoles validates one resource's app-role list: at least one
+// role, every entry whitespace-free and unique. It returns the defined role
+// set for the resource's audience.
+func validateResourceRoles(res ResourceDefinition) (map[string]bool, error) {
+	if len(res.AppRoles) == 0 {
+		return nil, fmt.Errorf("resource %q: %w", res.Audience, errAppRolesRequired)
+	}
+	defined := make(map[string]bool, len(res.AppRoles))
+	for _, role := range res.AppRoles {
+		if role == "" || strings.ContainsAny(role, " \t\r\n") {
+			return nil, fmt.Errorf("resource %q: app role %q: %w", res.Audience, role, errFreeOfWhitespace)
+		}
+		if defined[role] {
+			return nil, fmt.Errorf("resource %q: %w %q", res.Audience, errDuplicateAppRole, role)
+		}
+		defined[role] = true
+	}
+	return defined, nil
+}
+
+// validateClientRolesAgainstRegistry checks one client's client_credentials
+// roles and its users' role assignments against the defined role set of the
+// audience the client targets. Audiences without a definition impose no
+// constraint.
+func validateClientRolesAgainstRegistry(c *Client, roles map[string]map[string]bool) error {
+	defined, hasRegistry := roles[c.audience()]
+	if !hasRegistry {
+		return nil
+	}
+	for _, role := range c.ClientCredentialsRoles {
+		if !defined[role] {
+			return fmt.Errorf("client %q: client_credentials role %q %w %q",
+				c.ClientID, role, errCCRoleNotDefined, c.audience())
+		}
+	}
+	for _, u := range c.Users {
+		for _, role := range u.Roles {
 			if !defined[role] {
-				return fmt.Errorf("client %q: client_credentials role %q %w %q",
-					c.ClientID, role, errCCRoleNotDefined, c.audience())
-			}
-		}
-		for _, u := range c.Users {
-			for _, role := range u.Roles {
-				if !defined[role] {
-					return fmt.Errorf("client %q: user %q holds role %q, %w %q",
-						c.ClientID, u.Username, role, errUserRoleNotDefined, c.audience())
-				}
+				return fmt.Errorf("client %q: user %q holds role %q, %w %q",
+					c.ClientID, u.Username, role, errUserRoleNotDefined, c.audience())
 			}
 		}
 	}

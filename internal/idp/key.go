@@ -149,6 +149,25 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 		return nil, err
 	}
 
+	kept, err := pruneRetiredKeys(root, dir, ring)
+	if err != nil {
+		return nil, err
+	}
+	set, err := loadPublishedKeys(dir, kept)
+	if err != nil {
+		return nil, err
+	}
+	if set.active == nil {
+		return nil, fmt.Errorf("keyring %q %w", keyRingPath(dir), errKeyringNoActiveKey)
+	}
+	return set, nil
+}
+
+// pruneRetiredKeys validates the ring entries and drops retiring entries whose
+// retention horizon has passed: their key files are removed and the entries
+// dropped, so the JWKS only publishes keys that can still be referenced by
+// unexpired tokens.
+func pruneRetiredKeys(root *os.Root, dir string, ring *keyringFile) ([]keyringEntry, error) {
 	now := time.Now()
 	kept := make([]keyringEntry, 0, len(ring.Keys))
 	byKid := make(map[string]bool, len(ring.Keys))
@@ -176,7 +195,12 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 	if len(kept) == 0 {
 		return nil, fmt.Errorf("keyring %q %w", filepath.Join(dir, keyRingFileName), errKeyringContainsNoKeys)
 	}
+	return kept, nil
+}
 
+// loadPublishedKeys loads the PEM material for the kept entries and assembles
+// the published key set with its active key.
+func loadPublishedKeys(dir string, kept []keyringEntry) (*keySet, error) {
 	set := &keySet{published: make([]*signingKey, 0, len(kept))}
 	for _, entry := range kept {
 		k, err := loadSigningKey(filepath.Join(dir, entry.File))
@@ -205,9 +229,6 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 			set.active = k
 		}
 		set.published = append(set.published, k)
-	}
-	if set.active == nil {
-		return nil, fmt.Errorf("keyring %q %w", keyRingPath(dir), errKeyringNoActiveKey)
 	}
 	return set, nil
 }
