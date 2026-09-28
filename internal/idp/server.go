@@ -186,7 +186,7 @@ func (s *Server) authenticate(client *registeredClient, username, password strin
 // is walked from right to left and the rightmost entry NOT belonging to a
 // trusted proxy is used: standard proxies append the real client address, so
 // an attacker-supplied leftmost entry ("X-Forwarded-For: <random>, <real>")
-// can neither select nor rotate the rate-limit key. X-Real-IP is honoured only
+// can neither select nor rotate the rate-limit key. X-Real-IP is honored only
 // when X-Forwarded-For is absent (proxies that set it overwrite the header).
 // Without a trusted proxy, the socket address itself is used.
 func (s *Server) clientIP(r *http.Request) string {

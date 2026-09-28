@@ -160,7 +160,7 @@ func validatePrompt(q url.Values) (code, description string) {
 	switch p := q.Get("prompt"); p {
 	case "":
 	case "login":
-		// Matches the actual behaviour: the login form is always rendered.
+		// Matches the actual behavior: the login form is always rendered.
 	case "none":
 		// No browser session is ever kept, so interaction is always required;
 		// answering login_required is the OIDC-correct response.
@@ -301,7 +301,7 @@ func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status 
 			}
 			// Secure is set unconditionally: minidp is deployed either on
 			// https (TLS-terminating proxy) or on plain-HTTP localhost, where
-			// Chrome and Firefox honour the "potentially trustworthy origin"
+			// Chrome and Firefox honor the "potentially trustworthy origin"
 			// exception (W3C Secure Contexts). Safari implements no localhost
 			// exception — use Chrome/Firefox or TLS there.
 			http.SetCookie(w, &http.Cookie{
@@ -622,7 +622,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 // client_credentials_scopes), and no id_token or refresh token is issued.
 //
 // RFC 6749 §4.4.2 allows the client to send a scope parameter, and minidp
-// honours it only within the statically configured permissions — there is
+// honors it only within the statically configured permissions — there is
 // no login or consent step that could approve a runtime request. An absent
 // parameter and the audience's .default form (Entra ID semantics) grant the
 // full configured list, an exact configured entry grants that permission
@@ -819,7 +819,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 // this IdP: RS256 only, the configured issuer, a required expiry and the RFC
 // 9068 "at+jwt" typ header — an id_token (typ JWT) is never accepted as a
 // bearer access token (review finding H3). The jti revocation denylist is
-// always honoured. When requireAudience is true the token must carry the
+// always honored. When requireAudience is true the token must carry the
 // audience of one of the registered clients, so tokens minted for any other
 // audience are rejected at the resource endpoints (review finding H4).
 func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt.MapClaims, error) {
@@ -863,7 +863,7 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 // identifies the token family to revoke — so expiry is deliberately not
 // enforced here (review finding M6). The audience is, however, checked: a
 // signed id_token minted for a different audience is not a logout hint this
-// provider has to honour (review finding F4). The registered-claims
+// provider has to honor (review finding F4). The registered-claims
 // validation is disabled and issuer/audience are checked manually instead.
 func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient, error) {
 	token, err := jwt.Parse(hint, s.keys.verifyKey,
@@ -967,7 +967,7 @@ func insufficientScope(w http.ResponseWriter) {
 // access token. The token must carry the configured audience, the access
 // token profile (typ at+jwt) and the openid scope; profile claims are
 // released according to the granted scopes and resolved from the users-file
-// record — never synthesised (review findings H3/H4/M2/L2). `name` is
+// record — never synthesized (review findings H3/H4/M2/L2). `name` is
 // emitted alongside preferred_username so the response matches the
 // claims_supported advertised by discovery (review finding F3).
 func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
@@ -1098,7 +1098,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleEndSession implements a minimal logout. A post_logout_redirect_uri is
-// honoured only when it exactly matches an entry of the redirecting client's
+// honored only when it exactly matches an entry of the redirecting client's
 // post_logout_redirect_uris allowlist, and the redirect always targets the
 // allowlist entry itself — never the user-supplied string — so the endpoint
 // cannot be abused for open redirects (gosec G710). The client is resolved

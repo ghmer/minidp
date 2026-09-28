@@ -504,7 +504,7 @@ func TestAuthorizeRejectsUnsupportedOIDCParams(t *testing.T) {
 	}
 }
 
-// TestAuthorizePromptNoneReturnsLoginRequired pins the OIDC behaviour for
+// TestAuthorizePromptNoneReturnsLoginRequired pins the OIDC behavior for
 // prompt=none: minidp keeps no browser session, so the correct answer is the
 // login_required error redirect, not a login page.
 func TestAuthorizePromptNoneReturnsLoginRequired(t *testing.T) {
@@ -819,7 +819,7 @@ func TestTokenGrantRequiresClientIDAndRedirect(t *testing.T) {
 	}
 }
 
-// TestRefreshReuseRevokesWholeFamily drives the RFC 9700 §4.14.2 behaviour
+// TestRefreshReuseRevokesWholeFamily drives the RFC 9700 §4.14.2 behavior
 // end-to-end: replaying a rotated refresh token must invalidate every token
 // derived from the same authorization, not just fail.
 func TestRefreshReuseRevokesWholeFamily(t *testing.T) {
@@ -1148,7 +1148,7 @@ func TestEndSessionRevokesTokenFamily(t *testing.T) {
 // audience does not match this provider is rejected, so a signed token minted
 // for a DIFFERENT client cannot revoke a session here — even when it names a
 // live family via sid. A hint with the right audience but a stale exp is still
-// honoured (M6): expiry does not disqualify a logout hint.
+// honored (M6): expiry does not disqualify a logout hint.
 func TestEndSessionHintValidatesAudience(t *testing.T) {
 	ts, srv := testIDP(t, nil)
 	verifier, _ := pkcePair()
@@ -1869,7 +1869,7 @@ func TestClientIPResistsSpoofedXFF(t *testing.T) {
 		t.Errorf("XFF present: clientIP = %q, want 198.51.100.23 (X-Real-IP must be ignored)", got)
 	}
 
-	// X-Real-IP is honoured only when XFF is absent.
+	// X-Real-IP is honored only when XFF is absent.
 	r4 := httptest.NewRequest(http.MethodPost, "/authorize", nil)
 	r4.RemoteAddr = "10.1.2.3:5555"
 	r4.Header.Set("X-Real-IP", "198.51.100.23")

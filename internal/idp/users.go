@@ -92,7 +92,7 @@ func newDummyHash(cost int) string {
 	h, err := bcrypt.GenerateFromPassword([]byte("minidp-timing-equalizer-dummy"), cost)
 	if err != nil {
 		// Cannot happen for a fixed plaintext and valid cost; fail loudly.
-		panic(fmt.Sprintf("generate timing-equalisation dummy hash: %v", err))
+		panic(fmt.Sprintf("generate timing-equalization dummy hash: %v", err))
 	}
 	return string(h)
 }

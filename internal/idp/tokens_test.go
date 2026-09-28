@@ -281,7 +281,7 @@ func TestIssueTokensReleasesClaimsByScope(t *testing.T) {
 	}
 }
 
-// TestIssueTokensReleasesRoles pins the roles behaviour: a users-file record
+// TestIssueTokensReleasesRoles pins the roles behavior: a users-file record
 // with roles gets the roles array claim on both the access and the ID token,
 // independent of the granted scopes, while a user without roles gets no roles
 // claim at all.

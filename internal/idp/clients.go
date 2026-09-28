@@ -47,7 +47,7 @@ type Client struct {
 	// or confidential (client authentication with the secret).
 	Type ClientType `json:"type"`
 	// ClientSecret is the credential of a confidential client, compared in
-	// constant time at /token and honoured by /introspect and /revoke. It
+	// constant time at /token and honored by /introspect and /revoke. It
 	// must be empty for public clients.
 	ClientSecret string `json:"client_secret,omitempty"`
 	// Audience is the "aud" value written into the client's tokens. It
@@ -82,7 +82,7 @@ type Client struct {
 	// the client's audience, must be a subset of that registry.
 	ClientCredentialsRoles []string `json:"client_credentials_roles,omitempty"`
 	// RedirectURIs are the registered authorization-response targets. The
-	// policy is mandatory; requests are honoured only for these exact values.
+	// policy is mandatory; requests are honored only for these exact values.
 	RedirectURIs []string `json:"redirect_uris"`
 	// PostLogoutRedirectURIs are the targets /end_session may redirect to
 	// after a logout. Optional: with no entries, logout renders a
@@ -354,7 +354,7 @@ func (c Client) audience() string {
 // validateAbsoluteHTTPURL enforces the shape every registered URL must have:
 // an absolute http(s) URL with a host and no fragment. Allowlist comparisons
 // are plain string equality, so a malformed entry could otherwise never be
-// honoured (or worse, be honoured for a different URL than intended).
+// honored (or worse, be honored for a different URL than intended).
 func validateAbsoluteHTTPURL(raw, what string) (string, error) {
 	r := strings.TrimSpace(raw)
 	if r == "" {
@@ -680,7 +680,7 @@ func LoadClients(path string) (*clientRegistry, error) {
 }
 
 // newClientRegistry indexes validated client entries. It derives each
-// client's user store (with per-client timing equalisation) and the
+// client's user store (with per-client timing equalization) and the
 // provider-wide union sets.
 func newClientRegistry(clients []Client) (*clientRegistry, error) {
 	if len(clients) == 0 {
@@ -823,7 +823,7 @@ type staticUserStore struct {
 }
 
 // newStaticUserStore indexes one client's users and derives the timing
-// equalisation hash from the accounts' own bcrypt cost.
+// equalization hash from the accounts' own bcrypt cost.
 func newStaticUserStore(users []User) *staticUserStore {
 	cost := bcrypt.DefaultCost
 	if len(users) > 0 {
@@ -848,5 +848,5 @@ func (s *staticUserStore) Lookup(username string) (User, bool) {
 // Count returns the number of accounts.
 func (s *staticUserStore) Count() int { return len(s.byName) }
 
-// DummyHash returns the timing-equalisation hash (cost derived at load time).
+// DummyHash returns the timing-equalization hash (cost derived at load time).
 func (s *staticUserStore) DummyHash() string { return s.dummyHash }
