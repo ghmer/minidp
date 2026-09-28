@@ -12,6 +12,7 @@ import (
 // (client, redirect URI, PKCE challenge, nonce, scopes, subject) that it belongs
 // to so it can be redeemed at the token endpoint.
 type authCode struct {
+	ExpiresAt           time.Time
 	Sub                 string
 	ClientID            string
 	RedirectURI         string
@@ -19,7 +20,6 @@ type authCode struct {
 	CodeChallengeMethod string
 	Nonce               string
 	Scopes              []string
-	ExpiresAt           time.Time
 }
 
 // refreshEntry is a stored refresh token bound to its subject, client, scopes
@@ -28,12 +28,12 @@ type authCode struct {
 // authorization so that a detected reuse (RFC 9700 §4.14.2) can revoke the
 // whole chain at once.
 type refreshEntry struct {
+	ExpiresAt time.Time
 	Sub       string
 	ClientID  string
-	Scopes    []string
 	Nonce     string
 	Family    string
-	ExpiresAt time.Time
+	Scopes    []string
 }
 
 // store is an in-memory, concurrency-safe registry of authorization codes and
@@ -41,11 +41,10 @@ type refreshEntry struct {
 // therefore lost on restart, which is acceptable for a development IdP. Swap the
 // maps below for a database for production use.
 type store struct {
-	mu      sync.Mutex
 	codes   map[string]*authCode
 	refresh map[string]*refreshEntry
 	// usedRefresh remembers consumed refresh tokens until their original
-	// expiry so a replayed (stolen) token can be recognised and its entire
+	// expiry so a replayed (stolen) token can be recognized and its entire
 	// family revoked instead of merely failing (RFC 9700 §4.14.2).
 	usedRefresh map[string]*refreshEntry
 	// accessJTI registers issued access tokens (jti -> sub/family/exp). The
@@ -55,13 +54,14 @@ type store struct {
 	// deniedJTI is the revocation denylist: jti -> denial expiry. Denied
 	// tokens fail verification until their natural expiry.
 	deniedJTI map[string]time.Time
+	mu        sync.Mutex
 }
 
 // jtiRecord tracks one issued access token.
 type jtiRecord struct {
+	exp    time.Time
 	sub    string
 	family string
-	exp    time.Time
 }
 
 func newStore() *store {

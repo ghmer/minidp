@@ -77,10 +77,10 @@ func readAssetOverride(name string) ([]byte, error) {
 // assets.
 type loginTemplate struct {
 	tmpl     *template.Template
-	css      []byte
-	logo     []byte
 	title    string
 	subtitle string
+	css      []byte
+	logo     []byte
 }
 
 // loginField is one hidden <input> that carries an OAuth2 parameter from the
@@ -100,12 +100,12 @@ type loginData struct {
 	Error string
 	// Username is pre-filled after a failed attempt (never the password).
 	Username string
-	// Hidden carries the OAuth2 parameters echoed back into the form.
-	Hidden []loginField
 	// CSRFToken is the signed form token; rendered as a hidden input.
 	CSRFToken string
 	// Message, when set, replaces the form (e.g. "Signed in as alice").
 	Message string
+	// Hidden carries the OAuth2 parameters echoed back into the form.
+	Hidden []loginField
 }
 
 func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {

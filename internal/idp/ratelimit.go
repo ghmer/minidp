@@ -10,15 +10,15 @@ import (
 // adding any external dependency. Buckets start full (burst == perMinute) and
 // refill continuously; idle buckets are swept lazily.
 type loginLimiter struct {
-	mu        sync.Mutex
+	lastSweep time.Time
 	buckets   map[string]*bucket
 	perMinute int
-	lastSweep time.Time
+	mu        sync.Mutex
 }
 
 type bucket struct {
-	tokens float64
 	last   time.Time
+	tokens float64
 }
 
 // newLimiter returns a limiter allowing perMinute attempts per IP. A

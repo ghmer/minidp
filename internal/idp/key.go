@@ -43,11 +43,11 @@ const (
 // keyringEntry is one entry of the persisted keyring: a PEM file inside the
 // key directory, its published kid and its lifecycle state.
 type keyringEntry struct {
+	CreatedAt time.Time `json:"created_at"`
+	RetireAt  time.Time `json:"retire_at"`
 	KID       string    `json:"kid"`
 	File      string    `json:"file"`
-	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
-	RetireAt  time.Time `json:"retire_at"`
 }
 
 // keyringFile is the on-disk keyring document (keyring.json inside
@@ -138,9 +138,9 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 	if os.IsNotExist(err) {
 		// No keyring document: the legacy (pre-rotation) layout of exactly
 		// one persisted key with the fixed kid.
-		k, err := persistentSigningKey(dir)
-		if err != nil {
-			return nil, err
+		k, perr := persistentSigningKey(dir)
+		if perr != nil {
+			return nil, perr
 		}
 		return keySetOf(k), nil
 	}
@@ -260,8 +260,8 @@ func persistentSigningKey(keyDir string) (*signingKey, error) {
 			// Another instance is generating right now (or a crashed start
 			// left the temp file behind): wait for the final key, or take
 			// over a stale temp file once. Either way, retry the round.
-			if err := waitForPeerKey(root, dir, tmpName, path, attempt); err != nil {
-				return nil, err
+			if werr := waitForPeerKey(root, dir, tmpName, path, attempt); werr != nil {
+				return nil, werr
 			}
 			continue
 		}

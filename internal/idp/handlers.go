@@ -931,8 +931,8 @@ func (s *Server) requireClientAuth(w http.ResponseWriter, r *http.Request) bool 
 		return true
 	}
 	if id, pw, ok := r.BasicAuth(); ok {
-		if id, err := url.QueryUnescape(id); err == nil {
-			if client := s.clients.lookup(id); client != nil && client.Confidential() &&
+		if rawID, err := url.QueryUnescape(id); err == nil {
+			if client := s.clients.lookup(rawID); client != nil && client.Confidential() &&
 				constantTimeEqual(pw, client.secret()) {
 				return true
 			}

@@ -17,9 +17,9 @@ import (
 type authContext struct {
 	Sub      string
 	ClientID string
-	Scopes   []string
 	Nonce    string
 	Family   string
+	Scopes   []string
 }
 
 // subject identifies the authenticated user carried through to token
@@ -32,7 +32,6 @@ type subject struct {
 
 // Server is the in-memory OIDC provider.
 type Server struct {
-	cfg            Config
 	keys           *keySet
 	store          *store
 	template       *loginTemplate
@@ -40,6 +39,7 @@ type Server struct {
 	limiter        *loginLimiter
 	clients        *clientRegistry
 	allowedOrigins map[string]bool
+	cfg            Config
 }
 
 // New constructs a Server, resolving the signing material, the registered

@@ -18,8 +18,8 @@ type tokenResponse struct {
 	IDToken      string `json:"id_token,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
 	Scope        string `json:"scope,omitempty"`
+	ExpiresIn    int    `json:"expires_in"`
 }
 
 // accessClaims are the claims embedded in the issued access token. client_id
@@ -51,8 +51,8 @@ type idClaims struct {
 	Email             string   `json:"email,omitempty"`
 	Name              string   `json:"name,omitempty"`
 	PreferredUsername string   `json:"preferred_username,omitempty"`
-	Roles             []string `json:"roles,omitempty"`
 	SessionID         string   `json:"sid,omitempty"`
+	Roles             []string `json:"roles,omitempty"`
 }
 
 // profileData is the scope-gated profile information released into tokens.

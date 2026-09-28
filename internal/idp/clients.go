@@ -551,11 +551,11 @@ func SaveClientsFile(path string, file *ClientsFile) error {
 
 // registeredClient is a validated client entry with its resolved user store.
 type registeredClient struct {
-	client Client
-	users  UserStore
+	users UserStore
 	// explicitOrigins are the client's own CORS origin entries, normalised
 	// (trailing slash stripped) for comparison against request origins.
 	explicitOrigins map[string]bool
+	client          Client
 }
 
 // ID returns the client's OAuth client identifier.
@@ -640,7 +640,6 @@ func constantTimeEqual(a, b string) bool {
 // authentication methods).
 type clientRegistry struct {
 	byID map[string]*registeredClient
-	ids  []string
 	// redirects and logoutRedirects hold the per-client allowlists keyed by
 	// client id, so the redirect-target selection at the HTTP layer resolves
 	// them from the server's own registry (never through a request-derived
@@ -650,6 +649,7 @@ type clientRegistry struct {
 	logoutRedirects map[string][]string
 	audiences       map[string]bool
 	origins         map[string]bool
+	ids             []string
 	hasConfidential bool
 }
 

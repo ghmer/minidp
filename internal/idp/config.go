@@ -41,10 +41,6 @@ type Config struct {
 	// the single-client environment variables of earlier versions were
 	// removed.
 	ClientsFile string
-	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
-	AccessTokenTTL time.Duration
-	// RefreshTokenTTL is how long a refresh_token stays valid.
-	RefreshTokenTTL time.Duration
 	// Title / Subtitle are rendered on the login form.
 	Title    string
 	Subtitle string
@@ -58,10 +54,14 @@ type Config struct {
 	// tokens stay valid across restarts and replicas.
 	KeyDir string
 	// TrustedProxies is a list of CIDR ranges (TRUSTED_PROXIES) whose
-	// X-Forwarded-For header is honoured when resolving the client IP for rate
+	// X-Forwarded-For header is honored when resolving the client IP for rate
 	// limiting and audit logs. Empty means: trust no proxy, use the socket
 	// address.
 	TrustedProxies []string
+	// AccessTokenTTL is how long an access_token (and id_token) stays valid.
+	AccessTokenTTL time.Duration
+	// RefreshTokenTTL is how long a refresh_token stays valid.
+	RefreshTokenTTL time.Duration
 	// LoginRateLimit is the number of login attempts (POST /authorize and
 	// POST /login) allowed per minute and client IP.
 	LoginRateLimit int
@@ -72,6 +72,9 @@ type Config struct {
 // weaken security (no clients file, removed single-client or single-user
 // variables, unreadable key material, invalid proxy CIDRs).
 func LoadConfig() (Config, error) {
+	if err := rejectRemovedVariables(); err != nil {
+		return Config{}, err
+	}
 	accessTokenTTL, err := envDurationSeconds("IDP_ACCESS_TOKEN_TTL", 3600)
 	if err != nil {
 		return Config{}, err
@@ -82,9 +85,6 @@ func LoadConfig() (Config, error) {
 	}
 	loginRateLimit, err := envInt("IDP_LOGIN_RATE_LIMIT", 20)
 	if err != nil {
-		return Config{}, err
-	}
-	if err := rejectRemovedVariables(); err != nil {
 		return Config{}, err
 	}
 	cfg := Config{
