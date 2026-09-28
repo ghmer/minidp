@@ -141,7 +141,7 @@ func parseTrustedProxies(raw string) ([]string, error) {
 		return nil, nil
 	}
 	var out []string
-	for _, cidr := range strings.Split(raw, ",") {
+	for cidr := range strings.SplitSeq(raw, ",") {
 		cidr = strings.TrimSpace(cidr)
 		if cidr == "" {
 			continue

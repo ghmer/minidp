@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -89,13 +90,13 @@ func profileFor(store UserStore, sub string, wantProfile, wantEmail bool) profil
 // timestamps including nbf (Entra ID always emits it).
 func (s *Server) registeredClaims(audience, sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
 	return jwt.RegisteredClaims{
-		Issuer:     s.cfg.Issuer,
-		Subject:    sub,
-		Audience:   jwt.ClaimStrings{audience},
-		ExpiresAt:  jwt.NewNumericDate(expires),
-		NotBefore:  jwt.NewNumericDate(now),
-		IssuedAt:   jwt.NewNumericDate(now),
-		ID:         jti,
+		Issuer:    s.cfg.Issuer,
+		Subject:   sub,
+		Audience:  jwt.ClaimStrings{audience},
+		ExpiresAt: jwt.NewNumericDate(expires),
+		NotBefore: jwt.NewNumericDate(now),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ID:        jti,
 	}
 }
 
@@ -321,10 +322,5 @@ func joinScopes(scopes []string) string {
 }
 
 func hasScope(scopes []string, want string) bool {
-	for _, sc := range scopes {
-		if sc == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, want)
 }

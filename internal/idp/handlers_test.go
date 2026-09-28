@@ -1775,7 +1775,7 @@ func TestRateLimitIgnoresCSRFJunk(t *testing.T) {
 	ts, _ := testIDP(t, func(c *Config) { c.LoginRateLimit = 2 })
 	verifier, _ := pkcePair()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		form := authorizeForm(verifier)
 		form.Set("username", "demo")
 		form.Set("password", "demo-password")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -127,12 +128,7 @@ func (c Client) grants() []string {
 // AllowsGrant reports whether the client may use the given OAuth2 grant at
 // the token endpoint.
 func (c Client) AllowsGrant(grant string) bool {
-	for _, g := range c.grants() {
-		if g == grant {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.grants(), grant)
 }
 
 // Interactive reports whether the client participates in the browser-based
@@ -616,12 +612,7 @@ func (rc *registeredClient) resolveClientCredentialsScopes(requested string) ([]
 // delegated scopes. The built-in OIDC scopes are governed by the
 // provider-wide policy, not by this allowlist.
 func (rc *registeredClient) allowsScope(sc string) bool {
-	for _, allowed := range rc.client.AllowedScopes {
-		if allowed == sc {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rc.client.AllowedScopes, sc)
 }
 
 // secret returns the client's credential (empty for public clients).
@@ -634,12 +625,7 @@ func (rc *registeredClient) userCount() int { return rc.users.Count() }
 // this client (exact string comparison; there is deliberately no open
 // fallback).
 func (rc *registeredClient) redirectURIAllowed(raw string) bool {
-	for _, allowed := range rc.client.RedirectURIs {
-		if allowed == raw {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rc.client.RedirectURIs, raw)
 }
 
 // constantTimeEqual compares two strings without leaking where the first

@@ -7,7 +7,7 @@ import (
 
 func TestLimiterAllowsBurstThenBlocks(t *testing.T) {
 	l := newLimiter(3) // burst of 3, refill 3/minute
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !l.allow("1.2.3.4") {
 			t.Fatalf("attempt %d blocked within burst", i+1)
 		}
@@ -38,7 +38,7 @@ func TestLimiterRefillsOverTime(t *testing.T) {
 
 func TestLimiterDisabledWithNonPositiveLimit(t *testing.T) {
 	l := newLimiter(0)
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if !l.allow("1.2.3.4") {
 			t.Fatal("a disabled limiter must allow everything")
 		}

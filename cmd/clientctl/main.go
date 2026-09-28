@@ -217,7 +217,7 @@ func readSecretPrompt(prompt string) ([]byte, error) {
 // result always satisfies the clients-file validation.
 func parseList(value string) []string {
 	var out []string
-	for _, item := range strings.Split(value, ",") {
+	for item := range strings.SplitSeq(value, ",") {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}

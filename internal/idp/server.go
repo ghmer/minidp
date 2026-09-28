@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -215,8 +216,8 @@ func (s *Server) clientIP(r *http.Request) string {
 // for is the socket peer itself (host).
 func (s *Server) forwardedClientIP(xff, host string) string {
 	parts := strings.Split(xff, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		candidate := strings.TrimSpace(parts[i])
+	for _, part := range slices.Backward(parts) {
+		candidate := strings.TrimSpace(part)
 		cIP := net.ParseIP(candidate)
 		if cIP == nil {
 			continue // malformed entry: cannot be the real client, keep walking

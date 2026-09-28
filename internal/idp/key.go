@@ -47,7 +47,7 @@ type keyringEntry struct {
 	File      string    `json:"file"`
 	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
-	RetireAt  time.Time `json:"retire_at,omitempty"`
+	RetireAt  time.Time `json:"retire_at"`
 }
 
 // keyringFile is the on-disk keyring document (keyring.json inside
