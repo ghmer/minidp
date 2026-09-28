@@ -300,8 +300,38 @@ func TestJWKSEndpoint(t *testing.T) {
 	if key["kty"] != "RSA" || key["alg"] != "RS256" || key["use"] != "sig" {
 		t.Errorf("unexpected JWK: %v", key)
 	}
-	if key["kid"] != srv.key.kid {
-		t.Errorf("kid = %v, want %q", key["kid"], srv.key.kid)
+	if key["kid"] != srv.keys.active.kid {
+		t.Errorf("kid = %v, want %q", key["kid"], srv.keys.active.kid)
+	}
+}
+
+// TestReadyz pins the readiness contract: a healthy server answers 200 with
+// the published-key count, while a server without any published signing key
+// answers 503 — unlike the static /healthz liveness probe.
+func TestReadyz(t *testing.T) {
+	ts, srv := testIDP(t, nil)
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	body := decodeJSON(t, resp)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz: status = %d, body = %v", resp.StatusCode, body)
+	}
+	if body["status"] != "ready" {
+		t.Errorf("status = %v, want ready", body["status"])
+	}
+	if body["published_keys"] != float64(len(srv.keys.published)) {
+		t.Errorf("published_keys = %v, want %d", body["published_keys"], len(srv.keys.published))
+	}
+
+	// Degenerate set: no published key means not ready.
+	notReady := &Server{keys: &keySet{}, clients: srv.clients, cfg: srv.cfg}
+	rec := httptest.NewRecorder()
+	notReady.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz without keys: status = %d, want 503", rec.Code)
 	}
 }
 
@@ -976,7 +1006,7 @@ func TestUserinfoEnforcesScopesAndTokenProfile(t *testing.T) {
 		"iat": time.Now().Unix(),
 		"jti": "foreign-aud-jti",
 	}
-	signed, err := srv.key.signAccess(foreign)
+	signed, err := srv.keys.signAccess(foreign)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -1157,7 +1187,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 		"iat": time.Now().Unix(),
 		"sid": realSID,
 	}
-	hint, err := srv.key.sign(foreign)
+	hint, err := srv.keys.sign(foreign)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -1177,7 +1207,7 @@ func TestEndSessionHintValidatesAudience(t *testing.T) {
 		"iat": time.Now().Add(-time.Hour).Unix(),
 		"sid": realSID,
 	}
-	hint2, err := srv.key.sign(expired)
+	hint2, err := srv.keys.sign(expired)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -1227,9 +1257,14 @@ func TestIntrospectRevokeClientAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("introspect with basic auth: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	introspection := decodeJSON(t, resp)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("introspect with basic auth: status = %d, want 200", resp.StatusCode)
+	}
+	// RFC 7662 §2.3: the response names the client the token was issued to.
+	if introspection["client_id"] != testClientID {
+		t.Errorf("introspection client_id = %v, want %q", introspection["client_id"], testClientID)
 	}
 
 	// A client_id/client_secret form pair is accepted as well.

@@ -104,6 +104,54 @@ func TestLoadConfigInvalidNumericEnvFailsFast(t *testing.T) {
 	}
 }
 
+// TestLoadKeyRetention pins the retiring-key retention resolution: an
+// explicit IDP_KEY_RETENTION wins; otherwise the horizon is the sum of the
+// access- and refresh-token TTLs plus a five-minute clock-skew margin.
+func TestLoadKeyRetention(t *testing.T) {
+	t.Run("explicit IDP_KEY_RETENTION wins", func(t *testing.T) {
+		t.Setenv("IDP_KEY_RETENTION", "600")
+		got, err := LoadKeyRetention()
+		if err != nil {
+			t.Fatalf("LoadKeyRetention: %v", err)
+		}
+		if got != 10*time.Minute {
+			t.Errorf("retention = %v, want 10m", got)
+		}
+	})
+	t.Run("default is token TTLs plus skew margin", func(t *testing.T) {
+		got, err := LoadKeyRetention()
+		if err != nil {
+			t.Fatalf("LoadKeyRetention: %v", err)
+		}
+		if want := 3600*time.Second + 7200*time.Second + 5*time.Minute; got != want {
+			t.Errorf("retention = %v, want %v", got, want)
+		}
+	})
+	t.Run("token TTL envs are honoured", func(t *testing.T) {
+		t.Setenv("IDP_ACCESS_TOKEN_TTL", "300")
+		t.Setenv("IDP_REFRESH_TOKEN_TTL", "600")
+		got, err := LoadKeyRetention()
+		if err != nil {
+			t.Fatalf("LoadKeyRetention: %v", err)
+		}
+		if want := 300*time.Second + 600*time.Second + 5*time.Minute; got != want {
+			t.Errorf("retention = %v, want %v", got, want)
+		}
+	})
+	t.Run("invalid value fails fast", func(t *testing.T) {
+		t.Setenv("IDP_KEY_RETENTION", "nope")
+		if _, err := LoadKeyRetention(); err == nil {
+			t.Error("expected a fail-fast error for a non-numeric retention")
+		}
+	})
+	t.Run("non-positive value fails fast", func(t *testing.T) {
+		t.Setenv("IDP_KEY_RETENTION", "0")
+		if _, err := LoadKeyRetention(); err == nil {
+			t.Error("expected a fail-fast error for a zero retention")
+		}
+	})
+}
+
 // TestLoadConfigRejectsRemovedVariables pins the removal of the single-user
 // and single-client variables: they must abort startup loudly instead of
 // being ignored, so an operator cannot believe a silently ignored

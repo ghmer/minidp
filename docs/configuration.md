@@ -13,7 +13,8 @@ exclusively in the clients file (see [Clients and accounts](clients.md)).
 | `IDP_ACCESS_TOKEN_TTL`  | `3600`                  | Access/ID token lifetime in seconds                                          |
 | `IDP_REFRESH_TOKEN_TTL` | `7200`                  | Refresh token lifetime in seconds                                            |
 | `IDP_RSA_PEM`           | *(unset)*               | Path to a PKCS#1/PKCS#8 RSA private key; takes precedence over `IDP_KEY_DIR` |
-| `IDP_KEY_DIR`           | *(unset)*               | Directory for the auto-generated, persisted signing key (`minidp-rsa.pem`)   |
+| `IDP_KEY_DIR`           | *(unset)*               | Directory for the signing material (`minidp-rsa.pem`; after a rotation also `keyring.json` and `minidp-rsa-<kid>.pem` files) |
+| `IDP_KEY_RETENTION`     | *(unset)*               | Seconds a rotated (retiring) signing key stays published in the JWKS; defaults to the sum of the access- and refresh-token TTLs plus 5 minutes |
 | `TRUSTED_PROXIES`       | *(empty)*               | Comma-separated CIDR ranges of proxies whose `X-Forwarded-For` is trusted    |
 | `IDP_LOGIN_RATE_LIMIT`  | `20`                    | Login attempts per minute and client IP                                      |
 | `IDP_TITLE`             | `minidp`                | Title shown on the login page                                                |

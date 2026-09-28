@@ -32,7 +32,7 @@ type subject struct {
 // Server is the in-memory OIDC provider.
 type Server struct {
 	cfg            Config
-	key            *signingKey
+	keys           *keySet
 	store          *store
 	template       *loginTemplate
 	csrf           *csrfManager
@@ -41,10 +41,10 @@ type Server struct {
 	allowedOrigins map[string]bool
 }
 
-// New constructs a Server, resolving the signing key, the registered clients
-// (each with its own accounts), and compiling the login template.
+// New constructs a Server, resolving the signing material, the registered
+// clients (each with its own accounts), and compiling the login template.
 func New(cfg Config) (*Server, error) {
-	key, err := NewSigningKey(cfg.RSAPeM, cfg.KeyDir)
+	keys, err := NewSigningKeySet(cfg.RSAPeM, cfg.KeyDir)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{
 		cfg:            cfg,
-		key:            key,
+		keys:           keys,
 		store:          newStore(),
 		template:       tmpl,
 		csrf:           newCSRFManager(csrfSecret, 15*time.Minute),
@@ -74,6 +74,8 @@ func New(cfg Config) (*Server, error) {
 		"issuer", cfg.Issuer,
 		"clients", strings.Join(clients.clientIDs(), ", "),
 		"users", clients.userCount(),
+		"publishedKeys", len(keys.published),
+		"activeKid", keys.active.kid,
 		"accessTTL", cfg.AccessTokenTTL,
 		"refreshTTL", cfg.RefreshTokenTTL,
 		"loginRateLimit", cfg.LoginRateLimit,
@@ -130,8 +132,37 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	return s.withCORS(mux)
+}
+
+// handleReadyz is the readiness probe: unlike the static /healthz liveness
+// endpoint it verifies the two artifacts a misconfigured issuer or key
+// directory breaks — the discovery document must render and at least one
+// signing key must be published in the JWKS. Reaching the issuer hostname
+// from outside the container is a deployment concern and is exercised by
+// the integration tests and the app containers' own discovery fetches.
+func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	if len(s.keys.published) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not ready",
+			"reason": "no signing key published in the JWKS",
+		})
+		return
+	}
+	doc, err := json.Marshal(s.discoveryDocument())
+	if err != nil || len(doc) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not ready",
+			"reason": "discovery document does not render",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "ready",
+		"published_keys": len(s.keys.published),
+	})
 }
 
 // authenticate verifies the credentials against a client's user store.

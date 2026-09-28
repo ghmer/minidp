@@ -237,7 +237,12 @@ assert typ(d['access_token'])=='at+jwt', 'access token must carry the RFC 9068 t
 assert typ(d['id_token'])=='JWT', 'id token must carry typ JWT'
 assert ac['email']=='demo@example.com', ac.get('email')
 assert ac['roles']==['user'] and ic['roles']==['user'], 'roles must be released on both tokens when set'
-print('access+id token claims OK (iss/aud/sub/nonce/typ/scope/roles claims)')
+# Entra-compatible claim shape: client_id (RFC 9068), azp, nbf, idtyp.
+assert ac['client_id']=='$CLIENT' and ic['azp']=='$CLIENT' and ac['azp']=='$CLIENT'
+assert ac['nbf']==ac['iat'] and ic['nbf']==ic['iat'], 'nbf must equal iat'
+assert ac['idtyp']=='user', ac
+assert 'scp' not in ac, 'a token without resource scopes must not carry scp'
+print('access+id token claims OK (iss/aud/sub/nonce/typ/scope/roles/client_id/azp/nbf/idtyp)')
 print('refresh token present, scope =', d['scope'])
 "
 REFRESH=$(printf '%s' "$TOK" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
@@ -459,14 +464,18 @@ def typ(t):
 ac=claims(d['access_token']); ic=claims(d['id_token'])
 assert ac['sub']=='bob', ac
 assert ac['aud']==['conf-app'] and ic['aud']==['conf-app'], 'conf-app audience by default'
+assert ac['client_id']=='conf-app' and ac['azp']=='conf-app' and ic['azp']=='conf-app'
+assert ac['idtyp']=='user' and ac['nbf']==ac['iat'], ac
 assert typ(d['access_token'])=='at+jwt', typ
 print('confidential code grant with client_secret_basic OK (no PKCE needed)')
 "
 REFRESHC=$(printf '%s' "$TOKC" | python3 -c "import json,sys;print(json.load(sys.stdin)['refresh_token'])")
 
 echo "== 18b. client_credentials grant (machine-to-machine, RFC 6749 §4.4) =="
+# The audience's .default scope resolves to the full configured permission
+# list; an exact configured entry grants that permission alone.
 TOKM=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/token" \
-  -d "grant_type=client_credentials&scope=smoke:admin")  # scope param must be ignored
+  -d "grant_type=client_credentials&scope=smoke-api/.default")
 printf '%s' "$TOKM" | python3 -c "
 import json,sys,base64
 d=json.load(sys.stdin)
@@ -477,13 +486,27 @@ def typ(t):
     h=t.split('.')[0]; h+='='*(-len(h)%4)
     return json.loads(base64.urlsafe_b64decode(h))['typ']
 ac=claims(d['access_token'])
-assert d['scope']=='smoke:read smoke:write', d.get('scope')   # static, not requested
+assert d['scope']=='smoke:read smoke:write', d.get('scope')   # .default -> configured list
 assert ac['aud']==['$M2M_API'], ac                            # audience from the clients file
 assert ac['sub']=='$M2M_CLIENT', ac                           # service-account-like subject
+assert ac['idtyp']=='app', ac                                 # app-only marker
 assert typ(d['access_token'])=='at+jwt', typ
 assert 'id_token' not in d and 'refresh_token' not in d, d.keys()
-print('client_credentials grant OK (static scopes, aud=$M2M_API, sub=client_id, no refresh/id token)')
+print('client_credentials grant OK (.default scopes, aud=$M2M_API, sub=client_id, idtyp=app, no refresh/id token)')
 "
+# An exact configured entry grants that permission alone.
+TOKM2=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=client_credentials&scope=smoke:read")
+printf '%s' "$TOKM2" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['scope']=='smoke:read', d.get('scope')               # subset, least privilege
+print('client_credentials exact-entry scope OK (scope=smoke:read only)')
+"
+# An unconfigured scope is refused (invalid_scope), not silently ignored.
+RC4=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \
+  -d "grant_type=client_credentials&scope=smoke:admin")
+[ "$RC4" = "400" ] && echo "client_credentials unconfigured scope rejected (400) OK"
 # A client without the grant is refused (RFC 6749 §5.2 unauthorized_client).
 RC3=$(curl -s -u "$CONF_CLIENT:$CONF_SECRET" -o /dev/null -w '%{http_code}' -X POST "$BASE/token" \
   -d "grant_type=client_credentials")
@@ -542,6 +565,40 @@ if IDP_CLIENTS_FILE="$WORKDIR/empty.json" "$WORKDIR/minidp" >"$WORKDIR/empty.log
   echo "UNEXPECTED: startup succeeded with an empty clients file"; exit 1
 fi
 grep -q "contains no clients" "$WORKDIR/empty.log" && echo "empty clients file rejected OK"
+
+echo "== 21. staged signing-key rotation =="
+# A token minted before the rotation, for the post-restart overlap check.
+PRE_ROTATION_TOKEN=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=client_credentials" | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
+IDP_KEY_DIR="$WORKDIR/keys" "$WORKDIR/minidp" rotate-keys
+# The restart picks up the ring: JWKS publishes the retiring and the active
+# key, tokens minted before the rotation still verify, and new tokens carry
+# the new kid.
+kill "$MINIDP_PID"; wait "$MINIDP_PID" 2>/dev/null
+IDP_PORT=8099 IDP_ISSUER="$BASE" IDP_CLIENTS_FILE="$CFILE" \
+  IDP_KEY_DIR="$WORKDIR/keys" \
+  "$WORKDIR/minidp" >"$WORKDIR/minidp2.log" 2>&1 &
+MINIDP_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$BASE/healthz" >/dev/null && break
+  sleep 0.2
+done
+JWKS_KEYS=$(curl -sf "$BASE/jwks" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['keys']))")
+[ "$JWKS_KEYS" = "2" ] && echo "JWKS publishes both keys after rotation OK"
+curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/introspect" \
+  -d "token=$PRE_ROTATION_TOKEN" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['active'] is True, d
+print('pre-rotation token still verifies after rotation OK')
+"
+POST_ROTATION_KID=$(curl -s -u "$M2M_CLIENT:$M2M_SECRET" -X POST "$BASE/token" \
+  -d "grant_type=client_credentials" | python3 -c "
+import json,sys,base64
+t=json.load(sys.stdin)['access_token']
+h=t.split('.')[0]; h+='='*(-len(h)%4)
+print(json.loads(base64.urlsafe_b64decode(h))['kid'])")
+[ "$POST_ROTATION_KID" != "minidp-1" ] && echo "new tokens are minted with the rotated key OK (kid=$POST_ROTATION_KID)"
 
 echo
 echo "ALL CHECKS PASSED"

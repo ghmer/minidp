@@ -59,6 +59,15 @@ func TestClientCredentialsHappyPath(t *testing.T) {
 	if !ok || len(aud) != 1 || aud[0] != "fake-hr" {
 		t.Errorf("aud = %v, want [fake-hr]", claims["aud"])
 	}
+	if claims["client_id"] != "fake-hr-mcp-service" {
+		t.Errorf("client_id = %v, want %q (RFC 9068 §2.2)", claims["client_id"], "fake-hr-mcp-service")
+	}
+	if claims["azp"] != "fake-hr-mcp-service" {
+		t.Errorf("azp = %v, want the client id", claims["azp"])
+	}
+	if _, has := claims["scp"]; has {
+		t.Error("app-only token must not carry the scp claim")
+	}
 	if scope, _ := claims["scope"].(string); scope != "fake-hr:read fake-hr:write" {
 		t.Errorf("token scope = %v, want the configured scopes", claims["scope"])
 	}
@@ -136,19 +145,55 @@ func TestClientCredentialsRequiresOptIn(t *testing.T) {
 	}
 }
 
-// TestClientCredentialsIgnoresRequestedScope pins the static scope policy:
-// the grant has no consent step, so a requested scope parameter must not
-// widen (or change) the configured scopes.
-func TestClientCredentialsIgnoresRequestedScope(t *testing.T) {
+// TestClientCredentialsValidatesRequestedScope pins the /.default scope
+// semantics: an absent parameter grants the full configured list, the
+// audience's .default form (with or without the api:// prefix) grants the
+// same, an exact configured entry grants that permission alone, and
+// anything else — another audience's .default, unconfigured permissions,
+// OIDC scopes — is invalid_scope. The grant never issues unconfigured
+// scopes, and there is still no consent step that could widen the
+// registration.
+func TestClientCredentialsValidatesRequestedScope(t *testing.T) {
 	ts, _ := testIDPClients(t, []Client{testServiceClient(t, "fake-hr-mcp-service", "a-confidential-secret")}, nil)
+	const basic = "fake-hr-mcp-service"
+	const secret = "a-confidential-secret"
 
-	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"openid profile email"}}
-	resp := postTokenBasic(t, ts.URL+"/token", form, "fake-hr-mcp-service", "a-confidential-secret")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /token: status = %d, body = %v", resp.StatusCode, decodeJSON(t, resp))
-	}
-	if got := decodeJSON(t, resp)["scope"]; got != "fake-hr:read fake-hr:write" {
-		t.Errorf("scope = %v, want the configured scopes despite the request", got)
+	for _, tc := range []struct {
+		name      string
+		scope     string
+		wantScope string
+		wantError string
+	}{
+		{"absent parameter", "", "fake-hr:read fake-hr:write", ""},
+		{"audience .default", "fake-hr/.default", "fake-hr:read fake-hr:write", ""},
+		{"api:// audience .default", "api://fake-hr/.default", "fake-hr:read fake-hr:write", ""},
+		{"exact configured entry", "fake-hr:read", "fake-hr:read", ""},
+		{"foreign audience .default", "api://other-api/.default", "", "invalid_scope"},
+		{"unconfigured permission", "fake-hr:admin", "", "invalid_scope"},
+		{"oidc scopes are not m2m permissions", "openid profile email", "", "invalid_scope"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := url.Values{"grant_type": {"client_credentials"}}
+			if tc.scope != "" {
+				form.Set("scope", tc.scope)
+			}
+			resp := postTokenBasic(t, ts.URL+"/token", form, basic, secret)
+			if tc.wantError != "" {
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400", resp.StatusCode)
+				}
+				if got := decodeJSON(t, resp)["error"]; got != tc.wantError {
+					t.Errorf("error = %v, want %s", got, tc.wantError)
+				}
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %v", resp.StatusCode, decodeJSON(t, resp))
+			}
+			if got := decodeJSON(t, resp)["scope"]; got != tc.wantScope {
+				t.Errorf("scope = %v, want %q", got, tc.wantScope)
+			}
+		})
 	}
 }
 
@@ -278,6 +323,30 @@ func discoveryJSON(t *testing.T, url string) map[string]any {
 		t.Fatalf("GET %s: status = %d", url, resp.StatusCode)
 	}
 	return decodeJSON(t, resp)
+}
+
+// TestDiscoveryScopesSupported pins that discovery advertises the built-in
+// OIDC scopes plus the union of all clients' registered delegated scopes
+// (deduplicated across clients, deterministic file order).
+func TestDiscoveryScopesSupported(t *testing.T) {
+	ui := testPublicClient(t)
+	ui.AllowedScopes = []string{"api://demo-app/access_as_user", "api://demo-app/read"}
+	other := testPublicClient(t)
+	other.ClientID = "second-ui"
+	other.RedirectURIs = []string{"http://localhost:4000/callback"}
+	other.PostLogoutRedirectURIs = nil
+	// A second client sharing the first one's audience may register the same
+	// delegated scope; the union must not duplicate it.
+	other.Audience = "demo-app"
+	other.AllowedScopes = []string{"api://demo-app/access_as_user"}
+	ts, _ := testIDPClients(t, []Client{ui, other}, nil)
+
+	d := discoveryJSON(t, ts.URL+"/.well-known/openid-configuration")
+	got, _ := d["scopes_supported"].([]any)
+	want := []any{"openid", "profile", "email", "api://demo-app/access_as_user", "api://demo-app/read"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("scopes_supported = %v, want %v", got, want)
+	}
 }
 
 // TestDiscoveryGrantTypesAndOAuthMetadata pins the discovery additions:

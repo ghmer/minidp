@@ -100,6 +100,96 @@ func TestMultiClientBothClientsFlow(t *testing.T) {
 	if len(audB) != 1 || audB[0] != "conf-api" {
 		t.Errorf("conf-app aud = %v, want [conf-api]", audB)
 	}
+	if claimsB["client_id"] != "conf-app" {
+		t.Errorf("conf-app client_id = %v, want [conf-app] (RFC 9068 §2.2)", claimsB["client_id"])
+	}
+}
+
+// TestMultiClientAPIAudienceIDToken pins the audience split at the HTTP
+// boundary: conf-app's access token is minted for its configured API
+// audience while its id_token is minted for the client id itself.
+func TestMultiClientAPIAudienceIDToken(t *testing.T) {
+	ts, _ := multiClientIDP(t, "a-confidential-secret")
+
+	verifier, _ := pkcePair()
+	location := loginFor(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier)
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+
+	idClaims := verifyTokenString(t, tokens["id_token"].(string), ts.URL)
+	audID, _ := idClaims["aud"].([]any)
+	if len(audID) != 1 || audID[0] != "conf-app" {
+		t.Errorf("id aud = %v, want [conf-app] (the RP, not the conf-api audience)", audID)
+	}
+	nonce, _ := idClaims["nonce"].(string)
+	if nonce != testNonceValue {
+		t.Errorf("id nonce = %q, want %q", nonce, testNonceValue)
+	}
+}
+
+// TestMultiClientAPIAudienceUserInfoAndLogout pins that the endpoints that
+// must resolve the client behind a token still work when the access token's
+// audience is the API audience, not the client id: /userinfo resolves the
+// account store via the RFC 9068 client_id claim, and /end_session resolves
+// the client from the id_token_hint's client-id audience and revokes the
+// token family.
+func TestMultiClientAPIAudienceUserInfoAndLogout(t *testing.T) {
+	ts, _ := multiClientIDP(t, "a-confidential-secret")
+
+	verifier, _ := pkcePair()
+	location := loginFor(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier)
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+	access := tokens["access_token"].(string)
+	idToken := tokens["id_token"].(string)
+
+	// /userinfo with an API-audience access token: the client_id claim —
+	// not the audience — resolves bob's account store.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/userinfo", nil)
+	req.Header.Set("Authorization", "Bearer "+access)
+	ui, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /userinfo: %v", err)
+	}
+	uiClaims := decodeJSON(t, ui)
+	_ = ui.Body.Close()
+	if ui.StatusCode != http.StatusOK {
+		t.Fatalf("/userinfo: status = %d, body = %v", ui.StatusCode, uiClaims)
+	}
+	if uiClaims["sub"] != "bob" || uiClaims["preferred_username"] != "bob" {
+		t.Errorf("userinfo = %v, want bob's profile resolved via the client_id claim", uiClaims)
+	}
+
+	// /end_session with the conf-app id_token_hint: the hint's audience (the
+	// client id) must resolve conf-app even though its registered audience
+	// is conf-api, and logout must revoke the token family.
+	logoutResp, err := noFollow().Get(ts.URL + "/end_session?id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape("https://conf.example.com/"))
+	if err != nil {
+		t.Fatalf("GET /end_session: %v", err)
+	}
+	_ = logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusFound || logoutResp.Header.Get("Location") != "https://conf.example.com/" {
+		t.Errorf("end_session: status = %d, location = %q, want redirect to conf-app's allowlisted target",
+			logoutResp.StatusCode, logoutResp.Header.Get("Location"))
+	}
+
+	// The revoked family: the refresh token no longer redeems.
+	grant := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {tokens["refresh_token"].(string)},
+	}, "conf-app", "a-confidential-secret"))
+	if grant["error"] != "invalid_grant" {
+		t.Errorf("refresh after logout: %v, want invalid_grant", grant["error"])
+	}
 }
 
 // TestMultiClientPerClientRedirectPolicy pins that a client cannot use
@@ -303,4 +393,121 @@ func TestMultiClientPublicClientCannotAuthenticate(t *testing.T) {
 	if got := decodeJSON(t, resp)["error"]; got != "invalid_request" {
 		t.Errorf("token request without client_id: error = %v, want invalid_request", got)
 	}
+}
+
+// delegatedScopeIDP returns an IdP whose confidential client conf-app is
+// registered with the delegated API scopes api://conf-api/read and
+// api://conf-api/write.
+func delegatedScopeIDP(t *testing.T, secret string) (*httptest.Server, *Server) {
+	t.Helper()
+	conf := Client{
+		ClientID:      "conf-app",
+		Type:          TypeConfidential,
+		ClientSecret:  secret,
+		Audience:      "conf-api",
+		RedirectURIs:  []string{"https://conf.example.com/cb"},
+		AllowedScopes: []string{"api://conf-api/read", "api://conf-api/write"},
+		Users: []User{
+			{Username: "bob", PasswordHash: testHash(t, "builder")},
+		},
+	}
+	return testIDPClients(t, []Client{testPublicClient(t), conf}, nil)
+}
+
+// TestAuthorizeAllowedScopes pins the per-client delegated-scope allowlist:
+// conf-app may request the api:// scopes registered in its own entry — the
+// granted scope travels into the token's RFC 9068 scope claim and survives
+// the refresh grant — while a foreign resource, an unregistered permission
+// name and another client's registered scope are rejected with invalid_scope.
+func TestAuthorizeAllowedScopes(t *testing.T) {
+	ts, _ := delegatedScopeIDP(t, "a-confidential-secret")
+
+	// A registered delegated scope is granted end to end.
+	verifier, _ := pkcePair()
+	location := loginForScopes(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier,
+		"openid profile api://conf-api/read")
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+	if want := "openid profile api://conf-api/read"; tokens["scope"] != want {
+		t.Errorf("token response scope = %v, want %q", tokens["scope"], want)
+	}
+	claims := verifyTokenString(t, tokens["access_token"].(string), ts.URL)
+	if claims["scope"] != "openid profile api://conf-api/read" {
+		t.Errorf("scope claim = %v, want the full requested scopes (RFC 9068 §2.2.3)", claims["scope"])
+	}
+
+	// The refresh grant carries the same granted scopes forward.
+	refreshed := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {tokens["refresh_token"].(string)},
+	}, "conf-app", "a-confidential-secret"))
+	if refreshed["scope"] != "openid profile api://conf-api/read" {
+		t.Errorf("refreshed scope = %v, want the granted scopes", refreshed["scope"])
+	}
+
+	// A foreign resource, an unregistered permission name, and another
+	// client's (here: unregistered) scope are refused with invalid_scope.
+	for _, tc := range []struct {
+		name  string
+		scope string
+	}{
+		{"foreign resource", "openid api://demo-api/read"},
+		{"unregistered permission", "openid api://conf-api/admin"},
+		{"client without registrations", "openid api://conf-api/read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := authorizeFormFor("conf-app", "https://conf.example.com/cb", verifier)
+			if tc.name == "client without registrations" {
+				q = authorizeFormFor(testClientID, testRedirect, verifier)
+			}
+			q.Set("scope", tc.scope)
+			resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
+			if err != nil {
+				t.Fatalf("GET /authorize: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusFound {
+				t.Fatalf("status = %d, want 302 to the registered redirect_uri", resp.StatusCode)
+			}
+			loc, err := url.Parse(resp.Header.Get("Location"))
+			if err != nil {
+				t.Fatalf("bad redirect location: %v", err)
+			}
+			if got := loc.Query().Get("error"); got != "invalid_scope" {
+				t.Errorf("scope=%q: error = %q, want invalid_scope", tc.scope, got)
+			}
+			if loc.Query().Get("state") != testStateValue {
+				t.Errorf("error redirect must echo state, got %q", loc.Query().Get("state"))
+			}
+		})
+	}
+}
+
+// loginForScopes runs the authorize round-trip for a client with an explicit
+// scope value and returns the redirect target URL.
+func loginForScopes(t *testing.T, base, clientID, redirect, user, pass, verifier, scope string) string {
+	t.Helper()
+	// The CSRF token is bound to the OAuth parameters of the GET-rendered
+	// form, so the same parameters (including the custom scope) must be used
+	// for both the fetch and the POST body. The credentials are only in the
+	// POST body, never in the GET query.
+	params := authorizeFormFor(clientID, redirect, verifier)
+	params.Set("scope", scope)
+	form := url.Values{}
+	for k, v := range params {
+		form[k] = v
+	}
+	form.Set("username", user)
+	form.Set("password", pass)
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, base+"/authorize", params))
+	resp := postForm(t, browser, base+"/authorize", form)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("POST /authorize for %s: status = %d, want 302", clientID, resp.StatusCode)
+	}
+	return resp.Header.Get("Location")
 }

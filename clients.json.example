@@ -19,6 +19,7 @@
     "type": "confidential",
     "client_secret": "REPLACE-WITH-openssl-rand-base64-32",
     "audience": "backend-api",
+    "allowed_scopes": ["api://backend-api/access_as_user"],
     "redirect_uris": ["https://backend.example.com/callback"],
     "users": [
       {
@@ -33,6 +34,7 @@
     "client_secret": "REPLACE-WITH-openssl-rand-base64-32",
     "audience": "backend-api",
     "grant_types": ["client_credentials"],
-    "client_credentials_scopes": ["backend-api:read", "backend-api:write"]
+    "client_credentials_scopes": ["backend-api:read", "backend-api:write"],
+    "client_credentials_roles": ["integration"]
   }
 ]

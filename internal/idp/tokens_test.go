@@ -30,9 +30,7 @@ func newTestServer(t *testing.T) *Server {
 
 func parseWithServer(t *testing.T, srv *Server, tokenString string) jwt.MapClaims {
 	t.Helper()
-	parsed, err := jwt.Parse(tokenString, func(*jwt.Token) (any, error) {
-		return &srv.key.key.PublicKey, nil
-	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithExpirationRequired())
+	parsed, err := jwt.Parse(tokenString, srv.keys.verifyKey, jwt.WithValidMethods([]string{"RS256"}), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		t.Fatalf("token did not verify: %v", err)
 	}
@@ -101,6 +99,145 @@ func TestIssueTokensAccessAndIDClaims(t *testing.T) {
 	audID, _ := id.GetAudience()
 	if len(audID) != 1 || audID[0] != "demo-app" {
 		t.Errorf("id aud = %v", audID)
+	}
+}
+
+// TestIssueTokensSeparateAudiences pins the OIDC Core / RFC 9068 audience
+// split for a client whose configured audience differs from its client id:
+// the access token is minted for the configured API audience and carries the
+// RFC 9068 §2.2 REQUIRED client_id claim; the id_token is minted for the
+// client id itself (OIDC Core §2: the id_token aud is the Relying Party) and
+// carries no client_id claim.
+func TestIssueTokensSeparateAudiences(t *testing.T) {
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	conf := testConfidentialClient(t, "a-confidential-secret")
+	conf.Audience = "conf-api"
+	if err := SaveClients(clientsFile, []Client{conf}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
+	srv, err := New(Config{
+		Issuer:          "https://idp.test",
+		ClientsFile:     clientsFile,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resp, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile", "email"},
+		Nonce:    testNonceValue,
+	})
+	if err != nil {
+		t.Fatalf("issueTokens: %v", err)
+	}
+
+	access := parseWithServer(t, srv, resp.AccessToken)
+	aud, _ := access.GetAudience()
+	if len(aud) != 1 || aud[0] != "conf-api" {
+		t.Errorf("access aud = %v, want [conf-api]", aud)
+	}
+	if access["client_id"] != testClientID {
+		t.Errorf("access client_id = %v, want %q (RFC 9068 §2.2)", access["client_id"], testClientID)
+	}
+
+	id := parseWithServer(t, srv, resp.IDToken)
+	audID, _ := id.GetAudience()
+	if len(audID) != 1 || audID[0] != testClientID {
+		t.Errorf("id aud = %v, want [%s] (the RP, not the API audience)", audID, testClientID)
+	}
+	if _, has := id["client_id"]; has {
+		t.Error("id token must not carry the RFC 9068 client_id claim")
+	}
+}
+
+// TestEntraClaimShape pins the Entra ID v2.0 claim parity: azp on both
+// tokens, nbf on every token, and scp carrying the granted resource
+// permissions as SHORT names (api://<audience>/<name> → <name>) while the
+// RFC 9068 scope claim keeps the full strings. A token without resource
+// scopes carries no scp, and client-credentials tokens never carry scp.
+func TestEntraClaimShape(t *testing.T) {
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	conf := testConfidentialClient(t, "a-confidential-secret")
+	conf.Audience = "conf-api"
+	conf.AllowedScopes = []string{"api://conf-api/access_as_user"}
+	service := testServiceClient(t, "svc", "a-confidential-secret")
+	if err := SaveClients(clientsFile, []Client{conf, service}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
+	srv, err := New(Config{
+		Issuer:          "https://idp.test",
+		ClientsFile:     clientsFile,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	resp, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile", "api://conf-api/access_as_user"},
+		Nonce:    testNonceValue,
+	})
+	if err != nil {
+		t.Fatalf("issueTokens: %v", err)
+	}
+
+	access := parseWithServer(t, srv, resp.AccessToken)
+	if access["azp"] != testClientID {
+		t.Errorf("access azp = %v, want the client id", access["azp"])
+	}
+	if access["scp"] != "access_as_user" {
+		t.Errorf("access scp = %v, want the short permission name", access["scp"])
+	}
+	if access["scope"] != "openid profile api://conf-api/access_as_user" {
+		t.Errorf("access scope = %v, want the full granted strings", access["scope"])
+	}
+	nbf, ok := access["nbf"].(float64)
+	if !ok {
+		t.Fatal("access token carries no nbf claim")
+	}
+	if iat, _ := access["iat"].(float64); nbf != iat {
+		t.Errorf("access nbf = %v, want the iat value %v", nbf, iat)
+	}
+
+	id := parseWithServer(t, srv, resp.IDToken)
+	if id["azp"] != testClientID {
+		t.Errorf("id azp = %v, want the client id", id["azp"])
+	}
+	if _, ok := id["nbf"]; !ok {
+		t.Error("id token carries no nbf claim")
+	}
+
+	// A delegated token without resource scopes carries no scp.
+	resp2, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile"},
+	})
+	if err != nil {
+		t.Fatalf("issueTokens (openid only): %v", err)
+	}
+	plain := parseWithServer(t, srv, resp2.AccessToken)
+	if _, has := plain["scp"]; has {
+		t.Error("token without resource scopes must not carry scp")
+	}
+
+	// The app-only token names its client in azp but carries no scp.
+	cc, err := srv.issueClientCredentialsTokens(srv.clients.lookup("svc"), nil)
+	if err != nil {
+		t.Fatalf("issueClientCredentialsTokens: %v", err)
+	}
+	app := parseWithServer(t, srv, cc.AccessToken)
+	if app["azp"] != "svc" {
+		t.Errorf("client_credentials azp = %v, want the client id", app["azp"])
+	}
+	if _, has := app["scp"]; has {
+		t.Error("app-only token must not carry scp")
 	}
 }
 
@@ -250,9 +387,9 @@ func signedTestToken(t *testing.T, srv *Server, claims jwt.MapClaims, access boo
 	var err error
 	var signed string
 	if access {
-		signed, err = srv.key.signAccess(claims)
+		signed, err = srv.keys.signAccess(claims)
 	} else {
-		signed, err = srv.key.sign(claims)
+		signed, err = srv.keys.sign(claims)
 	}
 	if err != nil {
 		t.Fatalf("sign: %v", err)

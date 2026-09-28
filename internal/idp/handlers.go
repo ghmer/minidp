@@ -126,7 +126,7 @@ func (s *Server) validateAuthorizeRequest(client *registeredClient, q url.Values
 			return "invalid_request", fmt.Sprintf("Unsupported parameter %q.", p)
 		}
 	}
-	return validateScopes(q.Get("scope"))
+	return s.validateScopesFor(client, q.Get("scope"))
 }
 
 // validatePKCEParams checks the PKCE parameters of an authorize request:
@@ -171,13 +171,18 @@ func validatePrompt(q url.Values) (code, description string) {
 	return "", ""
 }
 
-// validateScopes checks the requested scopes against the IdP policy
-// (review finding M1).
-func validateScopes(raw string) (code, description string) {
+// validateScopesFor checks the requested scopes against the IdP policy
+// (review finding M1) extended by the requesting client's registered custom
+// delegated scopes: the provider-wide built-ins are openid, profile and
+// email, and a client may additionally request the api://<audience>/<name>
+// scopes registered in its own entry — never another client's, never
+// arbitrary resource/scope strings.
+func (s *Server) validateScopesFor(client *registeredClient, raw string) (code, description string) {
 	for _, sc := range parseScopes(raw) {
-		if !supportedScopes[sc] {
-			return "invalid_scope", fmt.Sprintf("Unsupported scope %q; supported scopes: openid profile email.", sc)
+		if supportedScopes[sc] || client.allowsScope(sc) {
+			continue
 		}
+		return "invalid_scope", fmt.Sprintf("Unsupported scope %q for this client; supported scopes: openid profile email and the api:// scopes registered for the client.", sc)
 	}
 	return "", ""
 }
@@ -616,10 +621,12 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 // scopes come exclusively from the client's registration (audience field,
 // client_credentials_scopes), and no id_token or refresh token is issued.
 //
-// RFC 6749 §4.4.2 allows the client to send a scope parameter, but minidp
-// resolves the scopes statically from the clients file — there is no login
-// or consent step that could approve a runtime request, so the parameter is
-// ignored and the configured scopes are granted.
+// RFC 6749 §4.4.2 allows the client to send a scope parameter, and minidp
+// honours it only within the statically configured permissions — there is
+// no login or consent step that could approve a runtime request. An absent
+// parameter and the audience's .default form (Entra ID semantics) grant the
+// full configured list, an exact configured entry grants that permission
+// alone, and anything else is invalid_scope.
 func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request) {
 	client, ok := s.authenticateClient(w, r)
 	if !ok {
@@ -633,7 +640,13 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 			"The client is not authorized to use the client_credentials grant.")
 		return
 	}
-	s.issueAndWriteClientCredentials(w, client)
+	scopes, ok := client.resolveClientCredentialsScopes(r.PostFormValue("scope"))
+	if !ok {
+		writeAuthError(w, "invalid_scope",
+			"The requested scope is not configured for this client; use a registered permission or the audience's .default scope.")
+		return
+	}
+	s.issueAndWriteClientCredentials(w, client, scopes)
 }
 
 // verifyPKCE checks the code_verifier against the stored challenge. Only
@@ -741,10 +754,10 @@ func (s *Server) issueAndWriteTokens(w http.ResponseWriter, grant string, ctx *a
 }
 
 // issueAndWriteClientCredentials mints and writes the client_credentials
-// grant response; a failure degrades to a 500 instead of panicking the
-// process (finding F6).
-func (s *Server) issueAndWriteClientCredentials(w http.ResponseWriter, client *registeredClient) {
-	resp, err := s.issueClientCredentialsTokens(client)
+// grant response for the resolved scope set; a failure degrades to a 500
+// instead of panicking the process (finding F6).
+func (s *Server) issueAndWriteClientCredentials(w http.ResponseWriter, client *registeredClient, scopes []string) {
+	resp, err := s.issueClientCredentialsTokens(client, scopes)
 	if err != nil {
 		slog.Error("token issuance failed", "grant", "client_credentials", "client", client.ID(), "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")
@@ -810,9 +823,7 @@ func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 // audience of one of the registered clients, so tokens minted for any other
 // audience are rejected at the resource endpoints (review finding H4).
 func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt.MapClaims, error) {
-	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
-		return &s.key.key.PublicKey, nil
-	},
+	token, err := jwt.Parse(tokenString, s.keys.verifyKey,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(s.cfg.Issuer),
 		jwt.WithExpirationRequired(),
@@ -855,9 +866,7 @@ func (s *Server) verifyAccessToken(tokenString string) (jwt.MapClaims, error) {
 // provider has to honour (review finding F4). The registered-claims
 // validation is disabled and issuer/audience are checked manually instead.
 func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient, error) {
-	token, err := jwt.Parse(hint, func(t *jwt.Token) (any, error) {
-		return &s.key.key.PublicKey, nil
-	},
+	token, err := jwt.Parse(hint, s.keys.verifyKey,
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithoutClaimsValidation(), // expiry is intentionally not enforced
 	)
@@ -878,9 +887,15 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 	if len(aud) == 0 {
 		return nil, nil, fmt.Errorf("invalid token: missing audience")
 	}
-	// The audience identifies the registered client the hint belongs to; the
-	// post-logout redirect policy of THAT client governs the logout redirect.
-	client := s.clients.clientForAudience(aud[0])
+	// The id_token audience is the client id (OIDC Core §2), so the audience
+	// resolves the registered client directly; the configured-audience
+	// fallback keeps hints minted under the pre-split audience semantics
+	// working. The resolved client's post-logout redirect policy governs the
+	// logout redirect.
+	client := s.clients.lookup(aud[0])
+	if client == nil {
+		client = s.clients.clientForAudience(aud[0])
+	}
 	if client == nil {
 		return nil, nil, fmt.Errorf("invalid token: audience not accepted here")
 	}
@@ -972,20 +987,29 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // userinfoClaims assembles the UserInfo response for the token's subject.
-// The token's audience identifies the registered client whose user store
-// holds the authoritative record; the scope-gated token claims are the
-// fallback for subjects that have since been removed from the clients file.
-// The access token carries no name claim, so for such subjects the name is
-// simply omitted (an absent claim is never fabricated).
+// The RFC 9068 client_id claim names the client whose user store holds the
+// authoritative record; the audience is only a fallback for that resolution
+// (an access token minted for a configured API audience does not name the
+// client). The scope-gated token claims are the fallback for subjects that
+// have since been removed from the clients file. The access token carries no
+// name claim, so for such subjects the name is simply omitted (an absent
+// claim is never fabricated).
 func (s *Server) userinfoClaims(claims jwt.MapClaims, scopes []string) map[string]any {
 	sub, _ := claims["sub"].(string)
 	wantProfile := hasScope(scopes, "profile")
 	wantEmail := hasScope(scopes, "email")
 	out := map[string]any{"sub": sub}
 	var store UserStore
-	if aud, _ := claims.GetAudience(); len(aud) > 0 {
-		if client := s.clients.clientForAudience(aud[0]); client != nil {
+	if cid, _ := claims["client_id"].(string); cid != "" {
+		if client := s.clients.lookup(cid); client != nil {
 			store = client.users
+		}
+	}
+	if store == nil {
+		if aud, _ := claims.GetAudience(); len(aud) > 0 {
+			if client := s.clients.clientForAudience(aud[0]); client != nil {
+				store = client.users
+			}
 		}
 	}
 	if store != nil {
@@ -1029,14 +1053,15 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 	sub, _ := claims["sub"].(string)
 	scope, _ := claims["scope"].(string)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":   true,
-		"sub":      sub,
-		"scope":    scope,
-		"iss":      claims["iss"],
-		"aud":      claims["aud"],
-		"exp":      claims["exp"],
-		"iat":      claims["iat"],
-		"username": sub,
+		"active":    true,
+		"sub":       sub,
+		"client_id": claims["client_id"],
+		"scope":     scope,
+		"iss":       claims["iss"],
+		"aud":       claims["aud"],
+		"exp":       claims["exp"],
+		"iat":       claims["iat"],
+		"username":  sub,
 	})
 }
 

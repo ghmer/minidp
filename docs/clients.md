@@ -56,9 +56,19 @@ secrets trigger a startup warning.
 
 ## Connecting a client application
 
-Every token carries the audience of the client it was issued for (the
-client's `audience`, defaulting to its `client_id`). Nothing is reflected —
-a token minted for, or presented at, any other audience is rejected. Point
+The two JWTs of a token set carry distinct, server-resolved audiences:
+
+- The **id_token** is minted for the client's `client_id` — OIDC Core §2
+  requires the id_token `aud` to be the Relying Party itself.
+- The **access token** is minted for the client's `audience` (defaulting to
+  its `client_id`) and additionally carries the RFC 9068 §2.2 REQUIRED
+  `client_id` claim naming the client that requested it.
+
+Every token also carries `nbf` (= `iat`), and both tokens name the
+requesting client in `azp` — the claim shape Entra ID v2.0 tokens use.
+
+Nothing is reflected — a token minted for, or presented at, any other
+audience is rejected. Point
 your OIDC client library (oidc-client-ts, AppAuth, Auth.js, or any
 standards-compliant library) at minidp:
 
@@ -68,7 +78,7 @@ standards-compliant library) at minidp:
 | Discovery          | `<IDP_ISSUER>/.well-known/openid-configuration`    |
 | `client_id`        | a registered client's `client_id`                  |
 | Redirect URI       | one of that client's `redirect_uris` (exact match) |
-| Scopes             | `openid profile email`                             |
+| Scopes             | `openid profile email` plus the client's registered delegated scopes (see below) |
 | PKCE               | `S256` (mandatory for public clients)              |
 
 The browser SPA performs the PKCE code exchange directly against minidp
@@ -79,6 +89,41 @@ unlocks `preferred_username`/`name` (on both tokens and `/userinfo`),
 `email` unlocks the `email` claim, and a token without the `openid` scope
 can't call `/userinfo`. Roles set on the account record are released as the
 `roles` array claim on both tokens, independent of scopes.
+
+### Delegated API scopes
+
+A UI client that calls a business API on the user's behalf registers a
+custom, resource-specific delegated scope in its `allowed_scopes` list. The
+format follows the resource-scope convention of Entra ID v2.0 tokens:
+`api://<audience>/<name>` — the authority must reference the client's own
+audience, so a client can never request authorization for a foreign
+resource:
+
+```json
+{
+  "client_id": "policy-ui",
+  "type": "confidential",
+  "client_secret": "...",
+  "audience": "policy-api",
+  "allowed_scopes": ["api://policy-api/access_as_user"],
+  "redirect_uris": ["https://policy-ui.example.com/callback"]
+}
+```
+
+The client then requests `scope=openid profile api://policy-api/access_as_user`
+at `/authorize`. Scopes outside the registered list (or another client's
+list) are rejected with `invalid_scope` — arbitrary resource/scope strings
+are never reflected into tokens. Granted delegated scopes are released in
+the access token's `scope` claim and in the token response's `scope` field
+in their full `api://...` form (RFC 9068 §2.2.3), and they survive the
+refresh grant unchanged. Discovery advertises the union of all clients'
+registered scopes in `scopes_supported`.
+
+For Entra ID compatibility the access token additionally carries the
+granted permissions in the `scp` claim as **short names** —
+`api://policy-api/access_as_user` becomes `access_as_user` — exactly the
+shape an Entra v2.0 token uses, while `scope` keeps the full strings.
+App-only (`client_credentials`) tokens carry no `scp`.
 
 A client's authorization code is bound to that client (RFC 6749 §4.1.3):
 another client can't redeem it even with valid credentials — the attempt
@@ -101,15 +146,22 @@ a confidential client can be opted in to the `client_credentials` grant:
   user session) and no `refresh_token` (RFC 6749 §4.4.3). The subject is
   the `client_id` itself — a service-account-like identity, as in other
   IdPs (Keycloak service accounts, Azure AD). No user-derived claims
-  (`preferred_username`, `email`, `name`, `roles`) are released, and
-  `/userinfo` is meaningless for such a token.
+  (`preferred_username`, `email`, `name`) are released, and `/userinfo` is
+  meaningless for such a token. The token carries `idtyp: "app"` (Entra's
+  app-only marker) and the client's configured app roles in the `roles`
+  claim; delegated tokens carry `idtyp: "user"`.
 - The audience is the client's registered `audience` field, so a purely
   service client can mint tokens for a *different* API's audience (e.g.
   `audience: "fake-hr"`) than its own `client_id`.
-- Scopes cannot be requested at token time — there is no login or consent
-  step that could approve them. They come exclusively from the client's
-  static `client_credentials_scopes` list, which is mandatory (non-empty)
-  with the grant; a `scope` request parameter is ignored.
+- Scopes resolve exclusively from the static `client_credentials_scopes`
+  list (mandatory, non-empty, with the grant) — there is no login or
+  consent step that could approve more. The `scope` request parameter is
+  honoured only within that list, following Entra ID's `/.default`
+  semantics: an absent parameter and the audience's `fake-hr/.default` or
+  `api://fake-hr/.default` form grant the full configured list, an exact
+  configured entry (`scope=fake-hr:read`) grants that permission alone,
+  and anything else — another audience, unconfigured permissions, OIDC
+  scopes — is refused with `invalid_scope`.
 - `/revoke` (via the `jti` denylist) and `/introspect` work as for any
   other access token.
 
@@ -125,17 +177,19 @@ this makes the client a first-class API consumer in its own right:
   "client_secret": "...",
   "audience": "fake-hr",
   "grant_types": ["client_credentials"],
-  "client_credentials_scopes": ["fake-hr:read", "fake-hr:write"]
+  "client_credentials_scopes": ["fake-hr:read", "fake-hr:write"],
+  "client_credentials_roles": ["integration"]
 }
 ```
 
 ```sh
 clientctl client add -file clients.json -client fake-hr-mcp-service \
   -type confidential -secret "$(openssl rand -base64 32)" \
-  -audience fake-hr -grant-types client_credentials -cc-scopes fake-hr:read,fake-hr:write
+  -audience fake-hr -grant-types client_credentials \
+  -cc-scopes fake-hr:read,fake-hr:write -cc-roles integration
 
 curl -s -u fake-hr-mcp-service:SECRET -d grant_type=client_credentials \
-  http://localhost:8080/token
+  -d scope=fake-hr/.default http://localhost:8080/token
 ```
 
 Discovery advertises `client_credentials` in `grant_types_supported` when
@@ -143,13 +197,37 @@ at least one registered client is opted in, and the same metadata document
 is additionally served at `/.well-known/oauth-authorization-server` (RFC
 8414), the path OAuth-only (non-OIDC) libraries probe.
 
+### Role registry (optional)
+
+A clients file may switch to the object form and declare, per audience,
+which app roles exist — mirroring Entra ID app roles. The registry is
+validation-only: an audience without a definition imposes no constraint,
+while a defined audience restricts both `client_credentials_roles` and the
+user role assignments of every client targeting that audience to its
+declared roles:
+
+```json
+{
+  "clients": [ ... ],
+  "resources": [
+    { "audience": "fake-hr", "app_roles": ["integration", "user"] }
+  ]
+}
+```
+
+With this registry, a client_credentials role `supervisor` for audience
+`fake-hr` or a user holding `supervisor` fails file validation at startup
+(fail-fast) and at every clientctl save.
+
 ## The clients file
 
-Set `IDP_CLIENTS_FILE` to a JSON file containing an array of clients. Each
-client carries its own profile, redirect policy, audience and user
-accounts. Passwords must be salted bcrypt hashes (the salt is embedded in
-the bcrypt format) — the IdP refuses to start on a file with plaintext
-passwords, duplicate usernames or malformed entries. Create and maintain
+Set `IDP_CLIENTS_FILE` to a JSON file holding the registered clients — a
+bare JSON array of client entries, or (when a role registry is used) the
+object form `{"clients": [...], "resources": [...]}`. Each client carries
+its own profile, redirect policy, audience and user accounts. Passwords
+must be salted bcrypt hashes (the salt is embedded in the bcrypt format) —
+the IdP refuses to start on a file with plaintext passwords, duplicate
+usernames or malformed entries. Create and maintain
 the file with the bundled tool:
 
 ```sh
@@ -223,8 +301,10 @@ File format (see `clients.json.example`):
 
 - `client_id` must be unique and free of whitespace. `type` is `public` or
    `confidential`; a confidential entry requires `client_secret` (≥128
-  random bits), a public entry must not have one. `audience` defaults to
-  the `client_id`. Every `redirect_uri` must be an absolute http(s) URL
+  random bits), a public entry must not have one. `audience` is the
+  access-token audience (the API the token is minted for) and defaults to
+  the `client_id`; the id_token audience is always the `client_id` itself.
+  Every `redirect_uri` must be an absolute http(s) URL
   without a fragment, compared by exact string match at `/authorize`.
 - `grant_types` selects the OAuth grants the client may use at `/token`
   (default `["authorization_code", "refresh_token"]`; see
@@ -236,6 +316,15 @@ File format (see `clients.json.example`):
   to for that client (resolved from the `id_token_hint`'s audience or the
    `client_id` parameter). An empty list means logout renders a confirmation
   page instead of redirecting.
+- `allowed_scopes` registers the custom delegated API scopes the client may
+  request at `/authorize` on top of the built-in `openid profile email`.
+  Each entry must have the `api://<audience>/<name>` form and reference the
+  client's own audience (an optional `api://` prefix on the audience is
+  ignored on both sides); anything else fails file validation at startup.
+- `client_credentials_roles` are the app roles released in the `roles`
+  claim of the client's app-only (`client_credentials`) tokens. They
+  require the grant and — with a role registry present — must be defined
+  for the client's audience.
 - `allowed_origins` adds explicit CORS origins on top of the hosts derived
   from the redirect URIs.
 - Each client's `users` are the only accounts that can sign in for that
