@@ -375,37 +375,13 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	ring, err := readKeyRing(root, keyRingFileName)
-	switch {
-	case err == nil:
-	case errors.Is(err, os.ErrNotExist):
-		// Legacy layout: adopt the persisted key (or start empty) as the
-		// active entry of a fresh ring.
-		ring = &keyringFile{}
-		if _, statErr := root.Stat(keyFileName); statErr == nil {
-			ring.Keys = []keyringEntry{{
-				KID:       legacyKid,
-				File:      keyFileName,
-				CreatedAt: time.Now(),
-				State:     keyStateActive,
-			}}
-		}
-	default:
-		return fmt.Errorf("read keyring: %w", err)
+	ring, err := loadOrCreateRing(root, dir)
+	if err != nil {
+		return err
 	}
-
 	now := time.Now()
-	for i := range ring.Keys {
-		switch ring.Keys[i].State {
-		case keyStateActive:
-			ring.Keys[i].State = keyStateRetiring
-			ring.Keys[i].RetireAt = now.Add(retention)
-		case keyStateRetiring:
-			// Keep the previous retirement horizon untouched.
-		default:
-			return fmt.Errorf("keyring %q: entry %q %w %q",
-				keyRingPath(dir), ring.Keys[i].KID, errKeyringStateInvalid, ring.Keys[i].State)
-		}
+	if err := retireRingKeys(ring, dir, now.Add(retention)); err != nil {
+		return err
 	}
 
 	// Generate the new active key and persist it under its thumbprint kid.
@@ -444,6 +420,49 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 		"retire_after", retention.String(),
 		"key_dir", dir,
 	)
+	return nil
+}
+
+// loadOrCreateRing reads the ring document, falling back to the legacy
+// single-key layout (or an empty ring) when it does not exist yet.
+func loadOrCreateRing(root *os.Root, dir string) (*keyringFile, error) {
+	ring, err := readKeyRing(root, keyRingFileName)
+	switch {
+	case err == nil:
+		return ring, nil
+	case errors.Is(err, os.ErrNotExist):
+		// Legacy layout: adopt the persisted key (or start empty) as the
+		// active entry of a fresh ring.
+		fresh := &keyringFile{}
+		if _, statErr := root.Stat(keyFileName); statErr == nil {
+			fresh.Keys = []keyringEntry{{
+				KID:       legacyKid,
+				File:      keyFileName,
+				CreatedAt: time.Now(),
+				State:     keyStateActive,
+			}}
+		}
+		return fresh, nil
+	default:
+		return nil, fmt.Errorf("read keyring: %w", err)
+	}
+}
+
+// retireRingKeys marks every active entry as retiring with the given horizon
+// and rejects entries with an unknown state.
+func retireRingKeys(ring *keyringFile, dir string, retireAt time.Time) error {
+	for i := range ring.Keys {
+		switch ring.Keys[i].State {
+		case keyStateActive:
+			ring.Keys[i].State = keyStateRetiring
+			ring.Keys[i].RetireAt = retireAt
+		case keyStateRetiring:
+			// Keep the previous retirement horizon untouched.
+		default:
+			return fmt.Errorf("keyring %q: entry %q %w %q",
+				keyRingPath(dir), ring.Keys[i].KID, errKeyringStateInvalid, ring.Keys[i].State)
+		}
+	}
 	return nil
 }
 
