@@ -621,10 +621,12 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 // scopes come exclusively from the client's registration (audience field,
 // client_credentials_scopes), and no id_token or refresh token is issued.
 //
-// RFC 6749 §4.4.2 allows the client to send a scope parameter, but minidp
-// resolves the scopes statically from the clients file — there is no login
-// or consent step that could approve a runtime request, so the parameter is
-// ignored and the configured scopes are granted.
+// RFC 6749 §4.4.2 allows the client to send a scope parameter, and minidp
+// honours it only within the statically configured permissions — there is
+// no login or consent step that could approve a runtime request. An absent
+// parameter and the audience's .default form (Entra ID semantics) grant the
+// full configured list, an exact configured entry grants that permission
+// alone, and anything else is invalid_scope.
 func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request) {
 	client, ok := s.authenticateClient(w, r)
 	if !ok {
@@ -638,7 +640,13 @@ func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Req
 			"The client is not authorized to use the client_credentials grant.")
 		return
 	}
-	s.issueAndWriteClientCredentials(w, client)
+	scopes, ok := client.resolveClientCredentialsScopes(r.PostFormValue("scope"))
+	if !ok {
+		writeAuthError(w, "invalid_scope",
+			"The requested scope is not configured for this client; use a registered permission or the audience's .default scope.")
+		return
+	}
+	s.issueAndWriteClientCredentials(w, client, scopes)
 }
 
 // verifyPKCE checks the code_verifier against the stored challenge. Only
@@ -746,10 +754,10 @@ func (s *Server) issueAndWriteTokens(w http.ResponseWriter, grant string, ctx *a
 }
 
 // issueAndWriteClientCredentials mints and writes the client_credentials
-// grant response; a failure degrades to a 500 instead of panicking the
-// process (finding F6).
-func (s *Server) issueAndWriteClientCredentials(w http.ResponseWriter, client *registeredClient) {
-	resp, err := s.issueClientCredentialsTokens(client)
+// grant response for the resolved scope set; a failure degrades to a 500
+// instead of panicking the process (finding F6).
+func (s *Server) issueAndWriteClientCredentials(w http.ResponseWriter, client *registeredClient, scopes []string) {
+	resp, err := s.issueClientCredentialsTokens(client, scopes)
 	if err != nil {
 		slog.Error("token issuance failed", "grant", "client_credentials", "client", client.ID(), "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error", "The token could not be issued.")

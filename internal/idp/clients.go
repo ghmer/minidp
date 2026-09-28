@@ -74,6 +74,12 @@ type Client struct {
 	// invalid_scope — the provider never reflects arbitrary
 	// resource/scope strings.
 	AllowedScopes []string `json:"allowed_scopes,omitempty"`
+	// ClientCredentialsRoles are the Entra-style app roles released in the
+	// roles claim of this client's client_credentials (app-only) access
+	// tokens. They must be configured statically — there is no consent step
+	// for the grant — and, when the clients file defines a role registry for
+	// the client's audience, must be a subset of that registry.
+	ClientCredentialsRoles []string `json:"client_credentials_roles,omitempty"`
 	// RedirectURIs are the registered authorization-response targets. The
 	// policy is mandatory; requests are honoured only for these exact values.
 	RedirectURIs []string `json:"redirect_uris"`
@@ -88,6 +94,22 @@ type Client struct {
 	// stored as bcrypt hashes; every other client's users are invisible to
 	// this client's login form.
 	Users []User `json:"users"`
+}
+
+// ResourceDefinition describes one target API (audience) and the app roles
+// that may be assigned for it — the optional role registry used to validate
+// client_credentials_roles and user role assignments. An audience without a
+// definition imposes no role constraint, so existing files keep working.
+type ResourceDefinition struct {
+	Audience string   `json:"audience"`
+	AppRoles []string `json:"app_roles"`
+}
+
+// ClientsFile bundles the parsed clients file: the registered clients plus
+// the optional per-audience role registry.
+type ClientsFile struct {
+	Clients   []Client
+	Resources []ResourceDefinition
 }
 
 // Confidential reports whether the client uses the confidential profile.
@@ -195,7 +217,35 @@ func (c Client) validateProfile() error {
 	if err := c.validateGrants(); err != nil {
 		return err
 	}
+	if err := c.validateCCRoles(); err != nil {
+		return err
+	}
 	return c.validateAllowedScopes()
+}
+
+// validateCCRoles checks the app-role list for the client_credentials grant:
+// whitespace-free, non-empty, duplicate-free entries, and the roles are only
+// valid when the grant itself is enabled (mirroring the client_credentials
+// scopes rule).
+func (c Client) validateCCRoles() error {
+	if len(c.ClientCredentialsRoles) == 0 {
+		return nil
+	}
+	if !c.AllowsGrant(GrantClientCredentials) {
+		return fmt.Errorf("client %q: client_credentials_roles are set but the client_credentials grant is not enabled", c.ClientID)
+	}
+	seen := make(map[string]bool, len(c.ClientCredentialsRoles))
+	for _, role := range c.ClientCredentialsRoles {
+		if role == "" || role != strings.TrimSpace(role) || strings.ContainsAny(role, " \t\r\n") {
+			return fmt.Errorf("client %q: client_credentials role %q must not be empty, whitespace-padded or contain whitespace",
+				c.ClientID, role)
+		}
+		if seen[role] {
+			return fmt.Errorf("client %q: duplicate client_credentials role %q", c.ClientID, role)
+		}
+		seen[role] = true
+	}
+	return nil
 }
 
 // validateGrants checks the grant_types / client_credentials_scopes pair:
@@ -325,20 +375,124 @@ func validateAbsoluteHTTPURL(raw, what string) (string, error) {
 }
 
 // ReadClients parses and fully validates a clients file into a Client slice.
-// Shared with the clientctl tool.
+// Shared with the clientctl tool. Files may also carry the optional role
+// registry; use ReadClientsFile when it must be preserved.
 func ReadClients(path string) ([]Client, error) {
+	file, err := ReadClientsFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return file.Clients, nil
+}
+
+// ReadClientsFile parses and fully validates a clients file in either form:
+// the legacy bare JSON array of clients (no role registry) or the object
+// form {"clients": [...], "resources": [...]}.
+func ReadClientsFile(path string) (*ClientsFile, error) {
 	raw, err := readScopedFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read clients file: %w", err)
 	}
-	var clients []Client
-	if err := json.Unmarshal(raw, &clients); err != nil {
-		return nil, fmt.Errorf("clients file %q is not a valid JSON array of clients: %w", path, err)
+	file := &ClientsFile{}
+	switch firstNonSpace(raw) {
+	case '[':
+		var clients []Client
+		if err := json.Unmarshal(raw, &clients); err != nil {
+			return nil, fmt.Errorf("clients file %q is not a valid JSON array of clients: %w", path, err)
+		}
+		file.Clients = clients
+	case '{':
+		var doc struct {
+			Clients   *[]Client            `json:"clients"`
+			Resources []ResourceDefinition `json:"resources"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("clients file %q is not a valid JSON clients document: %w", path, err)
+		}
+		if doc.Clients == nil {
+			return nil, fmt.Errorf("clients file %q is an object but carries no clients array", path)
+		}
+		file.Clients = *doc.Clients
+		file.Resources = doc.Resources
+	default:
+		return nil, fmt.Errorf("clients file %q is neither a JSON array of clients nor a clients document", path)
 	}
-	if err := validateClientSlice(clients); err != nil {
+	if err := validateClientSlice(file.Clients); err != nil {
 		return nil, fmt.Errorf("clients file %q: %w", path, err)
 	}
-	return clients, nil
+	if err := validateResourceRegistry(file.Resources, file.Clients); err != nil {
+		return nil, fmt.Errorf("clients file %q: %w", path, err)
+	}
+	return file, nil
+}
+
+// firstNonSpace returns the first non-whitespace byte of the document, or 0
+// for an empty document.
+func firstNonSpace(raw []byte) byte {
+	for _, b := range raw {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return b
+		}
+	}
+	return 0
+}
+
+// validateResourceRegistry validates the optional per-audience role
+// registry and its cross-references: audiences and role names must be
+// whitespace-free and unique, and — for every audience that has a
+// definition — the client_credentials_roles and user role assignments of
+// the clients targeting that audience must be subsets of the defined roles.
+// Audiences without a definition impose no constraint.
+func validateResourceRegistry(resources []ResourceDefinition, clients []Client) error {
+	roles := make(map[string]map[string]bool, len(resources))
+	seenAudience := make(map[string]bool, len(resources))
+	for _, res := range resources {
+		if res.Audience == "" || strings.ContainsAny(res.Audience, " \t\r\n") {
+			return fmt.Errorf("resource audience %q must be non-empty and free of whitespace", res.Audience)
+		}
+		if seenAudience[res.Audience] {
+			return fmt.Errorf("duplicate resource audience %q", res.Audience)
+		}
+		seenAudience[res.Audience] = true
+		if len(res.AppRoles) == 0 {
+			return fmt.Errorf("resource %q must define at least one app role", res.Audience)
+		}
+		defined := make(map[string]bool, len(res.AppRoles))
+		for _, role := range res.AppRoles {
+			if role == "" || strings.ContainsAny(role, " \t\r\n") {
+				return fmt.Errorf("resource %q: app role %q must be non-empty and free of whitespace", res.Audience, role)
+			}
+			if defined[role] {
+				return fmt.Errorf("resource %q: duplicate app role %q", res.Audience, role)
+			}
+			defined[role] = true
+		}
+		roles[res.Audience] = defined
+	}
+	for _, c := range clients {
+		defined, hasRegistry := roles[c.audience()]
+		if !hasRegistry {
+			continue
+		}
+		for _, role := range c.ClientCredentialsRoles {
+			if !defined[role] {
+				return fmt.Errorf("client %q: client_credentials role %q is not defined for audience %q",
+					c.ClientID, role, c.audience())
+			}
+		}
+		for _, u := range c.Users {
+			for _, role := range u.Roles {
+				if !defined[role] {
+					return fmt.Errorf("client %q: user %q holds role %q, which is not defined for audience %q",
+						c.ClientID, u.Username, role, c.audience())
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // validateClientSlice validates every entry and rejects duplicate client ids.
@@ -365,13 +519,33 @@ func validateClientSlice(clients []Client) error {
 func ValidateClient(c Client) error { return c.validate() }
 
 // SaveClients validates and writes the clients file atomically (temp file +
-// rename, mode 0600). Used by the clientctl tool. The file holds client
-// secrets and password hashes, so it must stay private.
+// rename, mode 0600) in the legacy bare-array form. Used by the clientctl
+// tool and tests. The file holds client secrets and password hashes, so it
+// must stay private.
 func SaveClients(path string, clients []Client) error {
-	if err := validateClientSlice(clients); err != nil {
+	return SaveClientsFile(path, &ClientsFile{Clients: clients})
+}
+
+// SaveClientsFile validates and writes a clients file atomically (temp file
+// + rename, mode 0600). Files without a role registry are written in the
+// legacy bare-array form; with a registry the object form is used.
+func SaveClientsFile(path string, file *ClientsFile) error {
+	if err := validateClientSlice(file.Clients); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(clients, "", "  ")
+	if err := validateResourceRegistry(file.Resources, file.Clients); err != nil {
+		return err
+	}
+	var data []byte
+	var err error
+	if len(file.Resources) == 0 {
+		data, err = json.MarshalIndent(file.Clients, "", "  ")
+	} else {
+		data, err = json.MarshalIndent(struct {
+			Clients   []Client             `json:"clients"`
+			Resources []ResourceDefinition `json:"resources"`
+		}{file.Clients, file.Resources}, "", "  ")
+	}
 	if err != nil {
 		return err
 	}
@@ -405,6 +579,37 @@ func (rc *registeredClient) AllowsGrant(grant string) bool { return rc.client.Al
 // client's client_credentials access tokens (validated non-empty at load).
 func (rc *registeredClient) clientCredentialsScopes() []string {
 	return rc.client.ClientCredentialsScopes
+}
+
+// clientCredentialsRoles returns the app roles released on this client's
+// client_credentials access tokens (validated against the optional role
+// registry at load).
+func (rc *registeredClient) clientCredentialsRoles() []string {
+	return rc.client.ClientCredentialsRoles
+}
+
+// resolveClientCredentialsScopes maps the requested scope parameter onto the
+// client's statically configured permissions (Entra ID /.default semantics):
+// an absent parameter and the audience's .default form — with or without the
+// api:// prefix — grant the full configured list, an exact configured entry
+// grants that single permission, and anything else is rejected so the grant
+// never issues unconfigured scopes.
+func (rc *registeredClient) resolveClientCredentialsScopes(requested string) ([]string, bool) {
+	configured := rc.clientCredentialsScopes()
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return configured, true
+	}
+	audience := strings.TrimPrefix(rc.Audience(), "api://")
+	if requested == audience+"/.default" || requested == "api://"+audience+"/.default" {
+		return configured, true
+	}
+	for _, sc := range configured {
+		if sc == requested {
+			return []string{sc}, true
+		}
+	}
+	return nil, false
 }
 
 // allowsScope reports whether sc is one of the client's registered custom
@@ -465,11 +670,11 @@ type clientRegistry struct {
 // LoadClients reads and validates a clients file and indexes it into the
 // account/registration backend of the IdP. Secrets are never logged.
 func LoadClients(path string) (*clientRegistry, error) {
-	clients, err := ReadClients(path)
+	file, err := ReadClientsFile(path)
 	if err != nil {
 		return nil, err
 	}
-	r, err := newClientRegistry(clients)
+	r, err := newClientRegistry(file.Clients)
 	if err != nil {
 		return nil, err
 	}

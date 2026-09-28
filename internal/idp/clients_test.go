@@ -2,6 +2,7 @@ package idp
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,19 +149,141 @@ func TestReadClientsErrors(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]string{
 		"malformed json": `[{"client_id": "app",`,
-		"not an array":   `{"client_id": "app"}`,
+		"not an array or object": `{"client_id": "app"}`,
+		"object without clients": `{"resources": [{"audience": "api", "app_roles": ["r"]}]}`,
 		"duplicate ids": `[{"client_id": "app", "type": "public", "redirect_uris": ["https://a.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]},` +
 			`{"client_id": "app", "type": "public", "redirect_uris": ["https://b.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]}]`,
+		"duplicate audiences": `{"clients": [{"client_id": "app", "type": "public", "redirect_uris": ["https://a.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]}],` +
+			`"resources": [{"audience": "api", "app_roles": ["r"]}, {"audience": "api", "app_roles": ["r"]} ]}`,
+		"role registry without roles": `{"clients": [{"client_id": "app", "type": "public", "redirect_uris": ["https://a.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234"}]}],` +
+			`"resources": [{"audience": "api"}]}`,
+		"cc role outside the registry": `{"clients": [{"client_id": "app", "type": "confidential", "client_secret": "a-confidential-secret", "audience": "api", "grant_types": ["client_credentials"], "client_credentials_scopes": ["api:read"], "client_credentials_roles": ["unknown"]}],` +
+			`"resources": [{"audience": "api", "app_roles": ["integration"]}]}`,
+		"user role outside the registry": `{"clients": [{"client_id": "app", "type": "public", "redirect_uris": ["https://a.example/cb"], "users": [{"username": "u", "password_hash": "$2a$10$0123456789012345678901234567890123456789012345678901234", "roles": ["unknown"]}]}],` +
+			`"resources": [{"audience": "app", "app_roles": ["user"]}]}`,
 	}
 	for name, content := range cases {
 		path := filepath.Join(dir, name+"-clients.json")
 		writeFile(t, path, content)
-		if _, err := ReadClients(path); err == nil {
+		if _, err := ReadClientsFile(path); err == nil {
 			t.Errorf("%s: expected an error, got none", name)
 		}
 	}
 	if _, err := ReadClients(filepath.Join(dir, "missing.json")); err == nil {
 		t.Error("expected an error for a missing clients file")
+	}
+}
+
+// TestClientsFileObjectFormRoundTrip pins the object form: a file with a
+// role registry round-trips through SaveClientsFile, the registry survives
+// clientctl-style rewrites, and the legacy bare-array form is preserved
+// when no registry is configured.
+func TestClientsFileObjectFormRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clients.json")
+	svc := testServiceClient(t, "svc", "a-confidential-secret")
+	svc.Audience = "fake-hr"
+	svc.ClientCredentialsRoles = []string{"integration"}
+	ui := testPublicClient(t)
+	ui.Audience = "fake-hr"
+	ui.Users[0].Roles = []string{"user"}
+	file := &ClientsFile{
+		Clients:   []Client{svc, ui},
+		Resources: []ResourceDefinition{{Audience: "fake-hr", AppRoles: []string{"integration", "user"}}},
+	}
+	if err := SaveClientsFile(path, file); err != nil {
+		t.Fatalf("SaveClientsFile: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("clients file mode = %o, want 600", perm)
+	}
+
+	loaded, err := ReadClientsFile(path)
+	if err != nil {
+		t.Fatalf("ReadClientsFile: %v", err)
+	}
+	if len(loaded.Clients) != 2 || len(loaded.Resources) != 1 || loaded.Resources[0].Audience != "fake-hr" {
+		t.Fatalf("unexpected contents: %+v", loaded)
+	}
+
+	// A registry-less save keeps the legacy bare-array form.
+	legacy := filepath.Join(t.TempDir(), "clients.json")
+	if err := SaveClients(legacy, []Client{svc}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
+	raw, err := os.ReadFile(legacy)
+	if err != nil {
+		t.Fatalf("read legacy file: %v", err)
+	}
+	if firstNonSpace(raw) != '[' {
+		t.Errorf("registry-less file is not the legacy array form: %.20s", raw)
+	}
+
+	// The registry validates: dropping a defined role from the registry
+	// while a client still uses it must be rejected on save.
+	file.Resources[0].AppRoles = []string{"user"}
+	if err := SaveClientsFile(path, file); err == nil {
+		t.Error("saving a registry that no longer defines a used role must fail")
+	}
+}
+
+// TestClientCredentialsRoles pins the app-role emission and validation: the
+// configured roles ride in the roles claim of app-only tokens, a
+// client_credentials role list without the grant fails validation, and
+// whitespace or duplicates are rejected.
+func TestClientCredentialsRoles(t *testing.T) {
+	svc := testServiceClient(t, "svc", "a-confidential-secret")
+	svc.ClientCredentialsRoles = []string{"integration", "reader"}
+	ts, _ := testIDPClients(t, []Client{svc}, nil)
+
+	resp := ccToken(t, ts.URL+"/token", "svc", "a-confidential-secret")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /token: status = %d, body = %v", resp.StatusCode, decodeJSON(t, resp))
+	}
+	claims := verifyTokenString(t, decodeJSON(t, resp)["access_token"].(string), ts.URL)
+	roles, ok := claims["roles"].([]any)
+	if !ok || len(roles) != 2 || roles[0] != "integration" || roles[1] != "reader" {
+		t.Errorf("roles = %v, want [integration reader]", claims["roles"])
+	}
+	if claims["idtyp"] != "app" {
+		t.Errorf("idtyp = %v, want app (app-only token)", claims["idtyp"])
+	}
+
+	for name, mutate := range map[string]func(*Client){
+		"roles without the grant": func(c *Client) { c.GrantTypes = nil },
+		"whitespace role":         func(c *Client) { c.ClientCredentialsRoles = []string{"integration reader"} },
+		"empty role":              func(c *Client) { c.ClientCredentialsRoles = []string{""} },
+		"duplicate role":          func(c *Client) { c.ClientCredentialsRoles = []string{"integration", "integration"} },
+	} {
+		c := testServiceClient(t, "svc", "a-confidential-secret")
+		mutate(&c)
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: expected a validation error, got none", name)
+		}
+	}
+}
+
+// TestDelegatedTokenIdtyp pins that user tokens carry idtyp=user.
+func TestDelegatedTokenIdtyp(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile"},
+	})
+	if err != nil {
+		t.Fatalf("issueTokens: %v", err)
+	}
+	access := parseWithServer(t, srv, resp.AccessToken)
+	if access["idtyp"] != "user" {
+		t.Errorf("idtyp = %v, want user (delegated token)", access["idtyp"])
+	}
+	id := parseWithServer(t, srv, resp.IDToken)
+	if _, has := id["idtyp"]; has {
+		t.Error("id token must not carry idtyp")
 	}
 }
 

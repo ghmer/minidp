@@ -145,19 +145,55 @@ func TestClientCredentialsRequiresOptIn(t *testing.T) {
 	}
 }
 
-// TestClientCredentialsIgnoresRequestedScope pins the static scope policy:
-// the grant has no consent step, so a requested scope parameter must not
-// widen (or change) the configured scopes.
-func TestClientCredentialsIgnoresRequestedScope(t *testing.T) {
+// TestClientCredentialsValidatesRequestedScope pins the /.default scope
+// semantics: an absent parameter grants the full configured list, the
+// audience's .default form (with or without the api:// prefix) grants the
+// same, an exact configured entry grants that permission alone, and
+// anything else — another audience's .default, unconfigured permissions,
+// OIDC scopes — is invalid_scope. The grant never issues unconfigured
+// scopes, and there is still no consent step that could widen the
+// registration.
+func TestClientCredentialsValidatesRequestedScope(t *testing.T) {
 	ts, _ := testIDPClients(t, []Client{testServiceClient(t, "fake-hr-mcp-service", "a-confidential-secret")}, nil)
+	const basic = "fake-hr-mcp-service"
+	const secret = "a-confidential-secret"
 
-	form := url.Values{"grant_type": {"client_credentials"}, "scope": {"openid profile email"}}
-	resp := postTokenBasic(t, ts.URL+"/token", form, "fake-hr-mcp-service", "a-confidential-secret")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /token: status = %d, body = %v", resp.StatusCode, decodeJSON(t, resp))
-	}
-	if got := decodeJSON(t, resp)["scope"]; got != "fake-hr:read fake-hr:write" {
-		t.Errorf("scope = %v, want the configured scopes despite the request", got)
+	for _, tc := range []struct {
+		name      string
+		scope     string
+		wantScope string
+		wantError string
+	}{
+		{"absent parameter", "", "fake-hr:read fake-hr:write", ""},
+		{"audience .default", "fake-hr/.default", "fake-hr:read fake-hr:write", ""},
+		{"api:// audience .default", "api://fake-hr/.default", "fake-hr:read fake-hr:write", ""},
+		{"exact configured entry", "fake-hr:read", "fake-hr:read", ""},
+		{"foreign audience .default", "api://other-api/.default", "", "invalid_scope"},
+		{"unconfigured permission", "fake-hr:admin", "", "invalid_scope"},
+		{"oidc scopes are not m2m permissions", "openid profile email", "", "invalid_scope"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := url.Values{"grant_type": {"client_credentials"}}
+			if tc.scope != "" {
+				form.Set("scope", tc.scope)
+			}
+			resp := postTokenBasic(t, ts.URL+"/token", form, basic, secret)
+			if tc.wantError != "" {
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400", resp.StatusCode)
+				}
+				if got := decodeJSON(t, resp)["error"]; got != tc.wantError {
+					t.Errorf("error = %v, want %s", got, tc.wantError)
+				}
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %v", resp.StatusCode, decodeJSON(t, resp))
+			}
+			if got := decodeJSON(t, resp)["scope"]; got != tc.wantScope {
+				t.Errorf("scope = %v, want %q", got, tc.wantScope)
+			}
+		})
 	}
 }
 

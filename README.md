@@ -43,6 +43,11 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
   own audience) and request them at `/authorize`; granted scopes are
   released in the access token's `scope` claim and advertised in discovery.
 - Refresh token grant with single-use rotation.
+- Client-credentials grant (RFC 6749 §4.4) for machine-to-machine flows:
+  statically configured scopes with Entra-style `.default` resolution, the
+  configured app roles in the `roles` claim, and `idtyp` distinguishing
+  app-only from user tokens. An optional per-audience role registry
+  validates role assignments at load.
 - Staged signing-key rotation (`minidp rotate-keys`): old and new keys are
   published in the JWKS simultaneously, tokens signed before the rotation
   stay verifiable until the retiring key's retention horizon passes, and

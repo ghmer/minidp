@@ -146,15 +146,22 @@ a confidential client can be opted in to the `client_credentials` grant:
   user session) and no `refresh_token` (RFC 6749 §4.4.3). The subject is
   the `client_id` itself — a service-account-like identity, as in other
   IdPs (Keycloak service accounts, Azure AD). No user-derived claims
-  (`preferred_username`, `email`, `name`, `roles`) are released, and
-  `/userinfo` is meaningless for such a token.
+  (`preferred_username`, `email`, `name`) are released, and `/userinfo` is
+  meaningless for such a token. The token carries `idtyp: "app"` (Entra's
+  app-only marker) and the client's configured app roles in the `roles`
+  claim; delegated tokens carry `idtyp: "user"`.
 - The audience is the client's registered `audience` field, so a purely
   service client can mint tokens for a *different* API's audience (e.g.
   `audience: "fake-hr"`) than its own `client_id`.
-- Scopes cannot be requested at token time — there is no login or consent
-  step that could approve them. They come exclusively from the client's
-  static `client_credentials_scopes` list, which is mandatory (non-empty)
-  with the grant; a `scope` request parameter is ignored.
+- Scopes resolve exclusively from the static `client_credentials_scopes`
+  list (mandatory, non-empty, with the grant) — there is no login or
+  consent step that could approve more. The `scope` request parameter is
+  honoured only within that list, following Entra ID's `/.default`
+  semantics: an absent parameter and the audience's `fake-hr/.default` or
+  `api://fake-hr/.default` form grant the full configured list, an exact
+  configured entry (`scope=fake-hr:read`) grants that permission alone,
+  and anything else — another audience, unconfigured permissions, OIDC
+  scopes — is refused with `invalid_scope`.
 - `/revoke` (via the `jti` denylist) and `/introspect` work as for any
   other access token.
 
@@ -170,17 +177,19 @@ this makes the client a first-class API consumer in its own right:
   "client_secret": "...",
   "audience": "fake-hr",
   "grant_types": ["client_credentials"],
-  "client_credentials_scopes": ["fake-hr:read", "fake-hr:write"]
+  "client_credentials_scopes": ["fake-hr:read", "fake-hr:write"],
+  "client_credentials_roles": ["integration"]
 }
 ```
 
 ```sh
 clientctl client add -file clients.json -client fake-hr-mcp-service \
   -type confidential -secret "$(openssl rand -base64 32)" \
-  -audience fake-hr -grant-types client_credentials -cc-scopes fake-hr:read,fake-hr:write
+  -audience fake-hr -grant-types client_credentials \
+  -cc-scopes fake-hr:read,fake-hr:write -cc-roles integration
 
 curl -s -u fake-hr-mcp-service:SECRET -d grant_type=client_credentials \
-  http://localhost:8080/token
+  -d scope=fake-hr/.default http://localhost:8080/token
 ```
 
 Discovery advertises `client_credentials` in `grant_types_supported` when
@@ -188,13 +197,37 @@ at least one registered client is opted in, and the same metadata document
 is additionally served at `/.well-known/oauth-authorization-server` (RFC
 8414), the path OAuth-only (non-OIDC) libraries probe.
 
+### Role registry (optional)
+
+A clients file may switch to the object form and declare, per audience,
+which app roles exist — mirroring Entra ID app roles. The registry is
+validation-only: an audience without a definition imposes no constraint,
+while a defined audience restricts both `client_credentials_roles` and the
+user role assignments of every client targeting that audience to its
+declared roles:
+
+```json
+{
+  "clients": [ ... ],
+  "resources": [
+    { "audience": "fake-hr", "app_roles": ["integration", "user"] }
+  ]
+}
+```
+
+With this registry, a client_credentials role `supervisor` for audience
+`fake-hr` or a user holding `supervisor` fails file validation at startup
+(fail-fast) and at every clientctl save.
+
 ## The clients file
 
-Set `IDP_CLIENTS_FILE` to a JSON file containing an array of clients. Each
-client carries its own profile, redirect policy, audience and user
-accounts. Passwords must be salted bcrypt hashes (the salt is embedded in
-the bcrypt format) — the IdP refuses to start on a file with plaintext
-passwords, duplicate usernames or malformed entries. Create and maintain
+Set `IDP_CLIENTS_FILE` to a JSON file holding the registered clients — a
+bare JSON array of client entries, or (when a role registry is used) the
+object form `{"clients": [...], "resources": [...]}`. Each client carries
+its own profile, redirect policy, audience and user accounts. Passwords
+must be salted bcrypt hashes (the salt is embedded in the bcrypt format) —
+the IdP refuses to start on a file with plaintext passwords, duplicate
+usernames or malformed entries. Create and maintain
 the file with the bundled tool:
 
 ```sh
@@ -288,6 +321,10 @@ File format (see `clients.json.example`):
   Each entry must have the `api://<audience>/<name>` form and reference the
   client's own audience (an optional `api://` prefix on the audience is
   ignored on both sides); anything else fails file validation at startup.
+- `client_credentials_roles` are the app roles released in the `roles`
+  claim of the client's app-only (`client_credentials`) tokens. They
+  require the grant and — with a role registry present — must be defined
+  for the client's audience.
 - `allowed_origins` adds explicit CORS origins on top of the hosts derived
   from the redirect URIs.
 - Each client's `users` are the only accounts that can sign in for that

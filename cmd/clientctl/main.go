@@ -11,12 +11,12 @@
 //	clientctl client show    -client app                           [-file clients.json]
 //	clientctl client add     -client app -type public|confidential [-file clients.json]
 //	                         [-secret ...|-] [-audience ...] [-grant-types ...]
-//	                         [-cc-scopes ...] [-allowed-scopes ...]
+//	                         [-cc-scopes ...] [-cc-roles ...] [-allowed-scopes ...]
 //	                         [-redirect uri[,uri...]]
 //	                         [-post-logout uri,...] [-origin uri,...]
 //	clientctl client update  -client app                           [-file clients.json]
 //	                         [-type ...] [-secret ...|-] [-audience ...]
-//	                         [-grant-types ...] [-cc-scopes ...]
+//	                         [-grant-types ...] [-cc-scopes ...] [-cc-roles ...]
 //	                         [-allowed-scopes ...] [-redirect ...]
 //	                         [-post-logout ...] [-origin ...]
 //	clientctl client remove  -client app                           [-file clients.json]
@@ -82,12 +82,12 @@ Usage:
   clientctl client show    -client app                           [-file clients.json]
   clientctl client add     -client app -type public|confidential [-file clients.json]
                            [-secret ...|-] [-audience ...] [-grant-types ...]
-                           [-cc-scopes ...] [-allowed-scopes ...]
+                           [-cc-scopes ...] [-cc-roles ...] [-allowed-scopes ...]
                            [-redirect uri[,uri...]]
                            [-post-logout uri,...] [-origin uri,...]
   clientctl client update  -client app                           [-file clients.json]
                            [-type ...] [-secret ...|-] [-audience ...]
-                           [-grant-types ...] [-cc-scopes ...]
+                           [-grant-types ...] [-cc-scopes ...] [-cc-roles ...]
                            [-allowed-scopes ...] [-redirect ...]
                            [-post-logout ...] [-origin ...]
   clientctl client remove  -client app                           [-file clients.json]
@@ -295,6 +295,7 @@ type clientFlags struct {
 	audience      *string
 	grantTypes    *string
 	ccScopes      *string
+	ccRoles       *string
 	allowedScopes *string
 	redirect      *string
 	postLogout    *string
@@ -309,6 +310,7 @@ func registerClientFlags(fs *flag.FlagSet) *clientFlags {
 	f.audience = fs.String("audience", "", "access-token audience; defaults to the client_id")
 	f.grantTypes = fs.String("grant-types", "", "comma-separated OAuth grants: authorization_code, refresh_token, client_credentials (default: authorization_code,refresh_token)")
 	f.ccScopes = fs.String("cc-scopes", "", "comma-separated scopes of the client_credentials access tokens (required with -grant-types client_credentials)")
+	f.ccRoles = fs.String("cc-roles", "", "comma-separated app roles released in the roles claim of the client_credentials access tokens (must be defined for the audience when the clients file carries a role registry)")
 	f.allowedScopes = fs.String("allowed-scopes", "", "comma-separated custom delegated API scopes the client may request at /authorize (api://<audience>/<name> form, referencing the client's own audience)")
 	f.redirect = fs.String("redirect", "", "comma-separated registered redirect_uri values (required unless client_credentials is the only grant)")
 	f.postLogout = fs.String("post-logout", "", "comma-separated post_logout_redirect_uri values for /end_session")
@@ -382,6 +384,7 @@ func clientAdd(args []string) error {
 		Audience:                *f.audience,
 		GrantTypes:              parseList(*f.grantTypes),
 		ClientCredentialsScopes: parseList(*f.ccScopes),
+		ClientCredentialsRoles:  parseList(*f.ccRoles),
 		AllowedScopes:           parseList(*f.allowedScopes),
 		RedirectURIs:            parseList(*f.redirect),
 		PostLogoutRedirectURIs:  parseList(*f.postLogout),
@@ -480,6 +483,10 @@ func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (boo
 		client.ClientCredentialsScopes = parseList(*spec.f.ccScopes)
 		changed = true
 	}
+	if spec.provid["cc-roles"] {
+		client.ClientCredentialsRoles = parseList(*spec.f.ccRoles)
+		changed = true
+	}
 	if spec.provid["allowed-scopes"] {
 		client.AllowedScopes = parseList(*spec.f.allowedScopes)
 		changed = true
@@ -517,7 +524,7 @@ func clientUpdate(args []string) error {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -allowed-scopes, -redirect, -post-logout or -origin")
+		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -cc-roles, -allowed-scopes, -redirect, -post-logout or -origin")
 	}
 	// Pre-flight the mutated entry so an inconsistent combination (e.g.
 	// -grant-types client_credentials without -cc-scopes) is reported
@@ -575,6 +582,9 @@ func describeClient(c idp.Client) string {
 		"\tgrants: " + strings.Join(grants, ",")
 	if len(c.ClientCredentialsScopes) > 0 {
 		line += "\tcc-scopes: " + strings.Join(c.ClientCredentialsScopes, ",")
+	}
+	if len(c.ClientCredentialsRoles) > 0 {
+		line += "\tcc-roles: " + strings.Join(c.ClientCredentialsRoles, ",")
 	}
 	if len(c.AllowedScopes) > 0 {
 		line += "\tallowed-scopes: " + strings.Join(c.AllowedScopes, ",")

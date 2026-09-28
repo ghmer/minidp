@@ -24,12 +24,14 @@ type tokenResponse struct {
 // accessClaims are the claims embedded in the issued access token. client_id
 // is the RFC 9068 §2.2 REQUIRED identifier of the client that requested the
 // token; it is emitted without omitempty so every access token carries it.
-// azp names the same party in the Entra ID v2.0 claim shape, and scp carries
-// the granted resource permissions as short names (see shortScopeNames).
+// azp names the same party in the Entra ID v2.0 claim shape, scp carries the
+// granted resource permissions as short names (see shortScopeNames), and
+// idtyp distinguishes user tokens from app-only tokens ("user"/"app").
 type accessClaims struct {
 	jwt.RegisteredClaims
 	ClientID string   `json:"client_id"`
 	Azp      string   `json:"azp,omitempty"`
+	Idtyp    string   `json:"idtyp,omitempty"`
 	Scp      string   `json:"scp,omitempty"`
 	Scope    string   `json:"scope,omitempty"`
 	Username string   `json:"preferred_username,omitempty"`
@@ -121,6 +123,7 @@ func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, 
 		RegisteredClaims: rc,
 		ClientID:         clientID,
 		Azp:              clientID,
+		Idtyp:            "user",
 		Scope:            joinScopes(scopes),
 		Scp:              strings.Join(shortScopeNames(scopes), " "),
 		Email:            p.email,
@@ -236,9 +239,9 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 // or refresh token is issued (RFC 6749 §4.4.3: no refresh token for this
 // grant). No profile claims are released: there is no user record the
 // token could speak about. client_id is the RFC 9068 §2.2 REQUIRED
-// identifier of the requesting client.
-func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenResponse, error) {
-	scopes := client.clientCredentialsScopes()
+// identifier of the requesting client; idtyp marks the token as app-only
+// and the configured app roles ride in the roles claim (Entra parity).
+func (s *Server) issueClientCredentialsTokens(client *registeredClient, scopes []string) (*tokenResponse, error) {
 	now := time.Now()
 	expires := now.Add(s.cfg.AccessTokenTTL)
 
@@ -252,7 +255,9 @@ func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenR
 		RegisteredClaims: s.registeredClaims(client.Audience(), client.ID(), jti, now, expires),
 		ClientID:         client.ID(),
 		Azp:              client.ID(),
+		Idtyp:            "app",
 		Scope:            joinScopes(scopes),
+		Roles:            client.clientCredentialsRoles(),
 	}
 	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {

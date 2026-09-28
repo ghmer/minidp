@@ -228,7 +228,7 @@ func TestEntraClaimShape(t *testing.T) {
 	}
 
 	// The app-only token names its client in azp but carries no scp.
-	cc, err := srv.issueClientCredentialsTokens(srv.clients.lookup("svc"))
+	cc, err := srv.issueClientCredentialsTokens(srv.clients.lookup("svc"), nil)
 	if err != nil {
 		t.Fatalf("issueClientCredentialsTokens: %v", err)
 	}
