@@ -225,7 +225,7 @@ func (s *store) dropExpired() {
 	dropWhere(s.refresh, func(f *refreshEntry) bool { return now.After(f.ExpiresAt) })
 	dropWhere(s.usedRefresh, func(f *refreshEntry) bool { return now.After(f.ExpiresAt) })
 	dropWhere(s.accessJTI, func(rec jtiRecord) bool { return now.After(rec.exp) })
-	dropWhere(s.deniedJTI, func(until time.Time) bool { return now.After(until) })
+	dropWhere(s.deniedJTI, now.After)
 }
 
 // dropWhere removes every map entry whose value satisfies the expired

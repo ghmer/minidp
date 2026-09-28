@@ -35,7 +35,7 @@ type UserStore interface {
 }
 
 // validate checks one user entry when the clients file is loaded or saved.
-func (u User) validate() error {
+func (u *User) validate() error {
 	if strings.TrimSpace(u.Username) == "" {
 		return fmt.Errorf("username must not be empty")
 	}
@@ -66,7 +66,8 @@ func (u User) validate() error {
 // user validation. Called for every client's users array.
 func validateUserSlice(users []User) error {
 	seen := make(map[string]bool, len(users))
-	for i, u := range users {
+	for i := range users {
+		u := &users[i]
 		if err := u.validate(); err != nil {
 			return fmt.Errorf("user entry %d: %w", i, err)
 		}

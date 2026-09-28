@@ -114,11 +114,11 @@ type ClientsFile struct {
 }
 
 // Confidential reports whether the client uses the confidential profile.
-func (c Client) Confidential() bool { return c.Type == TypeConfidential }
+func (c *Client) Confidential() bool { return c.Type == TypeConfidential }
 
 // grants resolves the client's enabled grants: the configured list, or the
 // historic default for registrations without an explicit one.
-func (c Client) grants() []string {
+func (c *Client) grants() []string {
 	if len(c.GrantTypes) == 0 {
 		return []string{GrantAuthorizationCode, GrantRefreshToken}
 	}
@@ -127,14 +127,14 @@ func (c Client) grants() []string {
 
 // AllowsGrant reports whether the client may use the given OAuth2 grant at
 // the token endpoint.
-func (c Client) AllowsGrant(grant string) bool {
+func (c *Client) AllowsGrant(grant string) bool {
 	return slices.Contains(c.grants(), grant)
 }
 
 // Interactive reports whether the client participates in the browser-based
 // authorization_code or refresh_token flows — the only grants with user
 // context, and therefore the only ones that need redirect URIs and accounts.
-func (c Client) Interactive() bool {
+func (c *Client) Interactive() bool {
 	return c.AllowsGrant(GrantAuthorizationCode) || c.AllowsGrant(GrantRefreshToken)
 }
 
@@ -143,13 +143,13 @@ func (c Client) Interactive() bool {
 // client_secret is intentionally part of that format (the token endpoint
 // compares it in constant time), so it is written verbatim — which is why the
 // file must stay mode 0600 (SaveClients enforces this).
-func (c Client) MarshalJSON() ([]byte, error) {
+func (c *Client) MarshalJSON() ([]byte, error) {
 	type plain Client
-	return json.Marshal(plain(c))
+	return json.Marshal(plain(*c))
 }
 
 // validate checks one client entry when the clients file is loaded or saved.
-func (c Client) validate() error {
+func (c *Client) validate() error {
 	if err := c.validateIdentity(); err != nil {
 		return err
 	}
@@ -172,7 +172,7 @@ func (c Client) validate() error {
 
 // validateIdentity checks the client_id shape: non-empty, whitespace-free
 // (client_id travels through forms, URLs and logs).
-func (c Client) validateIdentity() error {
+func (c *Client) validateIdentity() error {
 	if strings.TrimSpace(c.ClientID) == "" {
 		return fmt.Errorf("client_id must not be empty")
 	}
@@ -187,7 +187,7 @@ func (c Client) validateIdentity() error {
 
 // validateProfile checks the profile/secret combination: a public client must
 // not carry a dead secret; a confidential client needs one.
-func (c Client) validateProfile() error {
+func (c *Client) validateProfile() error {
 	switch c.Type {
 	case TypePublic:
 		if c.ClientSecret != "" {
@@ -223,7 +223,7 @@ func (c Client) validateProfile() error {
 // whitespace-free, non-empty, duplicate-free entries, and the roles are only
 // valid when the grant itself is enabled (mirroring the client_credentials
 // scopes rule).
-func (c Client) validateCCRoles() error {
+func (c *Client) validateCCRoles() error {
 	if len(c.ClientCredentialsRoles) == 0 {
 		return nil
 	}
@@ -248,7 +248,7 @@ func (c Client) validateCCRoles() error {
 // known grant names, the machine-to-machine grant only for confidential
 // clients, statically configured (non-empty) scopes for it, and no scopes
 // entry without the grant.
-func (c Client) validateGrants() error {
+func (c *Client) validateGrants() error {
 	hasCC := false
 	seen := make(map[string]bool, len(c.GrantTypes))
 	for _, g := range c.GrantTypes {
@@ -297,7 +297,7 @@ func (c Client) validateGrants() error {
 // form, and its authority must reference the client's own audience (an
 // optional api:// prefix on the audience is ignored on both sides), so a
 // client can never request authorization for a foreign resource.
-func (c Client) validateAllowedScopes() error {
+func (c *Client) validateAllowedScopes() error {
 	wantAuthority := strings.TrimPrefix(c.audience(), "api://")
 	for _, sc := range c.AllowedScopes {
 		if sc == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
@@ -321,7 +321,7 @@ func (c Client) validateAllowedScopes() error {
 // redirect_uri is required only for clients with an interactive grant: a
 // purely machine-to-machine client (client_credentials only) never sends the
 // browser anywhere. Extra lists stay validated whenever present.
-func (c Client) validateURLs() error {
+func (c *Client) validateURLs() error {
 	if c.Interactive() && len(c.RedirectURIs) == 0 {
 		return fmt.Errorf("client %q: at least one redirect_uri is required", c.ClientID)
 	}
@@ -344,7 +344,7 @@ func (c Client) validateURLs() error {
 }
 
 // audience returns the token audience, defaulting to the client id.
-func (c Client) audience() string {
+func (c *Client) audience() string {
 	if c.Audience != "" {
 		return c.Audience
 	}
@@ -468,7 +468,8 @@ func validateResourceRegistry(resources []ResourceDefinition, clients []Client) 
 		}
 		roles[res.Audience] = defined
 	}
-	for _, c := range clients {
+	for i := range clients {
+		c := &clients[i]
 		defined, hasRegistry := roles[c.audience()]
 		if !hasRegistry {
 			continue
@@ -496,7 +497,8 @@ func validateResourceRegistry(resources []ResourceDefinition, clients []Client) 
 // incrementally); starting the IdP with one is refused by the registry.
 func validateClientSlice(clients []Client) error {
 	seen := make(map[string]bool, len(clients))
-	for i, c := range clients {
+	for i := range clients {
+		c := &clients[i]
 		if err := c.validate(); err != nil {
 			return fmt.Errorf("entry %d (client %q): %w", i, c.ClientID, err)
 		}
@@ -512,7 +514,7 @@ func validateClientSlice(clients []Client) error {
 // returns its validation error. Exported for the clientctl tool: it can
 // pre-flight a mutated in-memory entry before a save, instead of letting the
 // save-time slice validation report the problem.
-func ValidateClient(c Client) error { return c.validate() }
+func ValidateClient(c *Client) error { return c.validate() }
 
 // SaveClients validates and writes the clients file atomically (temp file +
 // rename, mode 0600) in the legacy bare-array form. Used by the clientctl
@@ -693,7 +695,8 @@ func newClientRegistry(clients []Client) (*clientRegistry, error) {
 		audiences:       make(map[string]bool, len(clients)),
 		origins:         make(map[string]bool),
 	}
-	for _, c := range clients {
+	for i := range clients {
+		c := &clients[i]
 		if c.Interactive() && len(c.Users) == 0 {
 			return nil, fmt.Errorf("client %q has no users: add at least one account (clientctl user add)", c.ClientID)
 		}
@@ -701,7 +704,7 @@ func newClientRegistry(clients []Client) (*clientRegistry, error) {
 			return nil, fmt.Errorf("duplicate client_id %q", c.ClientID)
 		}
 		rc := &registeredClient{
-			client: c,
+			client: *c,
 			users:  newStaticUserStore(c.Users),
 		}
 		rc.explicitOrigins = make(map[string]bool, len(c.AllowedOrigins))

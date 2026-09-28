@@ -132,7 +132,7 @@ func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {
 
 // render writes the login page. Empty Title/Subtitle in data fall back to the
 // configured defaults.
-func (lt *loginTemplate) render(w io.Writer, data loginData) error {
+func (lt *loginTemplate) render(w io.Writer, data *loginData) error {
 	if data.Title == "" {
 		data.Title = lt.title
 	}

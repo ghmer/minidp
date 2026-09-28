@@ -17,7 +17,7 @@ func newTestServer(t *testing.T) *Server {
 	if err := SaveClients(clientsFile, []Client{testPublicClient(t)}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -116,7 +116,7 @@ func TestIssueTokensSeparateAudiences(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{conf}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -168,7 +168,7 @@ func TestEntraClaimShape(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{conf, service}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,
@@ -295,7 +295,7 @@ func TestIssueTokensReleasesRoles(t *testing.T) {
 	if err := SaveClients(clientsFile, []Client{client}); err != nil {
 		t.Fatalf("SaveClients: %v", err)
 	}
-	srv, err := New(Config{
+	srv, err := New(&Config{
 		Issuer:          "https://idp.test",
 		ClientsFile:     clientsFile,
 		AccessTokenTTL:  time.Hour,

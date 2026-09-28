@@ -111,12 +111,14 @@ func TestClientValidation(t *testing.T) {
 			c.AllowedScopes = []string{"api://other-api/read"}
 		}),
 	} {
-		if err := tc.validate(); err == nil {
+		c := tc
+		if err := c.validate(); err == nil {
 			t.Errorf("%s: expected a validation error, got none", name)
 		}
 	}
 	// The unmutated entry and a valid confidential variant pass.
-	if err := validClient(t).validate(); err != nil {
+	c := validClient(t)
+	if err := c.validate(); err != nil {
 		t.Errorf("valid public client rejected: %v", err)
 	}
 	confidential := validClient(t)

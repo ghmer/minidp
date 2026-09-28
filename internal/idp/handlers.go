@@ -88,11 +88,11 @@ var supportedScopes = map[string]bool{"openid": true, "profile": true, "email": 
 // unvalidated URI would be an open redirect (RFC 6749 §4.1.2.1). Only
 // registered clients may start a flow, and only against their own registered
 // redirect URIs (review findings H1/H2).
-func (s *Server) clientForAuthorize(q url.Values) (*registeredClient, string) {
+func (s *Server) clientForAuthorize(q url.Values) (client *registeredClient, message string) {
 	if q.Get("client_id") == "" {
 		return nil, "Missing client_id."
 	}
-	client := s.clients.lookup(q.Get("client_id"))
+	client = s.clients.lookup(q.Get("client_id"))
 	if client == nil {
 		return nil, "Unknown client_id."
 	}
@@ -227,7 +227,7 @@ func (s *Server) redirectToClient(w http.ResponseWriter, r *http.Request, client
 	if err != nil || target.String() == "" {
 		// Unreachable: the redirect_uri passed validateClientBinding, but the
 		// error page is the safe fallback either way.
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Invalid redirect_uri."})
+		s.renderLoginPage(w, r, http.StatusBadRequest, &loginData{Message: "Invalid redirect_uri."})
 		return
 	}
 	params := target.Query()
@@ -290,7 +290,7 @@ const nonceBytes = 32
 // and keeps forms rendered earlier valid, instead of silently invalidating
 // every previously issued form. The token itself is freshly signed per render
 // and expires with the manager TTL either way.
-func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status int, data loginData) {
+func (s *Server) renderLoginPage(w http.ResponseWriter, r *http.Request, status int, data *loginData) {
 	if data.Action != "" {
 		nonce := csrfNonce(r)
 		if len(nonce) != nonceBytes {
@@ -332,14 +332,14 @@ func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	client, problem := s.clientForAuthorize(q)
 	if problem != "" {
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
+		s.renderLoginPage(w, r, http.StatusBadRequest, &loginData{Message: problem})
 		return
 	}
 	if code, description := s.validateAuthorizeRequest(client, q); code != "" {
 		s.authorizeErrorRedirect(w, r, client, q, code, description)
 		return
 	}
-	s.renderLoginPage(w, r, http.StatusOK, loginData{
+	s.renderLoginPage(w, r, http.StatusOK, &loginData{
 		Action: "/authorize",
 		Hidden: oauthHiddenFields(q),
 		// login_hint pre-fills the username field (OIDC Core §3.1.2.1).
@@ -351,7 +351,7 @@ func (s *Server) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 // carrying the OAuth2 context through the hidden fields so a retry submits a
 // complete form.
 func (s *Server) renderAuthorizeError(w http.ResponseWriter, r *http.Request, form url.Values, status int, message string) {
-	s.renderLoginPage(w, r, status, loginData{
+	s.renderLoginPage(w, r, status, &loginData{
 		Action: "/authorize",
 		Error:  message,
 		Hidden: oauthHiddenFields(form),
@@ -373,7 +373,7 @@ func oauthContextOf(form url.Values) url.Values {
 func (s *Server) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if err := r.ParseForm(); err != nil {
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: "Malformed form submission."})
+		s.renderLoginPage(w, r, http.StatusBadRequest, &loginData{Message: "Malformed form submission."})
 		return
 	}
 	form := r.PostForm
@@ -417,7 +417,7 @@ func (s *Server) authorizeContext(w http.ResponseWriter, r *http.Request, form u
 	q = oauthContextOf(form)
 	client, problem := s.clientForAuthorize(q)
 	if problem != "" {
-		s.renderLoginPage(w, r, http.StatusBadRequest, loginData{Message: problem})
+		s.renderLoginPage(w, r, http.StatusBadRequest, &loginData{Message: problem})
 		return subject{}, nil, nil, false
 	}
 	if code, description := s.validateAuthorizeRequest(client, q); code != "" {
@@ -427,7 +427,7 @@ func (s *Server) authorizeContext(w http.ResponseWriter, r *http.Request, form u
 	who, ok = s.authenticate(client, form.Get("username"), form.Get("password"))
 	if !ok {
 		slog.Warn("login failed", "ip", ip, "user", form.Get("username"), "client", client.ID())
-		s.renderLoginPage(w, r, http.StatusUnauthorized, loginData{
+		s.renderLoginPage(w, r, http.StatusUnauthorized, &loginData{
 			Action:   "/authorize",
 			Error:    "Invalid username or password.",
 			Username: form.Get("username"),
@@ -464,7 +464,7 @@ func (s *Server) completeAuthorize(w http.ResponseWriter, r *http.Request, clien
 // Sign-in happens exclusively through a registered client's /authorize flow:
 // users belong to clients, so there is no standalone login form here.
 func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
-	s.renderLoginPage(w, r, http.StatusOK, loginData{
+	s.renderLoginPage(w, r, http.StatusOK, &loginData{
 		Message: "This is the identity provider of a registered OAuth2/OIDC client. " +
 			"Sign in happens through your application's authorization request to /authorize.",
 	})
@@ -1137,7 +1137,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.renderLoginPage(w, r, http.StatusOK, loginData{
+	s.renderLoginPage(w, r, http.StatusOK, &loginData{
 		Message: "You have been signed out.",
 	})
 }

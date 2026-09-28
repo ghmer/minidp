@@ -55,7 +55,7 @@ func main() {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
 	}
-	srv, err := idp.New(cfg)
+	srv, err := idp.New(&cfg)
 	if err != nil {
 		slog.Error("startup failed", "error", err)
 		os.Exit(1)

@@ -36,6 +36,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -194,7 +195,7 @@ func promptSecret(what string, confirm bool) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if string(pw) != string(again) {
+		if !bytes.Equal(pw, again) {
 			return "", fmt.Errorf("%ss do not match", what)
 		}
 	}
@@ -257,8 +258,8 @@ func loadExistingClients(path string) ([]idp.Client, error) {
 
 // findClient returns the index of the client with the given id, or -1.
 func findClient(clients []idp.Client, id string) int {
-	for i, c := range clients {
-		if c.ClientID == id {
+	for i := range clients {
+		if clients[i].ClientID == id {
 			return i
 		}
 	}
@@ -401,7 +402,7 @@ func clientAdd(args []string) error {
 	clients = append(clients, client)
 	// Pre-flight the new entry so an inconsistent grant/profile/scopes
 	// combination is reported before the file is touched.
-	if err := idp.ValidateClient(client); err != nil {
+	if err := idp.ValidateClient(&client); err != nil {
 		return err
 	}
 	if err := idp.SaveClients(*f.selector.file, clients); err != nil {
@@ -529,7 +530,7 @@ func clientUpdate(args []string) error {
 	// Pre-flight the mutated entry so an inconsistent combination (e.g.
 	// -grant-types client_credentials without -cc-scopes) is reported
 	// before the file is touched.
-	if err := idp.ValidateClient(clients[idx]); err != nil {
+	if err := idp.ValidateClient(&clients[idx]); err != nil {
 		return err
 	}
 	if err := idp.SaveClients(*spec.f.selector.file, clients); err != nil {
@@ -569,7 +570,7 @@ func clientRemove(args []string) error {
 
 // describeClient renders one list/show line. Secrets and hashes are never
 // printed.
-func describeClient(c idp.Client) string {
+func describeClient(c *idp.Client) string {
 	audience := c.Audience
 	if audience == "" {
 		audience = c.ClientID
@@ -610,8 +611,8 @@ func clientList(args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, c := range clients {
-		fmt.Println(describeClient(c))
+	for i := range clients {
+		fmt.Println(describeClient(&clients[i]))
 	}
 	fmt.Fprintf(os.Stderr, "%d client(s)\n", len(clients))
 	return nil
@@ -635,7 +636,7 @@ func clientShow(args []string) error {
 		return fmt.Errorf("client %q does not exist", *sel.client)
 	}
 	c := clients[idx]
-	fmt.Println(describeClient(c))
+	fmt.Println(describeClient(&c))
 	for _, u := range c.Users {
 		line := "  user: " + u.Username
 		if u.Email != "" {

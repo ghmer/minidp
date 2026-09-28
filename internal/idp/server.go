@@ -44,7 +44,7 @@ type Server struct {
 
 // New constructs a Server, resolving the signing material, the registered
 // clients (each with its own accounts), and compiling the login template.
-func New(cfg Config) (*Server, error) {
+func New(cfg *Config) (*Server, error) {
 	keys, err := NewSigningKeySet(cfg.RSAPeM, cfg.KeyDir)
 	if err != nil {
 		return nil, err
@@ -62,7 +62,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:            cfg,
+		cfg:            *cfg,
 		keys:           keys,
 		store:          newStore(),
 		template:       tmpl,
@@ -201,9 +201,9 @@ func (s *Server) clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		return s.forwardedClientIP(xff, host)
 	}
-	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
-		if realIP := net.ParseIP(real); realIP != nil && !s.ipTrusted(realIP) {
-			return real
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		if parsed := net.ParseIP(realIP); parsed != nil && !s.ipTrusted(parsed) {
+			return realIP
 		}
 	}
 	return host

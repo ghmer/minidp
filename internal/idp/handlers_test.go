@@ -79,7 +79,7 @@ func testIDPClients(t *testing.T, clients []Client, mutate func(*Config)) (*http
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	srv, err := New(cfg)
+	srv, err := New(&cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

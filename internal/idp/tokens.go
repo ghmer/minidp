@@ -119,9 +119,9 @@ func shortScopeNames(scopes []string) []string {
 // shape, scp carries the granted resource permissions as short names, the
 // RFC 9068 scope claim keeps the full granted strings, and
 // preferred_username is released with the profile scope.
-func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, wantProfile bool, p profileData) *accessClaims {
+func newAccessClaims(rc *jwt.RegisteredClaims, clientID string, scopes []string, wantProfile bool, p profileData) *accessClaims {
 	access := &accessClaims{
-		RegisteredClaims: rc,
+		RegisteredClaims: *rc,
 		ClientID:         clientID,
 		Azp:              clientID,
 		Idtyp:            "user",
@@ -140,9 +140,9 @@ func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, 
 // preferred_username and name are released with the profile scope; sid
 // carries the token family (one authorization) so /end_session can revoke
 // exactly that authorization's tokens from an id_token_hint.
-func newIDClaims(rc jwt.RegisteredClaims, azp, nonce, family string, wantProfile bool, p profileData) *idClaims {
+func newIDClaims(rc *jwt.RegisteredClaims, azp, nonce, family string, wantProfile bool, p profileData) *idClaims {
 	id := &idClaims{
-		RegisteredClaims: rc,
+		RegisteredClaims: *rc,
 		Azp:              azp,
 		Nonce:            nonce,
 		SessionID:        family,
@@ -189,8 +189,9 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	wantEmail := hasScope(ctx.Scopes, "email")
 	profile := profileFor(client.users, ctx.Sub, wantProfile, wantEmail)
 
+	rc := s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires)
 	access := newAccessClaims(
-		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
+		&rc,
 		client.ID(), ctx.Scopes, wantProfile, profile)
 	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {
@@ -286,8 +287,9 @@ func (s *Server) issueIDToken(ctx *authContext, audience string, now, expires ti
 	if err != nil {
 		return "", fmt.Errorf("generate id token jti: %w", err)
 	}
+	rc := s.registeredClaims(audience, ctx.Sub, idJTI, now, expires)
 	id := newIDClaims(
-		s.registeredClaims(audience, ctx.Sub, idJTI, now, expires),
+		&rc,
 		ctx.ClientID, ctx.Nonce, ctx.Family, wantProfile, profile)
 	idTokenString, err := s.keys.sign(id)
 	if err != nil {
