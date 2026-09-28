@@ -1113,24 +1113,34 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	token := r.PostForm.Get("token")
-	if token != "" {
+	if token := r.PostForm.Get("token"); token != "" {
 		// Any audience is accepted here: /revoke must be able to deny tokens
 		// minted under a previous audience configuration, too.
-		if claims, err := s.parseAccessToken(token, false); err == nil {
-			if jti := claimString(claims, "jti"); jti != "" {
-				until := time.Now().Add(s.cfg.AccessTokenTTL) // fail-safe horizon
-				if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
-					until = exp.Time
-				}
-				s.store.denyJTI(jti, until)
-				slog.Info("access token denied by revocation", "sub", claims["sub"])
-			}
-		} else {
-			s.store.revokeToken(token)
-		}
+		s.revokePresentedToken(token)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// revokePresentedToken denies a verifiable access token by putting its jti on
+// the denylist until its natural expiry; anything that is not a valid access
+// token of this IdP is treated as an opaque refresh token and revoked through
+// the store. Per RFC 7009 an unknown token is not an error.
+func (s *Server) revokePresentedToken(token string) {
+	claims, err := s.parseAccessToken(token, false)
+	if err != nil {
+		s.store.revokeToken(token)
+		return
+	}
+	jti := claimString(claims, "jti")
+	if jti == "" {
+		return
+	}
+	until := time.Now().Add(s.cfg.AccessTokenTTL) // fail-safe horizon
+	if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
+		until = exp.Time
+	}
+	s.store.denyJTI(jti, until)
+	slog.Info("access token denied by revocation", "sub", claims["sub"])
 }
 
 // handleEndSession implements a minimal logout. A post_logout_redirect_uri is
