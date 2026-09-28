@@ -24,9 +24,13 @@ type tokenResponse struct {
 // accessClaims are the claims embedded in the issued access token. client_id
 // is the RFC 9068 §2.2 REQUIRED identifier of the client that requested the
 // token; it is emitted without omitempty so every access token carries it.
+// azp names the same party in the Entra ID v2.0 claim shape, and scp carries
+// the granted resource permissions as short names (see shortScopeNames).
 type accessClaims struct {
 	jwt.RegisteredClaims
 	ClientID string   `json:"client_id"`
+	Azp      string   `json:"azp,omitempty"`
+	Scp      string   `json:"scp,omitempty"`
 	Scope    string   `json:"scope,omitempty"`
 	Username string   `json:"preferred_username,omitempty"`
 	Email    string   `json:"email,omitempty"`
@@ -35,9 +39,11 @@ type accessClaims struct {
 
 // idClaims are the OIDC claims embedded in the issued id_token. sid carries
 // the token family (one authorization) so /end_session can revoke exactly
-// that authorization's tokens from an id_token_hint.
+// that authorization's tokens from an id_token_hint; azp names the Relying
+// Party (Entra ID always emits it; generic validators tolerate azp==aud).
 type idClaims struct {
 	jwt.RegisteredClaims
+	Azp               string   `json:"azp,omitempty"`
 	Nonce             string   `json:"nonce,omitempty"`
 	Email             string   `json:"email,omitempty"`
 	Name              string   `json:"name,omitempty"`
@@ -78,26 +84,45 @@ func profileFor(store UserStore, sub string, wantProfile, wantEmail bool) profil
 // registeredClaims builds the registered claims shared by every issued
 // token: the configured issuer and the audience of the client the token is
 // minted for (never a caller-chosen one), the subject and the standard
-// timestamps.
+// timestamps including nbf (Entra ID always emits it).
 func (s *Server) registeredClaims(audience, sub, jti string, now, expires time.Time) jwt.RegisteredClaims {
 	return jwt.RegisteredClaims{
-		Issuer:    s.cfg.Issuer,
-		Subject:   sub,
-		Audience:  jwt.ClaimStrings{audience},
-		ExpiresAt: jwt.NewNumericDate(expires),
-		IssuedAt:  jwt.NewNumericDate(now),
-		ID:        jti,
+		Issuer:     s.cfg.Issuer,
+		Subject:    sub,
+		Audience:   jwt.ClaimStrings{audience},
+		ExpiresAt:  jwt.NewNumericDate(expires),
+		NotBefore:  jwt.NewNumericDate(now),
+		IssuedAt:   jwt.NewNumericDate(now),
+		ID:         jti,
 	}
 }
 
+// shortScopeNames reduces full resource-scope strings to their Entra-style
+// permission names: api://<authority>/<name> becomes <name>. Built-in OIDC
+// scopes and anything not in the resource-scope form are dropped — scp
+// carries resource permissions only, mirroring Entra ID v2.0 tokens.
+func shortScopeNames(scopes []string) []string {
+	var names []string
+	for _, sc := range scopes {
+		if _, name, ok := strings.Cut(strings.TrimPrefix(sc, "api://"), "/"); ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // newAccessClaims builds the access-token claims: client_id names the
-// requesting client (RFC 9068 §2.2), and preferred_username is released with
-// the profile scope.
-func newAccessClaims(rc jwt.RegisteredClaims, clientID, scope string, wantProfile bool, p profileData) *accessClaims {
+// requesting client (RFC 9068 §2.2), azp mirrors it in the Entra claim
+// shape, scp carries the granted resource permissions as short names, the
+// RFC 9068 scope claim keeps the full granted strings, and
+// preferred_username is released with the profile scope.
+func newAccessClaims(rc jwt.RegisteredClaims, clientID string, scopes []string, wantProfile bool, p profileData) *accessClaims {
 	access := &accessClaims{
 		RegisteredClaims: rc,
 		ClientID:         clientID,
-		Scope:            scope,
+		Azp:              clientID,
+		Scope:            joinScopes(scopes),
+		Scp:              strings.Join(shortScopeNames(scopes), " "),
 		Email:            p.email,
 		Roles:            p.roles,
 	}
@@ -107,13 +132,14 @@ func newAccessClaims(rc jwt.RegisteredClaims, clientID, scope string, wantProfil
 	return access
 }
 
-// newIDClaims builds the id_token claims. preferred_username and name are
-// released with the profile scope; sid carries the token family (one
-// authorization) so /end_session can revoke exactly that authorization's
-// tokens from an id_token_hint.
-func newIDClaims(rc jwt.RegisteredClaims, nonce, family string, wantProfile bool, p profileData) *idClaims {
+// newIDClaims builds the id_token claims. azp names the Relying Party;
+// preferred_username and name are released with the profile scope; sid
+// carries the token family (one authorization) so /end_session can revoke
+// exactly that authorization's tokens from an id_token_hint.
+func newIDClaims(rc jwt.RegisteredClaims, azp, nonce, family string, wantProfile bool, p profileData) *idClaims {
 	id := &idClaims{
 		RegisteredClaims: rc,
+		Azp:              azp,
 		Nonce:            nonce,
 		SessionID:        family,
 		Email:            p.email,
@@ -161,7 +187,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 
 	access := newAccessClaims(
 		s.registeredClaims(client.Audience(), ctx.Sub, accessJTI, now, accessExpires),
-		client.ID(), joinScopes(ctx.Scopes), wantProfile, profile)
+		client.ID(), ctx.Scopes, wantProfile, profile)
 	accessTokenString, err := s.keys.signAccess(access)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
@@ -225,6 +251,7 @@ func (s *Server) issueClientCredentialsTokens(client *registeredClient) (*tokenR
 	access := &accessClaims{
 		RegisteredClaims: s.registeredClaims(client.Audience(), client.ID(), jti, now, expires),
 		ClientID:         client.ID(),
+		Azp:              client.ID(),
 		Scope:            joinScopes(scopes),
 	}
 	accessTokenString, err := s.keys.signAccess(access)
@@ -255,7 +282,7 @@ func (s *Server) issueIDToken(ctx *authContext, audience string, now, expires ti
 	}
 	id := newIDClaims(
 		s.registeredClaims(audience, ctx.Sub, idJTI, now, expires),
-		ctx.Nonce, ctx.Family, wantProfile, profile)
+		ctx.ClientID, ctx.Nonce, ctx.Family, wantProfile, profile)
 	idTokenString, err := s.keys.sign(id)
 	if err != nil {
 		return "", fmt.Errorf("sign id token: %w", err)

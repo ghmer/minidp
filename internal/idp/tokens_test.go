@@ -153,6 +153,94 @@ func TestIssueTokensSeparateAudiences(t *testing.T) {
 	}
 }
 
+// TestEntraClaimShape pins the Entra ID v2.0 claim parity: azp on both
+// tokens, nbf on every token, and scp carrying the granted resource
+// permissions as SHORT names (api://<audience>/<name> → <name>) while the
+// RFC 9068 scope claim keeps the full strings. A token without resource
+// scopes carries no scp, and client-credentials tokens never carry scp.
+func TestEntraClaimShape(t *testing.T) {
+	clientsFile := filepath.Join(t.TempDir(), "clients.json")
+	conf := testConfidentialClient(t, "a-confidential-secret")
+	conf.Audience = "conf-api"
+	conf.AllowedScopes = []string{"api://conf-api/access_as_user"}
+	service := testServiceClient(t, "svc", "a-confidential-secret")
+	if err := SaveClients(clientsFile, []Client{conf, service}); err != nil {
+		t.Fatalf("SaveClients: %v", err)
+	}
+	srv, err := New(Config{
+		Issuer:          "https://idp.test",
+		ClientsFile:     clientsFile,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	resp, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile", "api://conf-api/access_as_user"},
+		Nonce:    testNonceValue,
+	})
+	if err != nil {
+		t.Fatalf("issueTokens: %v", err)
+	}
+
+	access := parseWithServer(t, srv, resp.AccessToken)
+	if access["azp"] != testClientID {
+		t.Errorf("access azp = %v, want the client id", access["azp"])
+	}
+	if access["scp"] != "access_as_user" {
+		t.Errorf("access scp = %v, want the short permission name", access["scp"])
+	}
+	if access["scope"] != "openid profile api://conf-api/access_as_user" {
+		t.Errorf("access scope = %v, want the full granted strings", access["scope"])
+	}
+	nbf, ok := access["nbf"].(float64)
+	if !ok {
+		t.Fatal("access token carries no nbf claim")
+	}
+	if iat, _ := access["iat"].(float64); nbf != iat {
+		t.Errorf("access nbf = %v, want the iat value %v", nbf, iat)
+	}
+
+	id := parseWithServer(t, srv, resp.IDToken)
+	if id["azp"] != testClientID {
+		t.Errorf("id azp = %v, want the client id", id["azp"])
+	}
+	if _, ok := id["nbf"]; !ok {
+		t.Error("id token carries no nbf claim")
+	}
+
+	// A delegated token without resource scopes carries no scp.
+	resp2, err := srv.issueTokens(&authContext{
+		Sub:      "demo",
+		ClientID: testClientID,
+		Scopes:   []string{"openid", "profile"},
+	})
+	if err != nil {
+		t.Fatalf("issueTokens (openid only): %v", err)
+	}
+	plain := parseWithServer(t, srv, resp2.AccessToken)
+	if _, has := plain["scp"]; has {
+		t.Error("token without resource scopes must not carry scp")
+	}
+
+	// The app-only token names its client in azp but carries no scp.
+	cc, err := srv.issueClientCredentialsTokens(srv.clients.lookup("svc"))
+	if err != nil {
+		t.Fatalf("issueClientCredentialsTokens: %v", err)
+	}
+	app := parseWithServer(t, srv, cc.AccessToken)
+	if app["azp"] != "svc" {
+		t.Errorf("client_credentials azp = %v, want the client id", app["azp"])
+	}
+	if _, has := app["scp"]; has {
+		t.Error("app-only token must not carry scp")
+	}
+}
+
 // TestIssueTokensReleasesClaimsByScope pins the OIDC scope model: profile
 // unlocks preferred_username/name, email unlocks email, and nothing is
 // fabricated when the users-file record lacks a value.

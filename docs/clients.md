@@ -64,6 +64,9 @@ The two JWTs of a token set carry distinct, server-resolved audiences:
   its `client_id`) and additionally carries the RFC 9068 §2.2 REQUIRED
   `client_id` claim naming the client that requested it.
 
+Every token also carries `nbf` (= `iat`), and both tokens name the
+requesting client in `azp` — the claim shape Entra ID v2.0 tokens use.
+
 Nothing is reflected — a token minted for, or presented at, any other
 audience is rejected. Point
 your OIDC client library (oidc-client-ts, AppAuth, Auth.js, or any
@@ -115,6 +118,12 @@ the access token's `scope` claim and in the token response's `scope` field
 in their full `api://...` form (RFC 9068 §2.2.3), and they survive the
 refresh grant unchanged. Discovery advertises the union of all clients'
 registered scopes in `scopes_supported`.
+
+For Entra ID compatibility the access token additionally carries the
+granted permissions in the `scp` claim as **short names** —
+`api://policy-api/access_as_user` becomes `access_as_user` — exactly the
+shape an Entra v2.0 token uses, while `scope` keeps the full strings.
+App-only (`client_credentials`) tokens carry no `scp`.
 
 A client's authorization code is bound to that client (RFC 6749 §4.1.3):
 another client can't redeem it even with valid credentials — the attempt

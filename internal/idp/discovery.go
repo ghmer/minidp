@@ -54,9 +54,10 @@ func (s *Server) discoveryDocument() map[string]any {
 		"claims_supported": []string{
 			// Exactly the claims minidp actually issues. auth_time was
 			// previously advertised but never embedded in any token.
-			// client_id is the RFC 9068 access-token claim.
-			"iss", "sub", "aud", "exp", "iat", "client_id", "nonce",
-			"preferred_username", "email", "name",
+			// client_id is the RFC 9068 access-token claim; azp/scp/nbf
+			// mirror the Entra ID v2.0 token shape.
+			"iss", "sub", "aud", "exp", "iat", "nbf", "client_id", "azp",
+			"scp", "nonce", "preferred_username", "email", "name",
 		},
 	}
 }
