@@ -419,10 +419,7 @@ func applyClientChanges(client *idp.Client, spec *clientChangeSpec) (bool, error
 	if err != nil {
 		return false, err
 	}
-	endpointChanged, err := applyClientEndpointChanges(client, spec)
-	if err != nil {
-		return false, err
-	}
+	endpointChanged := applyClientEndpointChanges(client, spec)
 	return profileChanged || endpointChanged, nil
 }
 
@@ -470,7 +467,7 @@ func applyClientProfileChange(client *idp.Client, spec *clientChangeSpec) (bool,
 
 // applyClientEndpointChanges applies the audience/grants/scopes/redirect/
 // post-logout/origin flags.
-func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (bool, error) {
+func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) bool {
 	changed := false
 	if spec.provid["audience"] {
 		client.Audience = *spec.f.audience
@@ -504,7 +501,7 @@ func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (boo
 		client.AllowedOrigins = parseList(*spec.f.origin)
 		changed = true
 	}
-	return changed, nil
+	return changed
 }
 
 func clientUpdate(args []string) error {

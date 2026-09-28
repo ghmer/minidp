@@ -326,17 +326,17 @@ func (c *Client) validateURLs() error {
 		return fmt.Errorf("client %q: at least one redirect_uri is required", c.ClientID)
 	}
 	for _, raw := range c.RedirectURIs {
-		if _, err := validateAbsoluteHTTPURL(raw, "redirect_uri"); err != nil {
+		if err := validateAbsoluteHTTPURL(raw, "redirect_uri"); err != nil {
 			return fmt.Errorf("client %q: %w", c.ClientID, err)
 		}
 	}
 	for _, raw := range c.PostLogoutRedirectURIs {
-		if _, err := validateAbsoluteHTTPURL(raw, "post_logout_redirect_uri"); err != nil {
+		if err := validateAbsoluteHTTPURL(raw, "post_logout_redirect_uri"); err != nil {
 			return fmt.Errorf("client %q: %w", c.ClientID, err)
 		}
 	}
 	for _, raw := range c.AllowedOrigins {
-		if _, err := validateAbsoluteHTTPURL(raw, "allowed_origin"); err != nil {
+		if err := validateAbsoluteHTTPURL(raw, "allowed_origin"); err != nil {
 			return fmt.Errorf("client %q: %w", c.ClientID, err)
 		}
 	}
@@ -355,19 +355,19 @@ func (c *Client) audience() string {
 // an absolute http(s) URL with a host and no fragment. Allowlist comparisons
 // are plain string equality, so a malformed entry could otherwise never be
 // honored (or worse, be honored for a different URL than intended).
-func validateAbsoluteHTTPURL(raw, what string) (string, error) {
+func validateAbsoluteHTTPURL(raw, what string) error {
 	r := strings.TrimSpace(raw)
 	if r == "" {
-		return "", fmt.Errorf("%s must not be empty", what)
+		return fmt.Errorf("%s must not be empty", what)
 	}
 	u, err := url.Parse(r)
 	if err != nil {
-		return "", fmt.Errorf("invalid %s %q: %w", what, r, err)
+		return fmt.Errorf("invalid %s %q: %w", what, r, err)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Fragment != "" {
-		return "", fmt.Errorf("invalid %s %q: must be an absolute http(s) URL with a host", what, r)
+		return fmt.Errorf("invalid %s %q: must be an absolute http(s) URL with a host", what, r)
 	}
-	return r, nil
+	return nil
 }
 
 // ReadClients parses and fully validates a clients file into a Client slice.
