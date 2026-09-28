@@ -145,7 +145,11 @@ func (c *Client) Interactive() bool {
 // file must stay mode 0600 (SaveClients enforces this).
 func (c *Client) MarshalJSON() ([]byte, error) {
 	type plain Client
-	return json.Marshal(plain(*c))
+	data, err := json.Marshal(plain(*c))
+	if err != nil {
+		return nil, fmt.Errorf("marshal client: %w", err)
+	}
+	return data, nil
 }
 
 // validate checks one client entry when the clients file is loaded or saved.
@@ -543,7 +547,7 @@ func SaveClientsFile(path string, file *ClientsFile) error {
 	}
 	data, err := json.MarshalIndent(source, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal clients file: %w", err)
 	}
 	return saveJSONFile(path, append(data, '\n'))
 }

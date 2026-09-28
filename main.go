@@ -96,9 +96,12 @@ func main() {
 func rotateKeys() error {
 	retention, err := idp.LoadKeyRetention()
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve key retention: %w", err)
 	}
-	return idp.RotateKeys(os.Getenv("IDP_KEY_DIR"), retention)
+	if err := idp.RotateKeys(os.Getenv("IDP_KEY_DIR"), retention); err != nil {
+		return fmt.Errorf("rotate signing keys: %w", err)
+	}
+	return nil
 }
 
 // usage prints the command summary.

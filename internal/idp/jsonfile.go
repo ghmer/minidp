@@ -31,10 +31,14 @@ func readScopedFile(path string) ([]byte, error) {
 	defer func() { _ = root.Close() }()
 	f, err := root.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open %q: %w", name, err)
 	}
 	defer func() { _ = f.Close() }()
-	return io.ReadAll(f)
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", name, err)
+	}
+	return data, nil
 }
 
 // saveJSONFile atomically writes data to path: a uniquely named temp file in

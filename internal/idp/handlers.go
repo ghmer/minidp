@@ -67,7 +67,7 @@ func csrfNonce(r *http.Request) []byte {
 // fingerprint.
 func oauthParamsOf(r *http.Request) (url.Values, error) {
 	if err := r.ParseForm(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse request form: %w", err)
 	}
 	out := url.Values{}
 	for _, key := range oauthParamKeys {

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -135,7 +136,7 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 	defer func() { _ = root.Close() }()
 
 	ring, err := readKeyRing(root, keyRingFileName)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		// No keyring document: the legacy (pre-rotation) layout of exactly
 		// one persisted key with the fixed kid.
 		k, perr := persistentSigningKey(dir)
@@ -219,7 +220,8 @@ func keyRingPath(dir string) string { return filepath.Join(dir, keyRingFileName)
 func readKeyRing(root *os.Root, name string) (*keyringFile, error) {
 	f, err := root.Open(name)
 	if err != nil {
-		return nil, err
+		// %w keeps os.ErrNotExist intact: it is the legacy-layout signal.
+		return nil, fmt.Errorf("open keyring: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	raw, err := io.ReadAll(f)
@@ -376,7 +378,7 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	ring, err := readKeyRing(root, keyRingFileName)
 	switch {
 	case err == nil:
-	case os.IsNotExist(err):
+	case errors.Is(err, os.ErrNotExist):
 		// Legacy layout: adopt the persisted key (or start empty) as the
 		// active entry of a fresh ring.
 		ring = &keyringFile{}
@@ -567,7 +569,11 @@ func (k *signingKey) signTyped(claims jwt.Claims, typ string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	token.Header["kid"] = k.kid
 	token.Header["typ"] = typ
-	return token.SignedString(k.key)
+	signed, err := token.SignedString(k.key)
+	if err != nil {
+		return "", fmt.Errorf("sign token: %w", err)
+	}
+	return signed, nil
 }
 
 // jwk is a single JSON Web Key as described by RFC 7517.

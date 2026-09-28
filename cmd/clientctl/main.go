@@ -208,7 +208,7 @@ func readSecretPrompt(prompt string) ([]byte, error) {
 	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read password: %w", err)
 	}
 	return pw, nil
 }
@@ -239,7 +239,7 @@ func loadClients(path string) ([]idp.Client, bool, error) {
 	case errors.Is(err, os.ErrNotExist):
 		return nil, false, nil
 	default:
-		return nil, false, err
+		return nil, false, fmt.Errorf("read clients file: %w", err)
 	}
 }
 
@@ -332,7 +332,7 @@ func parseClientChangeArgs(args []string) (*clientChangeSpec, error) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	spec := &clientChangeSpec{f: registerClientFlags(fs), provid: map[string]bool{}}
 	if err := fs.Parse(args); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(spec.f.selector); err != nil {
 		return nil, err
@@ -351,7 +351,7 @@ func clientAdd(args []string) error {
 	fs := flag.NewFlagSet("client add", flag.ExitOnError)
 	f := registerClientFlags(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(f.selector); err != nil {
 		return err
@@ -403,10 +403,10 @@ func clientAdd(args []string) error {
 	// Pre-flight the new entry so an inconsistent grant/profile/scopes
 	// combination is reported before the file is touched.
 	if err := idp.ValidateClient(&client); err != nil {
-		return err
+		return fmt.Errorf("validate client: %w", err)
 	}
 	if err := idp.SaveClients(*f.selector.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	fmt.Printf("client %q added to %s\n", client.ClientID, *f.selector.file)
 	return nil
@@ -528,10 +528,10 @@ func clientUpdate(args []string) error {
 	// -grant-types client_credentials without -cc-scopes) is reported
 	// before the file is touched.
 	if err := idp.ValidateClient(&clients[idx]); err != nil {
-		return err
+		return fmt.Errorf("validate client: %w", err)
 	}
 	if err := idp.SaveClients(*spec.f.selector.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	fmt.Printf("client %q updated in %s (takes effect on IdP restart)\n", clients[idx].ClientID, *spec.f.selector.file)
 	return nil
@@ -541,7 +541,7 @@ func clientRemove(args []string) error {
 	fs := flag.NewFlagSet("client remove", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
@@ -556,7 +556,7 @@ func clientRemove(args []string) error {
 	}
 	clients = append(clients[:idx], clients[idx+1:]...)
 	if err := idp.SaveClients(*sel.file, clients); err != nil {
-		return err
+		return fmt.Errorf("save clients file: %w", err)
 	}
 	if len(clients) == 0 {
 		fmt.Println("warning: the clients file is now empty; minidp will refuse to start with it")
@@ -602,11 +602,11 @@ func clientList(args []string) error {
 	fs := flag.NewFlagSet("client list", flag.ExitOnError)
 	file := fs.String("file", "clients.json", "path to the clients JSON file")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	clients, err := idp.ReadClients(*file)
 	if err != nil {
-		return err
+		return fmt.Errorf("read clients file: %w", err)
 	}
 	for i := range clients {
 		fmt.Println(describeClient(&clients[i]))
@@ -619,7 +619,7 @@ func clientShow(args []string) error {
 	fs := flag.NewFlagSet("client show", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
@@ -692,7 +692,11 @@ func newUserHash(flagValue string, cost int, confirm bool) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("password must not be empty")
 	}
-	return idp.HashPassword(password, cost)
+	h, err := idp.HashPassword(password, cost)
+	if err != nil {
+		return "", fmt.Errorf("hash password: %w", err)
+	}
+	return h, nil
 }
 
 func findUserIndex(users []idp.User, username string) int {
@@ -708,7 +712,7 @@ func userAdd(args []string) error {
 	fs := flag.NewFlagSet("user add", flag.ExitOnError)
 	u := registerUserFlags(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(u.selector); err != nil {
 		return err
@@ -750,7 +754,10 @@ func userAdd(args []string) error {
 func saveClientUsers(clients []idp.Client, sel *clientSelector, users []idp.User, file string) error {
 	idx := findClient(clients, *sel.client)
 	clients[idx].Users = users
-	return idp.SaveClients(file, clients)
+	if err := idp.SaveClients(file, clients); err != nil {
+		return fmt.Errorf("save clients file: %w", err)
+	}
+	return nil
 }
 
 // userChangeSpec bundles the parsed user update invocation: the shared flags
@@ -767,7 +774,7 @@ func parseUserChangeArgs(args []string) (*userChangeSpec, error) {
 	fs := flag.NewFlagSet("user update", flag.ExitOnError)
 	spec := &userChangeSpec{u: registerUserFlags(fs)}
 	if err := fs.Parse(args); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(spec.u.selector); err != nil {
 		return nil, err
@@ -856,7 +863,7 @@ func userRemove(args []string) error {
 	sel := registerClientSelector(fs)
 	username := fs.String("username", "", "login name (required)")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
@@ -891,14 +898,14 @@ func userList(args []string) error {
 	fs := flag.NewFlagSet("user list", flag.ExitOnError)
 	sel := registerClientSelector(fs)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	if err := requireSelector(sel); err != nil {
 		return err
 	}
 	clients, err := idp.ReadClients(*sel.file)
 	if err != nil {
-		return err
+		return fmt.Errorf("read clients file: %w", err)
 	}
 	users, err := userStoreOf(clients, sel)
 	if err != nil {
@@ -926,7 +933,7 @@ func hash(args []string) error {
 	password := fs.String("password", "", "password; '-' reads one line from stdin, empty prompts interactively")
 	cost := fs.Int("cost", bcrypt.DefaultCost, "bcrypt cost factor")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("parse flags: %w", err)
 	}
 	h, err := newUserHash(*password, *cost, false)
 	if err != nil {

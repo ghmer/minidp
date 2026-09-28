@@ -3,6 +3,7 @@ package idp
 import (
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -59,7 +60,7 @@ func New(cfg *Config) (*Server, error) {
 	}
 	csrfSecret := make([]byte, 32)
 	if _, err := rand.Read(csrfSecret); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate csrf secret: %w", err)
 	}
 	s := &Server{
 		cfg:            *cfg,

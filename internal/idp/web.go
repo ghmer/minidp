@@ -41,10 +41,13 @@ func loadAsset(name, embedded string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if data != nil {
-		return data, nil
+	if data == nil {
+		data, err = webFS.ReadFile(embedded)
+		if err != nil {
+			return nil, fmt.Errorf("read embedded asset %q: %w", embedded, err)
+		}
 	}
-	return webFS.ReadFile(embedded)
+	return data, nil
 }
 
 // readAssetOverride reads a single override file from assetDir through os.Root
@@ -111,7 +114,7 @@ type loginData struct {
 func newLoginTemplate(title, subtitle string) (*loginTemplate, error) {
 	tmpl, err := template.ParseFS(webFS, "web/login.html")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse login template: %w", err)
 	}
 	css, err := loadAsset("login.css", "web/login.css")
 	if err != nil {
@@ -139,5 +142,8 @@ func (lt *loginTemplate) render(w io.Writer, data *loginData) error {
 	if data.Subtitle == "" {
 		data.Subtitle = lt.subtitle
 	}
-	return lt.tmpl.Execute(w, data)
+	if err := lt.tmpl.Execute(w, data); err != nil {
+		return fmt.Errorf("render login page: %w", err)
+	}
+	return nil
 }
