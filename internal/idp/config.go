@@ -101,7 +101,7 @@ func LoadConfig() (Config, error) {
 		ClientsFile:     os.Getenv("IDP_CLIENTS_FILE"),
 	}
 	if cfg.ClientsFile == "" {
-		return cfg, fmt.Errorf("IDP_CLIENTS_FILE is not set: minidp registers its clients (profiles, redirect policies, audiences and users) in a clients file; create one (see clientctl and clients.json.example) and point IDP_CLIENTS_FILE at it")
+		return cfg, errClientsFileUnset
 	}
 	proxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
 	if err != nil {
@@ -129,7 +129,7 @@ var removedVariables = []string{
 func rejectRemovedVariables() error {
 	for _, removed := range removedVariables {
 		if os.Getenv(removed) != "" {
-			return fmt.Errorf("%s is no longer supported: register clients in the IDP_CLIENTS_FILE clients file (see clientctl and clients.json.example)", removed)
+			return fmt.Errorf("%s %w", removed, errRemovedVariable)
 		}
 	}
 	return nil
@@ -185,10 +185,10 @@ func envInt(key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: must be a whole number", key, v)
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, errIntNotWholeNumber)
 	}
 	if n <= 0 {
-		return 0, fmt.Errorf("invalid %s %q: must be positive", key, v)
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, errIntNotPositive)
 	}
 	return n, nil
 }

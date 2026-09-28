@@ -155,11 +155,11 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 	for _, entry := range ring.Keys {
 		switch {
 		case entry.KID == "" || entry.File == "":
-			return nil, fmt.Errorf("keyring %q: entry with empty kid or file", filepath.Join(dir, keyRingFileName))
+			return nil, fmt.Errorf("keyring %q: %w", filepath.Join(dir, keyRingFileName), errKeyringEntryIncomplete)
 		case entry.State != keyStateActive && entry.State != keyStateRetiring:
-			return nil, fmt.Errorf("keyring %q: entry %q has invalid state %q", filepath.Join(dir, keyRingFileName), entry.KID, entry.State)
+			return nil, fmt.Errorf("keyring %q: entry %q %w %q", filepath.Join(dir, keyRingFileName), entry.KID, errKeyringStateInvalid, entry.State)
 		case byKid[entry.KID]:
-			return nil, fmt.Errorf("keyring %q: duplicate kid %q", filepath.Join(dir, keyRingFileName), entry.KID)
+			return nil, fmt.Errorf("keyring %q: %w %q", filepath.Join(dir, keyRingFileName), errKeyringDuplicateKid, entry.KID)
 		}
 		byKid[entry.KID] = true
 		if entry.State == keyStateRetiring && !entry.RetireAt.IsZero() && entry.RetireAt.Before(now) {
@@ -174,7 +174,7 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 		kept = append(kept, entry)
 	}
 	if len(kept) == 0 {
-		return nil, fmt.Errorf("keyring %q contains no keys", filepath.Join(dir, keyRingFileName))
+		return nil, fmt.Errorf("keyring %q %w", filepath.Join(dir, keyRingFileName), errKeyringContainsNoKeys)
 	}
 
 	set := &keySet{published: make([]*signingKey, 0, len(kept))}
@@ -194,20 +194,20 @@ func keySetFromDir(keyDir string) (*keySet, error) {
 			// The keyring is the source of truth for kids; a PEM swapped
 			// under a published kid would silently break verification. The
 			// legacy kid is a fixed label (no thumbprint to check against).
-			return nil, fmt.Errorf("keyring %q: entry %q does not match the key material's RFC 7638 thumbprint",
-				keyRingPath(dir), entry.KID)
+			return nil, fmt.Errorf("keyring %q: entry %q %w",
+				keyRingPath(dir), entry.KID, errKeyringThumbprintMismatch)
 		}
 		k.kid = entry.KID
 		if entry.State == keyStateActive {
 			if set.active != nil {
-				return nil, fmt.Errorf("keyring %q: more than one active key", keyRingPath(dir))
+				return nil, fmt.Errorf("keyring %q: %w", keyRingPath(dir), errKeyringMultipleActive)
 			}
 			set.active = k
 		}
 		set.published = append(set.published, k)
 	}
 	if set.active == nil {
-		return nil, fmt.Errorf("keyring %q has no active key", keyRingPath(dir))
+		return nil, fmt.Errorf("keyring %q %w", keyRingPath(dir), errKeyringNoActiveKey)
 	}
 	return set, nil
 }
@@ -339,7 +339,7 @@ func awaitFile(path string, timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s", timeout)
+			return fmt.Errorf("%w %s", errAwaitTimedOut, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -366,7 +366,7 @@ func jwkThumbprint(pub *rsa.PublicKey) string {
 // as the retiring key and the ring document is created.
 func RotateKeys(keyDir string, retention time.Duration) error {
 	if strings.TrimSpace(keyDir) == "" {
-		return fmt.Errorf("key rotation requires IDP_KEY_DIR")
+		return errKeyDirRequired
 	}
 	dir := filepath.Clean(keyDir)
 	root, err := os.OpenRoot(dir)
@@ -403,8 +403,8 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 		case keyStateRetiring:
 			// Keep the previous retirement horizon untouched.
 		default:
-			return fmt.Errorf("keyring %q: entry %q has invalid state %q",
-				keyRingPath(dir), ring.Keys[i].KID, ring.Keys[i].State)
+			return fmt.Errorf("keyring %q: entry %q %w %q",
+				keyRingPath(dir), ring.Keys[i].KID, errKeyringStateInvalid, ring.Keys[i].State)
 		}
 	}
 
@@ -416,7 +416,7 @@ func RotateKeys(keyDir string, retention time.Duration) error {
 	kid := jwkThumbprint(&key.PublicKey)
 	for _, entry := range ring.Keys {
 		if entry.KID == kid {
-			return fmt.Errorf("keyring %q: generated kid %q already exists", keyRingPath(dir), kid)
+			return fmt.Errorf("keyring %q: generated kid %q %w", keyRingPath(dir), kid, errGeneratedKidExists)
 		}
 	}
 	fileName := "minidp-rsa-" + kid + ".pem"
@@ -526,7 +526,7 @@ func loadSigningKey(pemPath string) (*signingKey, error) {
 	}
 	block, _ := pem.Decode(raw)
 	if block == nil {
-		return nil, fmt.Errorf("rsa key: no PEM block found in %q", pemPath)
+		return nil, fmt.Errorf("%w in %q", errNoPEMBlock, pemPath)
 	}
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
@@ -537,7 +537,7 @@ func loadSigningKey(pemPath string) (*signingKey, error) {
 		}
 		rk, ok := pk.(*rsa.PrivateKey)
 		if !ok {
-			return nil, fmt.Errorf("rsa key in %q is not an RSA key", pemPath)
+			return nil, fmt.Errorf("rsa key in %q %w", pemPath, errNotAnRSAKey)
 		}
 		key = rk
 	}
@@ -632,7 +632,7 @@ func (ks *keySet) verifyKey(tok *jwt.Token) (any, error) {
 			return &k.key.PublicKey, nil
 		}
 	}
-	return nil, fmt.Errorf("unknown kid %q", kid)
+	return nil, fmt.Errorf("%w %q", errUnknownKid, kid)
 }
 
 // JWKS returns the JSON Web Key Set containing the public halves of every

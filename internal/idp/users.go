@@ -37,25 +37,24 @@ type UserStore interface {
 // validate checks one user entry when the clients file is loaded or saved.
 func (u *User) validate() error {
 	if strings.TrimSpace(u.Username) == "" {
-		return fmt.Errorf("username must not be empty")
+		return errUsernameEmpty
 	}
 	if u.Username != strings.TrimSpace(u.Username) {
-		return fmt.Errorf("username %q must not have leading or trailing whitespace", u.Username)
+		return fmt.Errorf("username %q: %w", u.Username, errPaddedValue)
 	}
 	if !isBcryptHash(u.PasswordHash) {
-		return fmt.Errorf("user %q: password_hash must be a 60-character bcrypt hash "+
-			"like $2a$10$... (generate one with: clientctl hash)", u.Username)
+		return fmt.Errorf("user %q: %w", u.Username, errPasswordHashShape)
 	}
 	seenRoles := make(map[string]bool, len(u.Roles))
 	for _, role := range u.Roles {
 		if strings.TrimSpace(role) == "" {
-			return fmt.Errorf("user %q: roles must not contain empty entries", u.Username)
+			return fmt.Errorf("user %q: %w", u.Username, errRolesEmptyEntry)
 		}
 		if role != strings.TrimSpace(role) {
-			return fmt.Errorf("user %q: role %q must not have leading or trailing whitespace", u.Username, role)
+			return fmt.Errorf("user %q: role %q: %w", u.Username, role, errPaddedValue)
 		}
 		if seenRoles[role] {
-			return fmt.Errorf("user %q: duplicate role %q", u.Username, role)
+			return fmt.Errorf("user %q: %w %q", u.Username, errDuplicateRole, role)
 		}
 		seenRoles[role] = true
 	}
@@ -72,7 +71,7 @@ func validateUserSlice(users []User) error {
 			return fmt.Errorf("user entry %d: %w", i, err)
 		}
 		if seen[u.Username] {
-			return fmt.Errorf("duplicate username %q", u.Username)
+			return fmt.Errorf("%w %q", errDuplicateUsername, u.Username)
 		}
 		seen[u.Username] = true
 	}
@@ -116,7 +115,7 @@ func bcryptCostOf(hash string) int {
 // the clientctl tool.
 func HashPassword(password string, cost int) (string, error) {
 	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
-		return "", fmt.Errorf("bcrypt cost must be between %d and %d", bcrypt.MinCost, bcrypt.MaxCost)
+		return "", errBcryptCostRange
 	}
 	h, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {

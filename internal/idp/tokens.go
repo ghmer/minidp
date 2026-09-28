@@ -174,7 +174,7 @@ func (s *Server) issueTokens(ctx *authContext) (*tokenResponse, error) {
 	// the client's own, and its profile claims come from its own users.
 	client := s.clients.lookup(ctx.ClientID)
 	if client == nil {
-		return nil, fmt.Errorf("issue tokens for unregistered client %q", ctx.ClientID)
+		return nil, fmt.Errorf("%w %q", errTokensUnregCli, ctx.ClientID)
 	}
 	now := time.Now()
 	accessExpires := now.Add(s.cfg.AccessTokenTTL)

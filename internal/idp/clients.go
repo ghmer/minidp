@@ -178,13 +178,13 @@ func (c *Client) validate() error {
 // (client_id travels through forms, URLs and logs).
 func (c *Client) validateIdentity() error {
 	if strings.TrimSpace(c.ClientID) == "" {
-		return fmt.Errorf("client_id must not be empty")
+		return errClientIDEmpty
 	}
 	if c.ClientID != strings.TrimSpace(c.ClientID) {
-		return fmt.Errorf("client_id %q must not have leading or trailing whitespace", c.ClientID)
+		return fmt.Errorf("client_id %q: %w", c.ClientID, errPaddedValue)
 	}
 	if strings.ContainsAny(c.ClientID, " \t\r\n") {
-		return fmt.Errorf("client_id %q must not contain whitespace", c.ClientID)
+		return fmt.Errorf("client_id %q: %w", c.ClientID, errValueWhitespace)
 	}
 	return nil
 }
@@ -195,12 +195,11 @@ func (c *Client) validateProfile() error {
 	switch c.Type {
 	case TypePublic:
 		if c.ClientSecret != "" {
-			return fmt.Errorf("client %q: a public client must not have a client_secret", c.ClientID)
+			return fmt.Errorf("client %q: %w", c.ClientID, errPublicClientSecret)
 		}
 	case TypeConfidential:
 		if c.ClientSecret == "" {
-			return fmt.Errorf("client %q: a confidential client requires a client_secret "+
-				"(generate one with: openssl rand -base64 32)", c.ClientID)
+			return fmt.Errorf("client %q: %w", c.ClientID, errConfidentialNoSecret)
 		}
 		if len(c.ClientSecret) < 16 {
 			// Loud warning, not an error: the operator may accept the risk,
@@ -209,10 +208,10 @@ func (c *Client) validateProfile() error {
 			slog.Warn("client secret is shorter than 16 characters: use a cryptographically random secret of at least 128 bits for a confidential client", "client", c.ClientID)
 		}
 	default:
-		return fmt.Errorf("client %q: invalid type %q: must be %q or %q", c.ClientID, string(c.Type), TypePublic, TypeConfidential)
+		return fmt.Errorf("client %q: invalid type %q: %w", c.ClientID, string(c.Type), errClientTypeMustBe)
 	}
 	if a := c.audience(); strings.ContainsAny(a, " \t\r\n") {
-		return fmt.Errorf("client %q: audience %q must not contain whitespace", c.ClientID, a)
+		return fmt.Errorf("client %q: audience %q: %w", c.ClientID, a, errValueWhitespace)
 	}
 	if err := c.validateGrants(); err != nil {
 		return err
@@ -232,16 +231,15 @@ func (c *Client) validateCCRoles() error {
 		return nil
 	}
 	if !c.AllowsGrant(GrantClientCredentials) {
-		return fmt.Errorf("client %q: client_credentials_roles are set but the client_credentials grant is not enabled", c.ClientID)
+		return fmt.Errorf("client %q: client_credentials_roles are set but the client_credentials %w", c.ClientID, errGrantNotEnabled)
 	}
 	seen := make(map[string]bool, len(c.ClientCredentialsRoles))
 	for _, role := range c.ClientCredentialsRoles {
 		if role == "" || role != strings.TrimSpace(role) || strings.ContainsAny(role, " \t\r\n") {
-			return fmt.Errorf("client %q: client_credentials role %q must not be empty, whitespace-padded or contain whitespace",
-				c.ClientID, role)
+			return fmt.Errorf("client %q: client_credentials role %q: %w", c.ClientID, role, errWhitespaceEntry)
 		}
 		if seen[role] {
-			return fmt.Errorf("client %q: duplicate client_credentials role %q", c.ClientID, role)
+			return fmt.Errorf("client %q: %w %q", c.ClientID, errDuplicateCCRole, role)
 		}
 		seen[role] = true
 	}
@@ -261,35 +259,33 @@ func (c *Client) validateGrants() error {
 		case GrantClientCredentials:
 			hasCC = true
 		default:
-			return fmt.Errorf("client %q: invalid grant type %q: must be %q, %q or %q",
-				c.ClientID, g, GrantAuthorizationCode, GrantRefreshToken, GrantClientCredentials)
+			return fmt.Errorf("client %q: invalid grant type %q: %w",
+				c.ClientID, g, errGrantTypesAllowed)
 		}
 		if seen[g] {
-			return fmt.Errorf("client %q: duplicate grant type %q", c.ClientID, g)
+			return fmt.Errorf("client %q: %w %q", c.ClientID, errDuplicateGrantType, g)
 		}
 		seen[g] = true
 	}
 	if !hasCC {
 		if len(c.ClientCredentialsScopes) > 0 {
-			return fmt.Errorf("client %q: client_credentials_scopes are set but the %q grant is not enabled",
-				c.ClientID, GrantClientCredentials)
+			return fmt.Errorf("client %q: client_credentials_scopes are set but the %q %w",
+				c.ClientID, GrantClientCredentials, errGrantNotEnabled)
 		}
 		return nil
 	}
 	if !c.Confidential() {
-		return fmt.Errorf("client %q: the %q grant requires the confidential profile "+
-			"(client authentication at the token endpoint, RFC 6749 §4.4)",
-			c.ClientID, GrantClientCredentials)
+		return fmt.Errorf("client %q: the %q %w",
+			c.ClientID, GrantClientCredentials, errGrantWantsConfident)
 	}
 	if len(c.ClientCredentialsScopes) == 0 {
-		return fmt.Errorf("client %q: the %q grant requires a non-empty client_credentials_scopes list "+
-			"(there is no login step, so scopes cannot be requested at token time)",
-			c.ClientID, GrantClientCredentials)
+		return fmt.Errorf("client %q: the %q %w",
+			c.ClientID, GrantClientCredentials, errCCScopesRequired)
 	}
 	for _, sc := range c.ClientCredentialsScopes {
 		if strings.TrimSpace(sc) == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
-			return fmt.Errorf("client %q: client_credentials_scope %q must not be empty, whitespace-padded or contain whitespace",
-				c.ClientID, sc)
+			return fmt.Errorf("client %q: client_credentials_scope %q: %w",
+				c.ClientID, sc, errWhitespaceEntry)
 		}
 	}
 	return nil
@@ -305,17 +301,17 @@ func (c *Client) validateAllowedScopes() error {
 	wantAuthority := strings.TrimPrefix(c.audience(), "api://")
 	for _, sc := range c.AllowedScopes {
 		if sc == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
-			return fmt.Errorf("client %q: allowed_scope %q must not be empty, whitespace-padded or contain whitespace",
-				c.ClientID, sc)
+			return fmt.Errorf("client %q: allowed_scope %q: %w",
+				c.ClientID, sc, errWhitespaceEntry)
 		}
 		authority, name, ok := strings.Cut(strings.TrimPrefix(sc, "api://"), "/")
 		if !ok || authority == "" || name == "" {
-			return fmt.Errorf("client %q: allowed_scope %q must have the api://<audience>/<name> form",
-				c.ClientID, sc)
+			return fmt.Errorf("client %q: allowed_scope %q: %w",
+				c.ClientID, sc, errAllowedScopeForm)
 		}
 		if authority != wantAuthority {
-			return fmt.Errorf("client %q: allowed_scope %q must reference the client's own audience %q",
-				c.ClientID, sc, wantAuthority)
+			return fmt.Errorf("client %q: allowed_scope %q %w %q",
+				c.ClientID, sc, errAllowedScopeOwnAud, wantAuthority)
 		}
 	}
 	return nil
@@ -327,7 +323,7 @@ func (c *Client) validateAllowedScopes() error {
 // browser anywhere. Extra lists stay validated whenever present.
 func (c *Client) validateURLs() error {
 	if c.Interactive() && len(c.RedirectURIs) == 0 {
-		return fmt.Errorf("client %q: at least one redirect_uri is required", c.ClientID)
+		return fmt.Errorf("client %q: %w", c.ClientID, errRedirectURIRequired)
 	}
 	for _, raw := range c.RedirectURIs {
 		if err := validateAbsoluteHTTPURL(raw, "redirect_uri"); err != nil {
@@ -362,14 +358,14 @@ func (c *Client) audience() string {
 func validateAbsoluteHTTPURL(raw, what string) error {
 	r := strings.TrimSpace(raw)
 	if r == "" {
-		return fmt.Errorf("%s must not be empty", what)
+		return fmt.Errorf("%s %w", what, errEmptyValue)
 	}
 	u, err := url.Parse(r)
 	if err != nil {
 		return fmt.Errorf("invalid %s %q: %w", what, r, err)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Fragment != "" {
-		return fmt.Errorf("invalid %s %q: must be an absolute http(s) URL with a host", what, r)
+		return fmt.Errorf("invalid %s %q: %w", what, r, errURLAbsolute)
 	}
 	return nil
 }
@@ -410,12 +406,12 @@ func ReadClientsFile(path string) (*ClientsFile, error) {
 			return nil, fmt.Errorf("clients file %q is not a valid JSON clients document: %w", path, err)
 		}
 		if doc.Clients == nil {
-			return nil, fmt.Errorf("clients file %q is an object but carries no clients array", path)
+			return nil, fmt.Errorf("clients file %q %w", path, errClientsArrayMissing)
 		}
 		file.Clients = *doc.Clients
 		file.Resources = doc.Resources
 	default:
-		return nil, fmt.Errorf("clients file %q is neither a JSON array of clients nor a clients document", path)
+		return nil, fmt.Errorf("clients file %q %w", path, errClientsFileShape)
 	}
 	if err := validateClientSlice(file.Clients); err != nil {
 		return nil, fmt.Errorf("clients file %q: %w", path, err)
@@ -451,22 +447,22 @@ func validateResourceRegistry(resources []ResourceDefinition, clients []Client) 
 	seenAudience := make(map[string]bool, len(resources))
 	for _, res := range resources {
 		if res.Audience == "" || strings.ContainsAny(res.Audience, " \t\r\n") {
-			return fmt.Errorf("resource audience %q must be non-empty and free of whitespace", res.Audience)
+			return fmt.Errorf("resource audience %q: %w", res.Audience, errFreeOfWhitespace)
 		}
 		if seenAudience[res.Audience] {
-			return fmt.Errorf("duplicate resource audience %q", res.Audience)
+			return fmt.Errorf("%w %q", errDuplicateResAudience, res.Audience)
 		}
 		seenAudience[res.Audience] = true
 		if len(res.AppRoles) == 0 {
-			return fmt.Errorf("resource %q must define at least one app role", res.Audience)
+			return fmt.Errorf("resource %q: %w", res.Audience, errAppRolesRequired)
 		}
 		defined := make(map[string]bool, len(res.AppRoles))
 		for _, role := range res.AppRoles {
 			if role == "" || strings.ContainsAny(role, " \t\r\n") {
-				return fmt.Errorf("resource %q: app role %q must be non-empty and free of whitespace", res.Audience, role)
+				return fmt.Errorf("resource %q: app role %q: %w", res.Audience, role, errFreeOfWhitespace)
 			}
 			if defined[role] {
-				return fmt.Errorf("resource %q: duplicate app role %q", res.Audience, role)
+				return fmt.Errorf("resource %q: %w %q", res.Audience, errDuplicateAppRole, role)
 			}
 			defined[role] = true
 		}
@@ -480,15 +476,15 @@ func validateResourceRegistry(resources []ResourceDefinition, clients []Client) 
 		}
 		for _, role := range c.ClientCredentialsRoles {
 			if !defined[role] {
-				return fmt.Errorf("client %q: client_credentials role %q is not defined for audience %q",
-					c.ClientID, role, c.audience())
+				return fmt.Errorf("client %q: client_credentials role %q %w %q",
+					c.ClientID, role, errCCRoleNotDefined, c.audience())
 			}
 		}
 		for _, u := range c.Users {
 			for _, role := range u.Roles {
 				if !defined[role] {
-					return fmt.Errorf("client %q: user %q holds role %q, which is not defined for audience %q",
-						c.ClientID, u.Username, role, c.audience())
+					return fmt.Errorf("client %q: user %q holds role %q, %w %q",
+						c.ClientID, u.Username, role, errUserRoleNotDefined, c.audience())
 				}
 			}
 		}
@@ -507,7 +503,7 @@ func validateClientSlice(clients []Client) error {
 			return fmt.Errorf("entry %d (client %q): %w", i, c.ClientID, err)
 		}
 		if seen[c.ClientID] {
-			return fmt.Errorf("duplicate client_id %q", c.ClientID)
+			return fmt.Errorf("%w %q", errDuplicateClientID, c.ClientID)
 		}
 		seen[c.ClientID] = true
 	}
@@ -687,7 +683,7 @@ func LoadClients(path string) (*clientRegistry, error) {
 // provider-wide union sets.
 func newClientRegistry(clients []Client) (*clientRegistry, error) {
 	if len(clients) == 0 {
-		return nil, fmt.Errorf("clients file contains no clients: register at least one client (see clientctl)")
+		return nil, errNoClientsRegistered
 	}
 	r := &clientRegistry{
 		byID:            make(map[string]*registeredClient, len(clients)),
@@ -699,10 +695,10 @@ func newClientRegistry(clients []Client) (*clientRegistry, error) {
 	for i := range clients {
 		c := &clients[i]
 		if c.Interactive() && len(c.Users) == 0 {
-			return nil, fmt.Errorf("client %q has no users: add at least one account (clientctl user add)", c.ClientID)
+			return nil, fmt.Errorf("client %q %w", c.ClientID, errNoUsersRegistered)
 		}
 		if _, dup := r.byID[c.ClientID]; dup {
-			return nil, fmt.Errorf("duplicate client_id %q", c.ClientID)
+			return nil, fmt.Errorf("%w %q", errDuplicateClientID, c.ClientID)
 		}
 		rc := &registeredClient{
 			client: *c,

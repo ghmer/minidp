@@ -70,7 +70,8 @@ func readAssetOverride(name string) ([]byte, error) {
 		return nil, fmt.Errorf("read asset override %s/%s: %w", assetDir, name, err)
 	}
 	if len(data) > assetOverrideLimit {
-		return nil, fmt.Errorf("asset override %s/%s is %d bytes, the limit is %d", assetDir, name, len(data), assetOverrideLimit)
+		return nil, fmt.Errorf("asset override %s/%s is %d bytes, the limit is %d: %w",
+			assetDir, name, len(data), assetOverrideLimit, errAssetOverrideTooLarge)
 	}
 	slog.Info("using login page asset override", "path", assetDir+"/"+name, "bytes", len(data))
 	return data, nil

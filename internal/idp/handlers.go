@@ -839,24 +839,24 @@ func (s *Server) parseAccessToken(tokenString string, requireAudience bool) (jwt
 		jwt.WithExpirationRequired(),
 	)
 	if err != nil || !token.Valid {
-		return nil, fmt.Errorf("invalid token")
+		return nil, errTokenInvalid
 	}
 	if typ := claimString(token.Header, "typ"); typ != typAccessToken {
-		return nil, fmt.Errorf("invalid token: not an access token")
+		return nil, errNotAccessToken
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, fmt.Errorf("invalid claims")
+		return nil, errClaimsInvalid
 	}
 	aud, err := claims.GetAudience()
 	if err != nil || len(aud) == 0 {
-		return nil, fmt.Errorf("invalid token: missing audience")
+		return nil, errAudienceMissing
 	}
 	if requireAudience && !s.clients.audienceAllowed(aud) {
-		return nil, fmt.Errorf("invalid token: audience not accepted here")
+		return nil, errAudienceRejected
 	}
 	if jti := claimString(claims, "jti"); jti != "" && s.store.isDeniedJTI(jti) {
-		return nil, fmt.Errorf("invalid token: revoked")
+		return nil, errTokenRevoked
 	}
 	return claims, nil
 }
@@ -881,21 +881,21 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 		jwt.WithoutClaimsValidation(), // expiry is intentionally not enforced
 	)
 	if err != nil || !token.Valid {
-		return nil, nil, fmt.Errorf("invalid token")
+		return nil, nil, errTokenInvalid
 	}
 	if typ := claimString(token.Header, "typ"); typ != typIDToken {
-		return nil, nil, fmt.Errorf("invalid token: not an id token")
+		return nil, nil, errNotIDToken
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, nil, fmt.Errorf("invalid claims")
+		return nil, nil, errClaimsInvalid
 	}
 	if iss := claimString(claims, "iss"); iss != s.cfg.Issuer {
-		return nil, nil, fmt.Errorf("invalid token: foreign issuer")
+		return nil, nil, errIssuerForeign
 	}
 	aud, err := claims.GetAudience()
 	if err != nil || len(aud) == 0 {
-		return nil, nil, fmt.Errorf("invalid token: missing audience")
+		return nil, nil, errAudienceMissing
 	}
 	// The id_token audience is the client id (OIDC Core §2), so the audience
 	// resolves the registered client directly; the configured-audience
@@ -907,7 +907,7 @@ func (s *Server) parseIDTokenHint(hint string) (jwt.MapClaims, *registeredClient
 		client = s.clients.clientForAudience(aud[0])
 	}
 	if client == nil {
-		return nil, nil, fmt.Errorf("invalid token: audience not accepted here")
+		return nil, nil, errAudienceRejected
 	}
 	return claims, client, nil
 }
