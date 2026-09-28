@@ -126,7 +126,7 @@ func (s *Server) validateAuthorizeRequest(client *registeredClient, q url.Values
 			return "invalid_request", fmt.Sprintf("Unsupported parameter %q.", p)
 		}
 	}
-	return validateScopes(q.Get("scope"))
+	return s.validateScopesFor(client, q.Get("scope"))
 }
 
 // validatePKCEParams checks the PKCE parameters of an authorize request:
@@ -171,13 +171,18 @@ func validatePrompt(q url.Values) (code, description string) {
 	return "", ""
 }
 
-// validateScopes checks the requested scopes against the IdP policy
-// (review finding M1).
-func validateScopes(raw string) (code, description string) {
+// validateScopesFor checks the requested scopes against the IdP policy
+// (review finding M1) extended by the requesting client's registered custom
+// delegated scopes: the provider-wide built-ins are openid, profile and
+// email, and a client may additionally request the api://<audience>/<name>
+// scopes registered in its own entry — never another client's, never
+// arbitrary resource/scope strings.
+func (s *Server) validateScopesFor(client *registeredClient, raw string) (code, description string) {
 	for _, sc := range parseScopes(raw) {
-		if !supportedScopes[sc] {
-			return "invalid_scope", fmt.Sprintf("Unsupported scope %q; supported scopes: openid profile email.", sc)
+		if supportedScopes[sc] || client.allowsScope(sc) {
+			continue
 		}
+		return "invalid_scope", fmt.Sprintf("Unsupported scope %q for this client; supported scopes: openid profile email and the api:// scopes registered for the client.", sc)
 	}
 	return "", ""
 }

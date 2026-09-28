@@ -38,6 +38,10 @@ user database, no admin UI and no dynamic client registration. Sorry :-)
     `email` → `email`). `roles` is released on both access and ID tokens
   whenever the user record defines it — roles are authorization data, not
   scope-gated profile claims.
+- Custom delegated API scopes: a client may register resource-specific
+  scopes (`allowed_scopes`, `api://<audience>/<name>` form referencing its
+  own audience) and request them at `/authorize`; granted scopes are
+  released in the access token's `scope` claim and advertised in discovery.
 - Refresh token grant with single-use rotation.
 - Machine-to-machine `client_credentials` grant (RFC 6749 §4.4) for
   confidential service clients, with a statically configured scope list

@@ -64,6 +64,16 @@ type Client struct {
 	// must be configured statically here (and be non-empty when the
 	// client_credentials grant is enabled).
 	ClientCredentialsScopes []string `json:"client_credentials_scopes,omitempty"`
+	// AllowedScopes are the custom, resource-specific delegated scopes the
+	// client may request at /authorize in addition to the built-in OIDC
+	// scopes (openid, profile, email). Each entry must reference the
+	// client's own audience in the resource-scope form
+	// api://<audience>/<name> (e.g. api://policy-api/access_as_user); the
+	// name part is the permission released into the access token's scope
+	// claim. Requests for anything outside this list fail with
+	// invalid_scope — the provider never reflects arbitrary
+	// resource/scope strings.
+	AllowedScopes []string `json:"allowed_scopes,omitempty"`
 	// RedirectURIs are the registered authorization-response targets. The
 	// policy is mandatory; requests are honoured only for these exact values.
 	RedirectURIs []string `json:"redirect_uris"`
@@ -182,7 +192,10 @@ func (c Client) validateProfile() error {
 	if a := c.audience(); strings.ContainsAny(a, " \t\r\n") {
 		return fmt.Errorf("client %q: audience %q must not contain whitespace", c.ClientID, a)
 	}
-	return c.validateGrants()
+	if err := c.validateGrants(); err != nil {
+		return err
+	}
+	return c.validateAllowedScopes()
 }
 
 // validateGrants checks the grant_types / client_credentials_scopes pair:
@@ -227,6 +240,32 @@ func (c Client) validateGrants() error {
 		if strings.TrimSpace(sc) == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
 			return fmt.Errorf("client %q: client_credentials_scope %q must not be empty, whitespace-padded or contain whitespace",
 				c.ClientID, sc)
+		}
+	}
+	return nil
+}
+
+// validateAllowedScopes checks the client's custom delegated scope list
+// (review finding M1's resource-scope counterpart): each entry must be
+// whitespace-free, must use the api://<authority>/<name> resource-scope
+// form, and its authority must reference the client's own audience (an
+// optional api:// prefix on the audience is ignored on both sides), so a
+// client can never request authorization for a foreign resource.
+func (c Client) validateAllowedScopes() error {
+	wantAuthority := strings.TrimPrefix(c.audience(), "api://")
+	for _, sc := range c.AllowedScopes {
+		if sc == "" || sc != strings.TrimSpace(sc) || strings.ContainsAny(sc, " \t\r\n") {
+			return fmt.Errorf("client %q: allowed_scope %q must not be empty, whitespace-padded or contain whitespace",
+				c.ClientID, sc)
+		}
+		authority, name, ok := strings.Cut(strings.TrimPrefix(sc, "api://"), "/")
+		if !ok || authority == "" || name == "" {
+			return fmt.Errorf("client %q: allowed_scope %q must have the api://<audience>/<name> form",
+				c.ClientID, sc)
+		}
+		if authority != wantAuthority {
+			return fmt.Errorf("client %q: allowed_scope %q must reference the client's own audience %q",
+				c.ClientID, sc, wantAuthority)
 		}
 	}
 	return nil
@@ -366,6 +405,18 @@ func (rc *registeredClient) AllowsGrant(grant string) bool { return rc.client.Al
 // client's client_credentials access tokens (validated non-empty at load).
 func (rc *registeredClient) clientCredentialsScopes() []string {
 	return rc.client.ClientCredentialsScopes
+}
+
+// allowsScope reports whether sc is one of the client's registered custom
+// delegated scopes. The built-in OIDC scopes are governed by the
+// provider-wide policy, not by this allowlist.
+func (rc *registeredClient) allowsScope(sc string) bool {
+	for _, allowed := range rc.client.AllowedScopes {
+		if allowed == sc {
+			return true
+		}
+	}
+	return false
 }
 
 // secret returns the client's credential (empty for public clients).
@@ -544,6 +595,23 @@ func (r *clientRegistry) clientForAudience(aud string) *registeredClient {
 // of every client's redirect URIs plus every client's explicit origins. Only
 // these origins are reflected with credentials (see withCORS).
 func (r *clientRegistry) allowedOrigins() map[string]bool { return r.origins }
+
+// delegatedScopes returns the union of all clients' registered custom
+// delegated scopes in deterministic file order — the provider-wide set
+// discovery advertises in scopes_supported alongside the OIDC scopes.
+func (r *clientRegistry) delegatedScopes() []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, id := range r.ids {
+		for _, sc := range r.byID[id].client.AllowedScopes {
+			if !seen[sc] {
+				seen[sc] = true
+				out = append(out, sc)
+			}
+		}
+	}
+	return out
+}
 
 // userCount returns the total number of accounts across all clients (for
 // startup logging).

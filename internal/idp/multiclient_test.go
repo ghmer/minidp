@@ -394,3 +394,120 @@ func TestMultiClientPublicClientCannotAuthenticate(t *testing.T) {
 		t.Errorf("token request without client_id: error = %v, want invalid_request", got)
 	}
 }
+
+// delegatedScopeIDP returns an IdP whose confidential client conf-app is
+// registered with the delegated API scopes api://conf-api/read and
+// api://conf-api/write.
+func delegatedScopeIDP(t *testing.T, secret string) (*httptest.Server, *Server) {
+	t.Helper()
+	conf := Client{
+		ClientID:      "conf-app",
+		Type:          TypeConfidential,
+		ClientSecret:  secret,
+		Audience:      "conf-api",
+		RedirectURIs:  []string{"https://conf.example.com/cb"},
+		AllowedScopes: []string{"api://conf-api/read", "api://conf-api/write"},
+		Users: []User{
+			{Username: "bob", PasswordHash: testHash(t, "builder")},
+		},
+	}
+	return testIDPClients(t, []Client{testPublicClient(t), conf}, nil)
+}
+
+// TestAuthorizeAllowedScopes pins the per-client delegated-scope allowlist:
+// conf-app may request the api:// scopes registered in its own entry — the
+// granted scope travels into the token's RFC 9068 scope claim and survives
+// the refresh grant — while a foreign resource, an unregistered permission
+// name and another client's registered scope are rejected with invalid_scope.
+func TestAuthorizeAllowedScopes(t *testing.T) {
+	ts, _ := delegatedScopeIDP(t, "a-confidential-secret")
+
+	// A registered delegated scope is granted end to end.
+	verifier, _ := pkcePair()
+	location := loginForScopes(t, ts.URL, "conf-app", "https://conf.example.com/cb", "bob", "builder", verifier,
+		"openid profile api://conf-api/read")
+	tokens := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeFrom(t, location)},
+		"redirect_uri":  {"https://conf.example.com/cb"},
+		"code_verifier": {verifier},
+	}, "conf-app", "a-confidential-secret"))
+	if want := "openid profile api://conf-api/read"; tokens["scope"] != want {
+		t.Errorf("token response scope = %v, want %q", tokens["scope"], want)
+	}
+	claims := verifyTokenString(t, tokens["access_token"].(string), ts.URL)
+	if claims["scope"] != "openid profile api://conf-api/read" {
+		t.Errorf("scope claim = %v, want the full requested scopes (RFC 9068 §2.2.3)", claims["scope"])
+	}
+
+	// The refresh grant carries the same granted scopes forward.
+	refreshed := decodeJSON(t, postTokenBasic(t, ts.URL+"/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {tokens["refresh_token"].(string)},
+	}, "conf-app", "a-confidential-secret"))
+	if refreshed["scope"] != "openid profile api://conf-api/read" {
+		t.Errorf("refreshed scope = %v, want the granted scopes", refreshed["scope"])
+	}
+
+	// A foreign resource, an unregistered permission name, and another
+	// client's (here: unregistered) scope are refused with invalid_scope.
+	for _, tc := range []struct {
+		name  string
+		scope string
+	}{
+		{"foreign resource", "openid api://demo-api/read"},
+		{"unregistered permission", "openid api://conf-api/admin"},
+		{"client without registrations", "openid api://conf-api/read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := authorizeFormFor("conf-app", "https://conf.example.com/cb", verifier)
+			if tc.name == "client without registrations" {
+				q = authorizeFormFor(testClientID, testRedirect, verifier)
+			}
+			q.Set("scope", tc.scope)
+			resp, err := noFollow().Get(ts.URL + "/authorize?" + q.Encode())
+			if err != nil {
+				t.Fatalf("GET /authorize: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusFound {
+				t.Fatalf("status = %d, want 302 to the registered redirect_uri", resp.StatusCode)
+			}
+			loc, err := url.Parse(resp.Header.Get("Location"))
+			if err != nil {
+				t.Fatalf("bad redirect location: %v", err)
+			}
+			if got := loc.Query().Get("error"); got != "invalid_scope" {
+				t.Errorf("scope=%q: error = %q, want invalid_scope", tc.scope, got)
+			}
+			if loc.Query().Get("state") != testStateValue {
+				t.Errorf("error redirect must echo state, got %q", loc.Query().Get("state"))
+			}
+		})
+	}
+}
+
+// loginForScopes runs the authorize round-trip for a client with an explicit
+// scope value and returns the redirect target URL.
+func loginForScopes(t *testing.T, base, clientID, redirect, user, pass, verifier, scope string) string {
+	t.Helper()
+	// The CSRF token is bound to the OAuth parameters of the GET-rendered
+	// form, so the same parameters (including the custom scope) must be used
+	// for both the fetch and the POST body. The credentials are only in the
+	// POST body, never in the GET query.
+	params := authorizeFormFor(clientID, redirect, verifier)
+	params.Set("scope", scope)
+	form := url.Values{}
+	for k, v := range params {
+		form[k] = v
+	}
+	form.Set("username", user)
+	form.Set("password", pass)
+	browser := newBrowser()
+	form.Set("csrf_token", fetchCSRF(t, browser, base+"/authorize", params))
+	resp := postForm(t, browser, base+"/authorize", form)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("POST /authorize for %s: status = %d, want 302", clientID, resp.StatusCode)
+	}
+	return resp.Header.Get("Location")
+}

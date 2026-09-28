@@ -98,6 +98,17 @@ func TestClientValidation(t *testing.T) {
 		"duplicate role": mutated(func(c *Client) {
 			c.Users = []User{{Username: "a", PasswordHash: "$2a$10$0123456789012345678901234567890123456789012345678901234", Roles: []string{"x", "x"}}}
 		}),
+		"empty allowed scope":        mutated(func(c *Client) { c.AllowedScopes = []string{""} }),
+		"padded allowed scope":       mutated(func(c *Client) { c.AllowedScopes = []string{" api://app/read"} }),
+		"space inside allowed scope": mutated(func(c *Client) { c.AllowedScopes = []string{"api://app/read write"} }),
+		"allowed scope without name": mutated(func(c *Client) { c.AllowedScopes = []string{"api://app/"} }),
+		"allowed scope without authority": mutated(func(c *Client) {
+			c.AllowedScopes = []string{"api:///read"}
+		}),
+		"allowed scope without resource form": mutated(func(c *Client) { c.AllowedScopes = []string{"app:read"} }),
+		"allowed scope for foreign audience": mutated(func(c *Client) {
+			c.AllowedScopes = []string{"api://other-api/read"}
+		}),
 	} {
 		if err := tc.validate(); err == nil {
 			t.Errorf("%s: expected a validation error, got none", name)
@@ -112,6 +123,24 @@ func TestClientValidation(t *testing.T) {
 	confidential.ClientSecret = "a-confidential-secret"
 	if err := confidential.validate(); err != nil {
 		t.Errorf("valid confidential client rejected: %v", err)
+	}
+	// A registered delegated scope must reference the client's own audience;
+	// with and without an api:// prefix on the audience itself.
+	delegated := validClient(t)
+	delegated.Audience = "app-api"
+	delegated.AllowedScopes = []string{"api://app-api/access_as_user", "api://app-api/read"}
+	if err := delegated.validate(); err != nil {
+		t.Errorf("valid delegated scopes rejected: %v", err)
+	}
+	delegated.Audience = "api://app-api"
+	if err := delegated.validate(); err != nil {
+		t.Errorf("api://-prefixed audience must match the scope authority: %v", err)
+	}
+	// Without a configured audience the client_id is the scope authority.
+	delegated.Audience = ""
+	delegated.AllowedScopes = []string{"api://app/read"}
+	if err := delegated.validate(); err != nil {
+		t.Errorf("client_id as scope authority rejected: %v", err)
 	}
 }
 

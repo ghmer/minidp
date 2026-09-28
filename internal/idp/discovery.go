@@ -44,7 +44,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"revocation_endpoint_auth_methods_supported":    clientAuthMethods,
 		"introspection_endpoint_auth_methods_supported": clientAuthMethods,
 		"code_challenge_methods_supported":              []string{"S256"},
-		"scopes_supported":                              []string{"openid", "profile", "email"},
+		"scopes_supported":                              s.scopesSupported(),
 		"claims_supported": []string{
 			// Exactly the claims minidp actually issues. auth_time was
 			// previously advertised but never embedded in any token.
@@ -53,6 +53,14 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 			"preferred_username", "email", "name",
 		},
 	})
+}
+
+// scopesSupported assembles the advertised scope set: the built-in OIDC
+// scopes plus every client's registered custom delegated scopes (OIDC
+// Discovery §5.2 — the advertised set is what requests are validated
+// against).
+func (s *Server) scopesSupported() []string {
+	return append([]string{"openid", "profile", "email"}, s.clients.delegatedScopes()...)
 }
 
 // handleJWKS serves the JSON Web Key Set with the RSA public signing key.

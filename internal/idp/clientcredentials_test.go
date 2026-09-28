@@ -283,6 +283,30 @@ func discoveryJSON(t *testing.T, url string) map[string]any {
 	return decodeJSON(t, resp)
 }
 
+// TestDiscoveryScopesSupported pins that discovery advertises the built-in
+// OIDC scopes plus the union of all clients' registered delegated scopes
+// (deduplicated across clients, deterministic file order).
+func TestDiscoveryScopesSupported(t *testing.T) {
+	ui := testPublicClient(t)
+	ui.AllowedScopes = []string{"api://demo-app/access_as_user", "api://demo-app/read"}
+	other := testPublicClient(t)
+	other.ClientID = "second-ui"
+	other.RedirectURIs = []string{"http://localhost:4000/callback"}
+	other.PostLogoutRedirectURIs = nil
+	// A second client sharing the first one's audience may register the same
+	// delegated scope; the union must not duplicate it.
+	other.Audience = "demo-app"
+	other.AllowedScopes = []string{"api://demo-app/access_as_user"}
+	ts, _ := testIDPClients(t, []Client{ui, other}, nil)
+
+	d := discoveryJSON(t, ts.URL+"/.well-known/openid-configuration")
+	got, _ := d["scopes_supported"].([]any)
+	want := []any{"openid", "profile", "email", "api://demo-app/access_as_user", "api://demo-app/read"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("scopes_supported = %v, want %v", got, want)
+	}
+}
+
 // TestDiscoveryGrantTypesAndOAuthMetadata pins the discovery additions:
 // client_credentials is advertised only when a client is opted in, and the
 // RFC 8414 metadata path serves the same document.

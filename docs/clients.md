@@ -75,7 +75,7 @@ standards-compliant library) at minidp:
 | Discovery          | `<IDP_ISSUER>/.well-known/openid-configuration`    |
 | `client_id`        | a registered client's `client_id`                  |
 | Redirect URI       | one of that client's `redirect_uris` (exact match) |
-| Scopes             | `openid profile email`                             |
+| Scopes             | `openid profile email` plus the client's registered delegated scopes (see below) |
 | PKCE               | `S256` (mandatory for public clients)              |
 
 The browser SPA performs the PKCE code exchange directly against minidp
@@ -86,6 +86,35 @@ unlocks `preferred_username`/`name` (on both tokens and `/userinfo`),
 `email` unlocks the `email` claim, and a token without the `openid` scope
 can't call `/userinfo`. Roles set on the account record are released as the
 `roles` array claim on both tokens, independent of scopes.
+
+### Delegated API scopes
+
+A UI client that calls a business API on the user's behalf registers a
+custom, resource-specific delegated scope in its `allowed_scopes` list. The
+format follows the resource-scope convention of Entra ID v2.0 tokens:
+`api://<audience>/<name>` — the authority must reference the client's own
+audience, so a client can never request authorization for a foreign
+resource:
+
+```json
+{
+  "client_id": "policy-ui",
+  "type": "confidential",
+  "client_secret": "...",
+  "audience": "policy-api",
+  "allowed_scopes": ["api://policy-api/access_as_user"],
+  "redirect_uris": ["https://policy-ui.example.com/callback"]
+}
+```
+
+The client then requests `scope=openid profile api://policy-api/access_as_user`
+at `/authorize`. Scopes outside the registered list (or another client's
+list) are rejected with `invalid_scope` — arbitrary resource/scope strings
+are never reflected into tokens. Granted delegated scopes are released in
+the access token's `scope` claim and in the token response's `scope` field
+in their full `api://...` form (RFC 9068 §2.2.3), and they survive the
+refresh grant unchanged. Discovery advertises the union of all clients'
+registered scopes in `scopes_supported`.
 
 A client's authorization code is bound to that client (RFC 6749 §4.1.3):
 another client can't redeem it even with valid credentials — the attempt
@@ -245,6 +274,11 @@ File format (see `clients.json.example`):
   to for that client (resolved from the `id_token_hint`'s audience or the
    `client_id` parameter). An empty list means logout renders a confirmation
   page instead of redirecting.
+- `allowed_scopes` registers the custom delegated API scopes the client may
+  request at `/authorize` on top of the built-in `openid profile email`.
+  Each entry must have the `api://<audience>/<name>` form and reference the
+  client's own audience (an optional `api://` prefix on the audience is
+  ignored on both sides); anything else fails file validation at startup.
 - `allowed_origins` adds explicit CORS origins on top of the hosts derived
   from the redirect URIs.
 - Each client's `users` are the only accounts that can sign in for that

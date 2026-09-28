@@ -11,11 +11,13 @@
 //	clientctl client show    -client app                           [-file clients.json]
 //	clientctl client add     -client app -type public|confidential [-file clients.json]
 //	                         [-secret ...|-] [-audience ...] [-grant-types ...]
-//	                         [-cc-scopes ...] [-redirect uri[,uri...]]
+//	                         [-cc-scopes ...] [-allowed-scopes ...]
+//	                         [-redirect uri[,uri...]]
 //	                         [-post-logout uri,...] [-origin uri,...]
 //	clientctl client update  -client app                           [-file clients.json]
 //	                         [-type ...] [-secret ...|-] [-audience ...]
-//	                         [-grant-types ...] [-cc-scopes ...] [-redirect ...]
+//	                         [-grant-types ...] [-cc-scopes ...]
+//	                         [-allowed-scopes ...] [-redirect ...]
 //	                         [-post-logout ...] [-origin ...]
 //	clientctl client remove  -client app                           [-file clients.json]
 //	clientctl user list      -client app                           [-file clients.json]
@@ -80,11 +82,13 @@ Usage:
   clientctl client show    -client app                           [-file clients.json]
   clientctl client add     -client app -type public|confidential [-file clients.json]
                            [-secret ...|-] [-audience ...] [-grant-types ...]
-                           [-cc-scopes ...] [-redirect uri[,uri...]]
+                           [-cc-scopes ...] [-allowed-scopes ...]
+                           [-redirect uri[,uri...]]
                            [-post-logout uri,...] [-origin uri,...]
   clientctl client update  -client app                           [-file clients.json]
                            [-type ...] [-secret ...|-] [-audience ...]
-                           [-grant-types ...] [-cc-scopes ...] [-redirect ...]
+                           [-grant-types ...] [-cc-scopes ...]
+                           [-allowed-scopes ...] [-redirect ...]
                            [-post-logout ...] [-origin ...]
   clientctl client remove  -client app                           [-file clients.json]
   clientctl user list      -client app                           [-file clients.json]
@@ -100,11 +104,14 @@ printed. "-password -"/"-secret -" read one line from stdin; without the flag
 an interactive prompt (with confirmation) is used where applicable. -roles
 takes a comma-separated list; updating with "-roles ''" clears all roles.
 Redirect URIs, post-logout URIs and origins are comma-separated lists that
-replace the previous set when provided. -grant-types and -cc-scopes are
-comma-separated lists too: -grant-types picks the OAuth grants the client may
-use (default: authorization_code,refresh_token); a client_credentials-only
-client needs no redirect URIs and no users, but -cc-scopes (its statically
-configured token scopes) and -secret (confidential profile) are required.
+replace the previous set when provided. -grant-types, -cc-scopes and
+-allowed-scopes are comma-separated lists too: -grant-types picks the OAuth
+grants the client may use (default: authorization_code,refresh_token); a
+client_credentials-only client needs no redirect URIs and no users, but
+-cc-scopes (its statically configured token scopes) and -secret (confidential
+profile) are required. -allowed-scopes registers the custom delegated API
+scopes (api://<audience>/<name>, referencing the client's own audience) the
+client may request at /authorize on top of the built-in openid profile email.
 `)
 }
 
@@ -282,15 +289,16 @@ func requireSelector(sel *clientSelector) error {
 
 // clientFlags bundles the flags shared by client add and update.
 type clientFlags struct {
-	selector   *clientSelector
-	typ        *string
-	secret     *string
-	audience   *string
-	grantTypes *string
-	ccScopes   *string
-	redirect   *string
-	postLogout *string
-	origin     *string
+	selector      *clientSelector
+	typ           *string
+	secret        *string
+	audience      *string
+	grantTypes    *string
+	ccScopes      *string
+	allowedScopes *string
+	redirect      *string
+	postLogout    *string
+	origin        *string
 }
 
 func registerClientFlags(fs *flag.FlagSet) *clientFlags {
@@ -298,9 +306,10 @@ func registerClientFlags(fs *flag.FlagSet) *clientFlags {
 	f.selector = registerClientSelector(fs)
 	f.typ = fs.String("type", "", "client profile: public (mandatory PKCE) or confidential (client auth at /token)")
 	f.secret = fs.String("secret", "", "client secret for a confidential client; '-' reads one line from stdin")
-	f.audience = fs.String("audience", "", "token audience; defaults to the client_id")
+	f.audience = fs.String("audience", "", "access-token audience; defaults to the client_id")
 	f.grantTypes = fs.String("grant-types", "", "comma-separated OAuth grants: authorization_code, refresh_token, client_credentials (default: authorization_code,refresh_token)")
 	f.ccScopes = fs.String("cc-scopes", "", "comma-separated scopes of the client_credentials access tokens (required with -grant-types client_credentials)")
+	f.allowedScopes = fs.String("allowed-scopes", "", "comma-separated custom delegated API scopes the client may request at /authorize (api://<audience>/<name> form, referencing the client's own audience)")
 	f.redirect = fs.String("redirect", "", "comma-separated registered redirect_uri values (required unless client_credentials is the only grant)")
 	f.postLogout = fs.String("post-logout", "", "comma-separated post_logout_redirect_uri values for /end_session")
 	f.origin = fs.String("origin", "", "comma-separated extra CORS origins granted to this client")
@@ -373,6 +382,7 @@ func clientAdd(args []string) error {
 		Audience:                *f.audience,
 		GrantTypes:              parseList(*f.grantTypes),
 		ClientCredentialsScopes: parseList(*f.ccScopes),
+		AllowedScopes:           parseList(*f.allowedScopes),
 		RedirectURIs:            parseList(*f.redirect),
 		PostLogoutRedirectURIs:  parseList(*f.postLogout),
 		AllowedOrigins:          parseList(*f.origin),
@@ -470,6 +480,10 @@ func applyClientEndpointChanges(client *idp.Client, spec *clientChangeSpec) (boo
 		client.ClientCredentialsScopes = parseList(*spec.f.ccScopes)
 		changed = true
 	}
+	if spec.provid["allowed-scopes"] {
+		client.AllowedScopes = parseList(*spec.f.allowedScopes)
+		changed = true
+	}
 	if spec.provid["redirect"] {
 		client.RedirectURIs = parseList(*spec.f.redirect)
 		changed = true
@@ -503,7 +517,7 @@ func clientUpdate(args []string) error {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -redirect, -post-logout or -origin")
+		return fmt.Errorf("nothing to update: provide -type, -secret, -audience, -grant-types, -cc-scopes, -allowed-scopes, -redirect, -post-logout or -origin")
 	}
 	// Pre-flight the mutated entry so an inconsistent combination (e.g.
 	// -grant-types client_credentials without -cc-scopes) is reported
@@ -561,6 +575,9 @@ func describeClient(c idp.Client) string {
 		"\tgrants: " + strings.Join(grants, ",")
 	if len(c.ClientCredentialsScopes) > 0 {
 		line += "\tcc-scopes: " + strings.Join(c.ClientCredentialsScopes, ",")
+	}
+	if len(c.AllowedScopes) > 0 {
+		line += "\tallowed-scopes: " + strings.Join(c.AllowedScopes, ",")
 	}
 	line += "\tredirects: " + strings.Join(c.RedirectURIs, ",")
 	if len(c.PostLogoutRedirectURIs) > 0 {
