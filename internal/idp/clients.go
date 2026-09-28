@@ -534,21 +534,18 @@ func SaveClientsFile(path string, file *ClientsFile) error {
 	if err := validateResourceRegistry(file.Resources, file.Clients); err != nil {
 		return err
 	}
-	var data []byte
-	var err error
-	if len(file.Resources) == 0 {
-		data, err = json.MarshalIndent(file.Clients, "", "  ")
-	} else {
-		data, err = json.MarshalIndent(struct {
+	var source any = file.Clients
+	if len(file.Resources) > 0 {
+		source = struct {
 			Clients   []Client             `json:"clients"`
 			Resources []ResourceDefinition `json:"resources"`
-		}{file.Clients, file.Resources}, "", "  ")
+		}{file.Clients, file.Resources}
 	}
+	data, err := json.MarshalIndent(source, "", "  ")
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	return saveJSONFile(path, data)
+	return saveJSONFile(path, append(data, '\n'))
 }
 
 // registeredClient is a validated client entry with its resolved user store.
