@@ -132,8 +132,37 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	return s.withCORS(mux)
+}
+
+// handleReadyz is the readiness probe: unlike the static /healthz liveness
+// endpoint it verifies the two artifacts a misconfigured issuer or key
+// directory breaks — the discovery document must render and at least one
+// signing key must be published in the JWKS. Reaching the issuer hostname
+// from outside the container is a deployment concern and is exercised by
+// the integration tests and the app containers' own discovery fetches.
+func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	if len(s.keys.published) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not ready",
+			"reason": "no signing key published in the JWKS",
+		})
+		return
+	}
+	doc, err := json.Marshal(s.discoveryDocument())
+	if err != nil || len(doc) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not ready",
+			"reason": "discovery document does not render",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "ready",
+		"published_keys": len(s.keys.published),
+	})
 }
 
 // authenticate verifies the credentials against a client's user store.

@@ -139,6 +139,7 @@ Managing clients and accounts — profiles, secrets, redirect policies, the
 | `POST /revoke`                            | RFC 7009 revocation (refresh + access tokens via `jti` denylist)     |
 | `GET   /end_session`                      | Logout; with `id_token_hint`, the authorization's tokens are revoked |
 | `GET   /healthz`                          | Liveness probe                                                       |
+| `GET   /readyz`                           | Readiness probe: discovery renders and a signing key is published     |
 
 ## Deployment
 

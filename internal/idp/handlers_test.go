@@ -305,6 +305,36 @@ func TestJWKSEndpoint(t *testing.T) {
 	}
 }
 
+// TestReadyz pins the readiness contract: a healthy server answers 200 with
+// the published-key count, while a server without any published signing key
+// answers 503 — unlike the static /healthz liveness probe.
+func TestReadyz(t *testing.T) {
+	ts, srv := testIDP(t, nil)
+	resp, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	body := decodeJSON(t, resp)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /readyz: status = %d, body = %v", resp.StatusCode, body)
+	}
+	if body["status"] != "ready" {
+		t.Errorf("status = %v, want ready", body["status"])
+	}
+	if body["published_keys"] != float64(len(srv.keys.published)) {
+		t.Errorf("published_keys = %v, want %d", body["published_keys"], len(srv.keys.published))
+	}
+
+	// Degenerate set: no published key means not ready.
+	notReady := &Server{keys: &keySet{}, clients: srv.clients, cfg: srv.cfg}
+	rec := httptest.NewRecorder()
+	notReady.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz without keys: status = %d, want 503", rec.Code)
+	}
+}
+
 func TestAuthorizeFormRendersHiddenParams(t *testing.T) {
 	ts, _ := testIDP(t, nil)
 	verifier, _ := pkcePair()

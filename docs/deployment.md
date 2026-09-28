@@ -53,10 +53,22 @@ Worth knowing up front:
   an expired hint still identifies the token family) and revokes that
   authorization's tokens. `post_logout_redirect_uri` must exactly match a
   post-logout target registered for the client resolved from the hint (or
-  the `client_id` parameter). There's no browser session cookie to
+   the `client_id` parameter). There's no browser session cookie to
   terminate without a hint; `logout_hint` and an independent `sid`
   parameter aren't handled, and `prompt=none` requests answer
    `login_required` since no browser session is ever kept.
+
+### Health, readiness and key reachability
+
+- `/healthz` is a static liveness probe (process is up).
+- `/readyz` is the readiness probe: it answers 200 only when the discovery
+  document renders and at least one signing key is published in the JWKS.
+  The bundled compose healthcheck probes both endpoints locally; reaching
+  the *public issuer hostname* (the one embedded in the discovery document
+  and the tokens) must be exercised from where it matters — the app
+  containers and the integration tests. An issuer that resolves for the
+  browser but not inside the Compose network (or vice versa) is the single
+  most common integration failure, and no in-container probe can catch it.
 
 ## Key management & rotation
 

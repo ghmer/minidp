@@ -19,6 +19,12 @@ func (s *Server) grantTypesSupported() []string {
 // The same document is served at /.well-known/oauth-authorization-server,
 // the RFC 8414 metadata path that OAuth-only (non-OIDC) clients probe.
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.discoveryDocument())
+}
+
+// discoveryDocument assembles the OIDC discovery metadata. It is shared by
+// the discovery endpoints and the /readyz readiness self-check.
+func (s *Server) discoveryDocument() map[string]any {
 	// Client authentication methods are provider-wide metadata: "none" is
 	// always available (public clients identify themselves with client_id
 	// only); the secret-based methods are advertised when at least one
@@ -27,7 +33,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	if s.clients.anyConfidential() {
 		clientAuthMethods = append(clientAuthMethods, "client_secret_basic", "client_secret_post")
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"issuer":                                        s.cfg.Issuer,
 		"authorization_endpoint":                        s.cfg.Issuer + "/authorize",
 		"token_endpoint":                                s.cfg.Issuer + "/token",
@@ -52,7 +58,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 			"iss", "sub", "aud", "exp", "iat", "client_id", "nonce",
 			"preferred_username", "email", "name",
 		},
-	})
+	}
 }
 
 // scopesSupported assembles the advertised scope set: the built-in OIDC
