@@ -188,3 +188,26 @@ Upstream already has unit and HTTP flow tests for discovery, client profiles, re
 ## Explicit limitations
 
 MinIDP can and should emulate the protocol and authorization contracts our applications rely on. It cannot establish compatibility with Entra Conditional Access, MFA, device claims, consent UX, tenant lifecycle, Entra-specific role assignment administration, production key behavior in every edge case, or conditional access errors. Those remain mandatory checks against a non-production Entra tenant. A local pass is necessary, not sufficient, evidence of Entra readiness.
+
+## Implementation status (2026-09-28)
+
+Implemented on branch `feature/entra-harmonization`, in RFC-first order per
+the approved sprint plan. Every sprint shipped a clean binary, extended
+tests, and went through the full gate set (`go test`, `go vet`,
+`golangci-lint`, `gosec`) before its commit.
+
+| Sprint | Scope | Commit |
+| --- | --- | --- |
+| 1 (RFC) | Audience split: id_token `aud` = `client_id`, access token `aud` = configured API audience; RFC 9068 REQUIRED `client_id` claim on access tokens; `/userinfo` resolves the account store via `client_id`; `/end_session` resolves hints by client-id audience; `/introspect` carries `client_id` (RFC 7662) | `0a1d517` |
+| 2 (RFC) | Per-client delegated API scopes (`allowed_scopes`, `api://<audience>/<name>` referencing the client's own audience), allowlist validation at `/authorize`, discovery `scopes_supported` union, `clientctl -allowed-scopes` | `f56a7bd` |
+| 3 (RFC) | Staged signing-key rotation: `keyring.json`, RFC 7638 thumbprint kids, overlapping JWKS during the transition, retention pruning at start, `minidp rotate-keys` (`IDP_KEY_RETENTION`) | `7a427a2` |
+| 4 (RFC) | `/readyz` readiness probe (discovery renders + signing key published); compose healthcheck pattern probes discovery + JWKS | `76dcc40` |
+| 5 (Entra) | `nbf` on every token, `azp` on both tokens, `scp` with short permission names on delegated access tokens (no `scp` on app-only tokens) | `c1ef39c` |
+| 6 (Entra) | CC `/.default` resolution (absent/`<audience>/.default`/exact entry; else `invalid_scope`), `client_credentials_roles` in the `roles` claim, `idtyp` (`app`/`user`), optional per-audience role registry via the object-form clients file | `2139d08` |
+| 7 | Smoke-test extensions (claim shape, `.default`, rotation overlap), example clients file, this status section | this commit |
+
+Not covered here by design — they live in the application repositories:
+the Compose migration (§ "Compose migration requirements"), the
+app-verifier hardening (typ-header tolerance for Entra's `typ: JWT` access
+tokens vs. MinIDP's RFC 9068 `at+jwt`), and the non-production Entra
+tenant runs (§ "Acceptance tests", last bullet).
